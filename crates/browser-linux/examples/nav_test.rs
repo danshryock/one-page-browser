@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
     window.add(&content);
     window.show_all();
 
-    let engine = WryEngine::new(&content, &url_a)?;
+    let engine = WryEngine::new(&content, &url_a, |_| {})?;
     pump_for(Duration::from_millis(800));
 
     let mut all_ok = true;

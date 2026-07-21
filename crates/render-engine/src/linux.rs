@@ -8,9 +8,14 @@ pub struct WryEngine {
 }
 
 impl WryEngine {
-    pub fn new<W: gtk::glib::IsA<Container>>(container: &W, initial_url: &str) -> anyhow::Result<Self> {
+    pub fn new<W: gtk::glib::IsA<Container>>(
+        container: &W,
+        initial_url: &str,
+        on_title_changed: impl Fn(String) + 'static,
+    ) -> anyhow::Result<Self> {
         let webview = WebViewBuilder::new()
             .with_url(initial_url)
+            .with_document_title_changed_handler(move |title| on_title_changed(title))
             .build_gtk(container)?;
         Ok(Self { webview })
     }
