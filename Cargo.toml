@@ -4,3 +4,6 @@ members = [
     "crates/render-engine",
     "crates/browser-linux",
 ]
+
+[workspace.package]
+license = "MIT OR Apache-2.0"
