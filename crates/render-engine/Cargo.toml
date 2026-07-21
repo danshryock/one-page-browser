@@ -1,0 +1,11 @@
+[package]
+name = "render-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wry = "0.55"
+anyhow = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"

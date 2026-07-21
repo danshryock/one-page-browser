@@ -1,0 +1,9 @@
+[package]
+name = "browser-linux"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gtk = "0.18"
+render-engine = { path = "../render-engine" }
+anyhow = "1"

@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/render-engine",
+    "crates/browser-linux",
+]
