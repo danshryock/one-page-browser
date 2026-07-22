@@ -10,9 +10,12 @@ A cross-platform web browser written in Rust. No tabs, by design.
 
 Linux (`crates/browser-linux`) is implemented and working. Windows (`crates/browser-windows`) has a
 first-milestone native Win32 chrome (single page, back/forward/reload, address bar — no switcher grid
-yet) that type-checks cleanly against the real `windows` crate, but **has never been linked or run** —
-it was written on a Linux machine with no Windows/WebView2 toolchain available. Build and run it on an
-actual Windows machine and report back anything that breaks. macOS isn't started yet.
+yet). It's been cross-compiled and run from this same Linux dev machine (see below) — the window, toolbar,
+and message loop are confirmed working under Wine, but WebView2 itself (the actual Edge-based rendering
+engine, distinct from the small `WebView2Loader.dll` stub) isn't available under Wine, so the content area
+won't render there. A window still opens if the webview fails to initialize (logged, not fatal) rather
+than the whole app silently failing to launch — test the actual browsing on a real Windows machine.
+macOS isn't started yet.
 
 ## Installing dependencies
 
@@ -60,18 +63,59 @@ cargo build --workspace --exclude browser-windows
 
 ```sh
 cargo run -p browser-linux   # Linux
-cargo run -p browser-windows # Windows — untested, see the warning above
+cargo run -p browser-windows # Windows (native build)
 ```
 
 Each opens a native window (GTK on Linux, Win32 on Windows) with an address bar and back / forward /
 reload buttons. Type a URL into the address bar and press Enter (or, on Windows, click Go) to navigate.
 
-## Testing
+### Cross-compiling and running `browser-windows` from Linux
 
-There's an example-based regression test that drives navigation (load, navigate, back, forward, reload) against local fixture pages and checks the webview's URL after each step:
+Useful for testing the native window/chrome/message-loop code without a Windows machine — WebView2 itself
+won't work this way (see below), but everything else can be exercised end-to-end.
 
 ```sh
-cargo run --example nav_test -p browser-linux
+rustup target add x86_64-pc-windows-gnu
+sudo apt install -y mingw-w64 wine
+cargo build --target x86_64-pc-windows-gnu -p browser-windows
 ```
 
-It prints `PASS`/`FAIL` per step and exits non-zero if anything fails.
+`webview2-com-sys`'s build script vendors `WebView2Loader.dll` but doesn't copy it next to the binary —
+real Windows/WebView2 projects need this DLL alongside the exe, so copy it manually the first time (or
+after a clean build):
+
+```sh
+cp target/x86_64-pc-windows-gnu/debug/build/webview2-com-sys-*/out/x64/WebView2Loader.dll \
+   target/x86_64-pc-windows-gnu/debug/
+```
+
+Then run it under Wine:
+
+```sh
+wine target/x86_64-pc-windows-gnu/debug/browser-windows.exe
+```
+
+The window, toolbar, and address bar come up normally. Expect (and it's fine) to see this in the
+output — Wine has no real WebView2 Runtime, so the content area never initializes, but the window and
+chrome still work:
+
+```
+failed to create webview: WebView2 error: WindowsError(Error { code: HRESULT(0x80070002), message: "File not found." })
+```
+
+## Testing
+
+`browser-core`'s page/tab-management logic (load/unload tracking, the loaded-pages limit) is pure state
+machine logic tested with real unit tests against a mock engine — no GTK or webview involved:
+
+```sh
+cargo test -p browser-core
+```
+
+`browser-linux` has two example-based regression tests that drive the actual GTK app end-to-end against
+local fixture pages, printing `PASS`/`FAIL` per check and exiting non-zero if anything fails:
+
+```sh
+cargo run --example nav_test -p browser-linux       # navigate/back/forward/reload
+cargo run --example switcher_test -p browser-linux  # multi-page switcher, search, loaded/unloaded limit
+```

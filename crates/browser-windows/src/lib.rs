@@ -54,14 +54,19 @@ const GO_BUTTON_WIDTH: i32 = 40;
 const MARGIN: i32 = 4;
 
 struct AppState {
-    engine: WryEngine,
+    /// `None` if the webview failed to initialize (e.g. the WebView2
+    /// Runtime isn't installed) — the window and toolbar still come up in
+    /// that case rather than the whole window failing to open, so the
+    /// failure is at least visible instead of silent.
+    engine: Option<WryEngine>,
     address_edit: HWND,
 }
 
 impl AppState {
     fn navigate_from_address_bar(&self) {
+        let Some(engine) = &self.engine else { return };
         let text = get_window_text(self.address_edit);
-        if let Err(err) = self.engine.navigate(&text) {
+        if let Err(err) = engine.navigate(&text) {
             eprintln!("navigation failed: {err:?}");
         }
     }
@@ -186,8 +191,10 @@ fn layout_toolbar(hwnd: HWND, app: &AppState) {
 
     let content_y = TOOLBAR_HEIGHT;
     let content_h = (height - TOOLBAR_HEIGHT).max(0);
-    if let Err(err) = app.engine.set_bounds(0, content_y, width.max(0) as u32, content_h as u32) {
-        eprintln!("failed to resize webview: {err:?}");
+    if let Some(engine) = &app.engine {
+        if let Err(err) = engine.set_bounds(0, content_y, width.max(0) as u32, content_h as u32) {
+            eprintln!("failed to resize webview: {err:?}");
+        }
     }
 }
 
@@ -298,10 +305,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // Title tracking has no UI consumer yet in this first
                 // milestone (no switcher grid) — nothing to update.
             }) {
-                Ok(engine) => engine,
+                Ok(engine) => Some(engine),
                 Err(err) => {
+                    // Don't abort window creation over this (e.g. the
+                    // WebView2 Runtime isn't installed) — better to show a
+                    // window with a visibly broken content area than no
+                    // window at all with the failure only in stderr.
                     eprintln!("failed to create webview: {err:?}");
-                    return LRESULT(-1);
+                    None
                 }
             };
 
@@ -324,13 +335,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(app) = app_state(hwnd) {
                 match control_id {
                     ID_BACK => {
-                        let _ = app.engine.go_back();
+                        if let Some(engine) = &app.engine {
+                            let _ = engine.go_back();
+                        }
                     }
                     ID_FORWARD => {
-                        let _ = app.engine.go_forward();
+                        if let Some(engine) = &app.engine {
+                            let _ = engine.go_forward();
+                        }
                     }
                     ID_RELOAD => {
-                        let _ = app.engine.reload();
+                        if let Some(engine) = &app.engine {
+                            let _ = engine.reload();
+                        }
                     }
                     ID_GO => app.navigate_from_address_bar(),
                     _ => {}
