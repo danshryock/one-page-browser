@@ -50,20 +50,33 @@ pub fn resolve_address_input(input: &str, settings: &Settings) -> String {
 
 pub struct Page<E> {
     pub id: String,
-    pub engine: E,
+    /// `None` means this page has been unloaded: its `RenderEngine`/webview
+    /// was actually torn down to reclaim resources, not just flagged. Only
+    /// ever `None` for a non-foreground page — the active page is never
+    /// unloaded (see `enforce_loaded_limit`).
+    pub engine: Option<E>,
     pub title: Rc<RefCell<String>>,
     pub color: &'static str,
-    /// Whether this page currently counts against `max_loaded_pages`.
-    /// Bookkeeping only for now — an "unloaded" page's `RenderEngine`/webview
-    /// keeps running underneath; actually suspending/recreating it is a
-    /// follow-up once this tracking exists. Named `loaded` rather than
-    /// "active" to avoid colliding with `PageManager::active_id`, which
-    /// already means "the page currently shown in the UI" — an unrelated
-    /// concept.
+    /// Whether this page currently counts against `max_loaded_pages`. Named
+    /// `loaded` rather than "active" to avoid colliding with
+    /// `PageManager::active_id`, which already means "the page currently
+    /// shown in the UI" — an unrelated concept.
     pub loaded: bool,
     /// Last time this page was created or switched to. Used to pick which
     /// loaded page to unload first when over the limit (oldest first).
     pub last_accessed: Instant,
+    /// URL as of the last time `engine` was live. Frozen the moment the
+    /// engine is taken away (see `PageManager::take_engine` callers) — the
+    /// only source of truth for the URL/search-matching while unloaded.
+    pub last_url: String,
+}
+
+impl<E: RenderEngine> Page<E> {
+    /// The page's current URL: the live engine's, if it has one, else the
+    /// frozen `last_url` from before it was unloaded.
+    pub fn current_url(&self) -> String {
+        self.engine.as_ref().and_then(|e| e.current_url().ok()).unwrap_or_else(|| self.last_url.clone())
+    }
 }
 
 fn page_matches_query<E: RenderEngine>(page: &Page<E>, query_lower: &str) -> bool {
@@ -71,7 +84,7 @@ fn page_matches_query<E: RenderEngine>(page: &Page<E>, query_lower: &str) -> boo
         return true;
     }
     let title = page.title.borrow().to_lowercase();
-    let url = page.engine.current_url().unwrap_or_default().to_lowercase();
+    let url = page.current_url().to_lowercase();
     title.contains(query_lower) || url.contains(query_lower)
 }
 
@@ -107,18 +120,22 @@ impl<E> PageManager<E> {
     /// taken as a parameter (rather than created here) so the caller can
     /// clone it into the engine's title-changed callback before this call —
     /// the stored `Page` and the callback then share the same cell.
-    pub fn insert(&mut self, id: String, engine: E, title: Rc<RefCell<String>>) {
+    /// Returns the ids of any pages `enforce_loaded_limit` evicted to make
+    /// room — the caller is responsible for actually tearing down their
+    /// engines (see `take_engine`).
+    pub fn insert(&mut self, id: String, engine: E, title: Rc<RefCell<String>>) -> Vec<String> {
         let color = PALETTE[self.pages.len() % PALETTE.len()];
         self.pages.push(Page {
             id: id.clone(),
-            engine,
+            engine: Some(engine),
             title,
             color,
             loaded: true,
             last_accessed: Instant::now(),
+            last_url: String::new(),
         });
         self.active_id = id;
-        self.enforce_loaded_limit();
+        self.enforce_loaded_limit()
     }
 
     /// Removes a page and returns it so the caller can clean up its native
@@ -127,6 +144,26 @@ impl<E> PageManager<E> {
     pub fn remove(&mut self, id: &str) -> Option<Page<E>> {
         let index = self.pages.iter().position(|p| p.id == id)?;
         Some(self.pages.remove(index))
+    }
+
+    pub fn page_mut(&mut self, id: &str) -> Option<&mut Page<E>> {
+        self.pages.iter_mut().find(|p| p.id == id)
+    }
+
+    /// Removes and returns a page's live engine (e.g. so the caller can drop
+    /// it to reclaim its resources). `None` if the page doesn't exist or is
+    /// already engine-less.
+    pub fn take_engine(&mut self, id: &str) -> Option<E> {
+        self.page_mut(id)?.engine.take()
+    }
+
+    /// Installs a (re)created engine for a page — used after `take_engine`
+    /// tore the old one down and the caller built a fresh one. No-op if the
+    /// page no longer exists.
+    pub fn install_engine(&mut self, id: &str, engine: E) {
+        if let Some(page) = self.page_mut(id) {
+            page.engine = Some(engine);
+        }
     }
 
     /// Makes `id` the foreground page. Also marks it `loaded` and refreshes
@@ -146,12 +183,15 @@ impl<E> PageManager<E> {
     /// the loaded page with the oldest `last_accessed` — never the current
     /// foreground page, which is never unloaded regardless of age. Loops
     /// rather than a single pass so it fully converges even if several pages
-    /// are loaded at once or the limit is small.
-    fn enforce_loaded_limit(&mut self) {
-        let Some(limit) = self.max_loaded_pages else { return };
+    /// are loaded at once or the limit is small. Returns the ids it flipped
+    /// to unloaded (in eviction order) so the caller can tear down their
+    /// engines via `take_engine`.
+    fn enforce_loaded_limit(&mut self) -> Vec<String> {
+        let mut evicted = Vec::new();
+        let Some(limit) = self.max_loaded_pages else { return evicted };
         loop {
             if self.pages.iter().filter(|p| p.loaded).count() <= limit {
-                return;
+                return evicted;
             }
             let active_id = self.active_id.clone();
             let oldest = self
@@ -160,8 +200,11 @@ impl<E> PageManager<E> {
                 .filter(|p| p.loaded && p.id != active_id)
                 .min_by_key(|p| p.last_accessed);
             match oldest {
-                Some(page) => page.loaded = false,
-                None => return, // nothing left that's safe to unload
+                Some(page) => {
+                    page.loaded = false;
+                    evicted.push(page.id.clone());
+                }
+                None => return evicted, // nothing left that's safe to unload
             }
         }
     }
@@ -179,10 +222,11 @@ impl<E> PageManager<E> {
     /// Changes the loaded-page limit and enforces it immediately (unlike
     /// `set_active` reactivating a page, which defers enforcement to the
     /// next new page load — a user explicitly changing this setting should
-    /// take effect right away).
-    pub fn set_max_loaded_pages(&mut self, limit: Option<usize>) {
+    /// take effect right away). Returns any newly-evicted ids, same as
+    /// `insert`.
+    pub fn set_max_loaded_pages(&mut self, limit: Option<usize>) -> Vec<String> {
         self.max_loaded_pages = limit;
-        self.enforce_loaded_limit();
+        self.enforce_loaded_limit()
     }
 
     pub fn active_id(&self) -> &str {
@@ -291,11 +335,13 @@ mod tests {
         let id2 = insert_page(&mut mgr, "https://b.example");
         assert_eq!(mgr.loaded_page_count(), 2, "still at the limit, nothing unloaded yet");
 
-        let id3 = insert_page(&mut mgr, "https://c.example");
+        let id3 = mgr.allocate_id();
+        let evicted = mgr.insert(id3.clone(), MockEngine::new("https://c.example"), Rc::new(RefCell::new(String::new())));
         assert_eq!(mgr.loaded_page_count(), 2, "back down to the limit after the 3rd load");
         assert!(!mgr.is_page_loaded(&id1), "oldest page should be unloaded");
         assert!(mgr.is_page_loaded(&id2));
         assert!(mgr.is_page_loaded(&id3));
+        assert_eq!(evicted, vec![id1], "insert reports exactly the page it evicted");
     }
 
     #[test]
@@ -363,6 +409,34 @@ mod tests {
         assert!(mgr.is_page_loaded(&id3), "the foreground page survives");
         assert!(!mgr.is_page_loaded(&id1));
         assert!(!mgr.is_page_loaded(&id2));
+    }
+
+    #[test]
+    fn take_engine_removes_the_live_engine() {
+        let mut mgr: PageManager<MockEngine> = PageManager::new(None);
+        let id = insert_page(&mut mgr, "https://a.example");
+        assert!(mgr.take_engine(&id).is_some(), "a freshly-inserted page has a live engine to take");
+        assert!(mgr.take_engine(&id).is_none(), "already taken — nothing left to take a second time");
+        assert!(mgr.take_engine("nonexistent-id").is_none());
+    }
+
+    #[test]
+    fn install_engine_after_take_engine_restores_current_url() {
+        let mut mgr: PageManager<MockEngine> = PageManager::new(None);
+        let id = insert_page(&mut mgr, "https://a.example");
+        let taken = mgr.take_engine(&id).expect("should have a live engine to take");
+        // Simulate the caller freezing last_url the way browser-linux's
+        // unload_engines does, right before dropping the taken engine.
+        mgr.page_mut(&id).unwrap().last_url = taken.current_url().unwrap();
+        drop(taken);
+        assert_eq!(mgr.page(&id).unwrap().current_url(), "https://a.example", "falls back to last_url while unloaded");
+
+        mgr.install_engine(&id, MockEngine::new("https://b.example"));
+        assert_eq!(
+            mgr.page(&id).unwrap().current_url(),
+            "https://b.example",
+            "a live engine's URL takes priority over the frozen last_url"
+        );
     }
 
     #[test]

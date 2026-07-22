@@ -32,7 +32,8 @@ impl AppState {
     /// drive that dialog's UI.
     pub fn set_max_loaded_pages(self: &Rc<Self>, limit: Option<usize>) {
         self.settings.borrow_mut().max_loaded_pages = limit;
-        self.core.borrow_mut().set_max_loaded_pages(limit);
+        let evicted = self.core.borrow_mut().set_max_loaded_pages(limit);
+        self.unload_engines(&evicted);
         self.rebuild_switcher_grid();
     }
 
@@ -47,8 +48,10 @@ impl AppState {
     fn with_active<F: FnOnce(&WryEngine) -> anyhow::Result<()>>(&self, f: F) {
         let core = self.core.borrow();
         if let Some(page) = core.active() {
-            if let Err(err) = f(&page.engine) {
-                eprintln!("action failed: {err}");
+            if let Some(engine) = &page.engine {
+                if let Err(err) = f(engine) {
+                    eprintln!("action failed: {err}");
+                }
             }
         }
     }
@@ -71,24 +74,70 @@ impl AppState {
             }
         })?;
 
-        self.core.borrow_mut().insert(id.clone(), engine, title);
+        let evicted = self.core.borrow_mut().insert(id.clone(), engine, title);
+        self.unload_engines(&evicted);
 
         self.set_active(&id);
         self.rebuild_switcher_grid();
         Ok(())
     }
 
+    /// Actually tears down the engines for pages `PageManager` just flipped
+    /// to unloaded — this is what turns the `loaded` bookkeeping flag into
+    /// real resource reclamation. Dropping a `WryEngine` destroys its
+    /// underlying GTK/WebKit widget (confirmed via wry's `InnerWebView` Drop
+    /// impl, which calls `gtk_widget_destroy`), which also detaches it from
+    /// its (now-empty, and since non-foreground, invisible) stack container.
+    fn unload_engines(&self, ids: &[String]) {
+        let mut core = self.core.borrow_mut();
+        for id in ids {
+            if let Some(page) = core.page_mut(id) {
+                if let Some(engine) = page.engine.take() {
+                    page.last_url = engine.current_url().unwrap_or_else(|_| page.last_url.clone());
+                    drop(engine);
+                }
+            }
+        }
+    }
+
+    /// Rebuilds the engine for a page that was previously unloaded, loading
+    /// it back to its `last_url` into its existing (still-tracked) stack
+    /// container. No-op if the page already has a live engine.
+    fn ensure_engine_loaded(self: &Rc<Self>, id: &str) {
+        let needs_engine = self.core.borrow().page(id).map(|p| p.engine.is_none()).unwrap_or(false);
+        if !needs_engine {
+            return;
+        }
+        let Some(container) = self.containers.borrow().get(id).cloned() else { return };
+        let (url, title) = {
+            let core = self.core.borrow();
+            let Some(page) = core.page(id) else { return };
+            (page.last_url.clone(), Rc::clone(&page.title))
+        };
+
+        let title_for_cb = Rc::clone(&title);
+        let app_weak = Rc::downgrade(self);
+        match WryEngine::new(&container, &url, move |new_title| {
+            *title_for_cb.borrow_mut() = new_title;
+            if let Some(app) = app_weak.upgrade() {
+                app.rebuild_switcher_grid();
+            }
+        }) {
+            Ok(engine) => self.core.borrow_mut().install_engine(id, engine),
+            Err(err) => eprintln!("failed to reload unloaded page: {err}"),
+        }
+    }
+
     /// Makes `id` the active/visible page, without touching the switcher
     /// panel's visibility — used wherever the active page changes as a side
     /// effect (creating a page, closing the active one) rather than as an
     /// explicit "go view this page" action from the user.
-    fn set_active(&self, id: &str) {
+    fn set_active(self: &Rc<Self>, id: &str) {
+        self.ensure_engine_loaded(id);
         self.core.borrow_mut().set_active(id);
         self.stack.set_visible_child_name(id);
         if let Some(page) = self.core.borrow().page(id) {
-            if let Ok(url) = page.engine.current_url() {
-                self.address_bar.set_text(&url);
-            }
+            self.address_bar.set_text(&page.current_url());
         }
     }
 
@@ -166,7 +215,7 @@ impl AppState {
                     let t = page.title.borrow();
                     if t.is_empty() { "New Page".to_string() } else { t.clone() }
                 };
-                let url = page.engine.current_url().unwrap_or_default();
+                let url = page.current_url();
                 let domain = domain_of(&url);
 
                 let tile = gtk::Button::new();
@@ -288,13 +337,30 @@ impl AppState {
 
     /// The active page's current URL — test/inspection helper.
     pub fn active_url(&self) -> Option<String> {
-        self.core.borrow().active().and_then(|p| p.engine.current_url().ok())
+        self.core.borrow().active().map(|p| p.current_url())
+    }
+
+    /// Number of GTK children in a page's stack container — 0 means its
+    /// webview has actually been torn down (real reclamation), 1 means a
+    /// live webview is present. Distinguishes real teardown from the
+    /// `loaded` bool alone (already covered by `is_page_loaded`) —
+    /// test/inspection helper.
+    pub fn page_container_child_count(&self, id: &str) -> usize {
+        self.containers.borrow().get(id).map(|c| c.children().len()).unwrap_or(0)
     }
 
     /// A page's tracked title (updated via wry's document-title-changed
     /// handler) — test/inspection helper.
     pub fn page_title(&self, id: &str) -> Option<String> {
         self.core.borrow().page(id).map(|p| p.title.borrow().clone())
+    }
+
+    /// A page's current URL regardless of whether it's loaded or active —
+    /// the live engine's URL if it has one, else the frozen URL from before
+    /// it was unloaded. Unlike `active_url`, works for any page — test/
+    /// inspection helper.
+    pub fn page_url(&self, id: &str) -> Option<String> {
+        self.core.borrow().page(id).map(|p| p.current_url())
     }
 
     /// Whether the switcher grid is currently shown — test/inspection helper.

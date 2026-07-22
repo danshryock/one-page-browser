@@ -229,6 +229,37 @@ fn main() -> anyhow::Result<()> {
         loaded_after_unlimited == 2,
     );
 
+    // The `loaded` flag alone only proves bookkeeping, not real resource
+    // reclamation. Tighten the limit to 1 to force an eviction, confirm the
+    // evicted page's webview widget was actually torn down (its stack
+    // container has zero children — the `loaded` checks above never assert
+    // this), then confirm switching back to it rebuilds a live widget
+    // reloaded at its original URL.
+    app.set_max_loaded_pages(Some(1));
+    let reclaimed_id = app
+        .page_ids()
+        .into_iter()
+        .find(|id| !app.is_page_loaded(id))
+        .expect("tightening to limit 1 with more than one open page should evict at least one");
+    let reclaimed_url = app.page_url(&reclaimed_id).expect("an evicted page still remembers its last URL");
+    all_ok &= check(
+        "the evicted page's webview widget is actually torn down, not just flagged",
+        app.page_container_child_count(&reclaimed_id) == 0,
+    );
+
+    app.switch_to(&reclaimed_id);
+    all_ok &= check(
+        "switching to an unloaded page rebuilds a live webview widget",
+        app.page_container_child_count(&reclaimed_id) == 1,
+    );
+    all_ok &= check("switching to an unloaded page marks it loaded again", app.is_page_loaded(&reclaimed_id));
+    all_ok &= check(
+        "the rebuilt webview reloads the page's original URL",
+        wait_until(TIMEOUT, || app.active_url().as_deref() == Some(reclaimed_url.as_str())),
+    );
+
+    app.set_max_loaded_pages(None);
+
     // Real end-to-end check that the toolbar address bar (not just the
     // switcher's search box) resolves non-URL input via the preferred
     // search engine — this path had zero coverage before
