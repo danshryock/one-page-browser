@@ -48,6 +48,15 @@ impl WryEngine {
         })?;
         Ok(())
     }
+
+    /// Win32 has no `Stack`-like widget to show only the active page's
+    /// webview the way GTK's does on Linux — every page's webview is a
+    /// sibling child window of the same parent, so exactly one must be
+    /// shown (and the rest hidden) by hand whenever the active page changes.
+    pub fn set_visible(&self, visible: bool) -> anyhow::Result<()> {
+        self.webview.set_visible(visible)?;
+        Ok(())
+    }
 }
 
 impl RenderEngine for WryEngine {

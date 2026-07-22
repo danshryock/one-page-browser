@@ -1,5 +1,7 @@
 fn main() -> anyhow::Result<()> {
-    browser_windows::create_window()?;
-    browser_windows::run_message_loop();
+    let (hwnd, app) = browser_windows::create_window()?;
+    let start_page = app.settings().start_page.clone();
+    app.add_page(&start_page)?;
+    browser_windows::run_message_loop(hwnd);
     Ok(())
 }
