@@ -17,12 +17,30 @@ pub struct AppState {
     /// GTK `Stack` children, keyed by page id — `browser_core::Page` doesn't
     /// hold these since they're a GTK-only concept.
     containers: RefCell<HashMap<String, gtk::Box>>,
-    settings: Settings,
+    settings: RefCell<Settings>,
 }
 
 impl AppState {
-    pub fn settings(&self) -> &Settings {
-        &self.settings
+    pub fn settings(&self) -> std::cell::Ref<'_, Settings> {
+        self.settings.borrow()
+    }
+
+    /// Applies a new loaded-pages limit: updates the stored setting, tells
+    /// the live `PageManager` (which enforces it immediately, unlike a page
+    /// reactivated via switching), and refreshes the grid so any resulting
+    /// evictions show up right away. Used by the settings dialog's Save
+    /// action, and reusable directly (e.g. from a test) without needing to
+    /// drive that dialog's UI.
+    pub fn set_max_loaded_pages(self: &Rc<Self>, limit: Option<usize>) {
+        self.settings.borrow_mut().max_loaded_pages = limit;
+        self.core.borrow_mut().set_max_loaded_pages(limit);
+        self.rebuild_switcher_grid();
+    }
+
+    /// Whether `id` currently counts against the loaded-pages limit — test/
+    /// inspection helper.
+    pub fn is_page_loaded(&self, id: &str) -> bool {
+        self.core.borrow().is_page_loaded(id)
     }
 }
 
@@ -170,6 +188,9 @@ impl AppState {
                 );
                 tile.style_context()
                     .add_provider(&css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+                if !page.loaded {
+                    tile.style_context().add_class("page-tile-unloaded");
+                }
                 tile.set_size_request(150, 110);
                 // Keyboard focus should land on the FlowBoxChild wrapper, not
                 // descend into this button, so arrow keys move between tiles
@@ -183,7 +204,8 @@ impl AppState {
                 let title_label = gtk::Label::new(Some(&title_text));
                 title_label.set_halign(gtk::Align::Start);
                 title_label.style_context().add_class("tile-title");
-                let domain_label = gtk::Label::new(Some(&domain));
+                let domain_text = if page.loaded { domain } else { format!("{domain} \u{b7} unloaded") };
+                let domain_label = gtk::Label::new(Some(&domain_text));
                 domain_label.set_halign(gtk::Align::Start);
                 domain_label.style_context().add_class("tile-subtitle");
                 inner.pack_start(&title_label, false, false, 0);
@@ -295,6 +317,87 @@ impl AppState {
     }
 }
 
+/// Shows a modal "Settings" dialog for editing `AppState.settings` (start
+/// page, default search engine, loaded-pages limit). Scoped to picking the
+/// default search engine from the existing seeded list, not adding/editing
+/// entries — that's a fuller list-editor UI, left for later.
+fn show_settings_dialog(app: &Rc<AppState>, parent: &gtk::Window) {
+    let dialog = gtk::Dialog::new();
+    dialog.set_title("Settings");
+    dialog.set_transient_for(Some(parent));
+    dialog.set_modal(true);
+    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+    dialog.add_button("Save", gtk::ResponseType::Ok);
+
+    let content = dialog.content_area();
+    content.set_margin(12);
+    content.set_spacing(8);
+
+    let (current_start_page, current_engine, current_limit) = {
+        let settings = app.settings();
+        (settings.start_page.clone(), settings.default_search_engine.clone(), settings.max_loaded_pages)
+    };
+
+    let start_page_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    start_page_row.pack_start(&gtk::Label::new(Some("Start page")), false, false, 0);
+    let start_page_entry = gtk::Entry::new();
+    start_page_entry.set_text(&current_start_page);
+    start_page_entry.set_hexpand(true);
+    start_page_row.pack_start(&start_page_entry, true, true, 0);
+    content.pack_start(&start_page_row, false, false, 0);
+
+    let engine_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    engine_row.pack_start(&gtk::Label::new(Some("Search engine")), false, false, 0);
+    let engine_combo = gtk::ComboBoxText::new();
+    for engine in &app.settings().search_engines {
+        engine_combo.append(Some(&engine.name), &engine.name);
+    }
+    engine_combo.set_active_id(Some(&current_engine));
+    engine_row.pack_start(&engine_combo, true, true, 0);
+    content.pack_start(&engine_row, false, false, 0);
+
+    let limit_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    limit_row.pack_start(&gtk::Label::new(Some("Loaded pages limit")), false, false, 0);
+    let unlimited_check = gtk::CheckButton::new();
+    unlimited_check.set_label("Unlimited");
+    let limit_spin = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
+    match current_limit {
+        Some(n) => {
+            unlimited_check.set_active(false);
+            limit_spin.set_value(n as f64);
+        }
+        None => {
+            unlimited_check.set_active(true);
+            limit_spin.set_sensitive(false);
+        }
+    }
+    {
+        let limit_spin = limit_spin.clone();
+        unlimited_check.connect_toggled(move |check| {
+            limit_spin.set_sensitive(!check.is_active());
+        });
+    }
+    limit_row.pack_start(&unlimited_check, false, false, 0);
+    limit_row.pack_start(&limit_spin, false, false, 0);
+    content.pack_start(&limit_row, false, false, 0);
+
+    dialog.show_all();
+    let response = dialog.run();
+    if response == gtk::ResponseType::Ok {
+        {
+            let mut settings = app.settings.borrow_mut();
+            settings.start_page = start_page_entry.text().to_string();
+            if let Some(id) = engine_combo.active_id() {
+                settings.default_search_engine = id.to_string();
+            }
+        }
+        let new_limit =
+            if unlimited_check.is_active() { None } else { Some(limit_spin.value_as_int().max(1) as usize) };
+        app.set_max_loaded_pages(new_limit);
+    }
+    dialog.close();
+}
+
 /// Builds the full window + chrome (header bar, page stack, switcher overlay)
 /// and wires up all signal handlers. Does not create any page — call
 /// `app.add_page(HOME_URL)` (or any other URL) afterward to open the first one.
@@ -313,7 +416,8 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
                 border: none; box-shadow: none; border-radius: 9999px; padding: 0; \
                 min-width: 0; min-height: 0; } \
               .tile-close-label { color: #ffffff; } \
-              .switcher-hint { color: rgba(255, 255, 255, 0.6); font-size: 12px; }",
+              .switcher-hint { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
+              .page-tile-unloaded { opacity: 0.5; }",
         );
         gtk::StyleContext::add_provider_for_screen(&screen, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
@@ -350,7 +454,12 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
         Some("view-grid-symbolic"),
         gtk::IconSize::Button,
     )));
-    for button in [&back_button, &forward_button, &reload_button, &switcher_toggle] {
+    let settings_button = gtk::Button::new();
+    settings_button.set_image(Some(&gtk::Image::from_icon_name(
+        Some("preferences-system-symbolic"),
+        gtk::IconSize::Button,
+    )));
+    for button in [&back_button, &forward_button, &reload_button, &switcher_toggle, &settings_button] {
         button.style_context().add_class("flat");
     }
 
@@ -381,6 +490,7 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
     header_bar.set_custom_title(Some(&address_group));
 
     header_bar.pack_end(&switcher_toggle);
+    header_bar.pack_end(&settings_button);
 
     window.set_titlebar(Some(&header_bar));
 
@@ -439,15 +549,16 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
     window.set_title("claude-browser");
 
     let settings = Settings::default();
+    let core = PageManager::new(settings.max_loaded_pages);
     let app = Rc::new(AppState {
         address_bar: address_bar.clone(),
         stack,
         switcher_panel: switcher_overlay.clone().upcast::<gtk::Widget>(),
         search_entry: search_entry.clone(),
         flowbox: flowbox.clone(),
-        core: RefCell::new(PageManager::new(settings.max_loaded_pages)),
+        core: RefCell::new(core),
         containers: RefCell::new(HashMap::new()),
-        settings,
+        settings: RefCell::new(settings),
     });
 
     let app_weak = Rc::downgrade(&app);
@@ -565,6 +676,13 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
             } else {
                 app.open_switcher();
             }
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        let window = window.clone();
+        settings_button.connect_clicked(move |_| {
+            show_settings_dialog(&app, &window);
         });
     }
     {

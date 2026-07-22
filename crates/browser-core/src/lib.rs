@@ -164,6 +164,15 @@ impl<E> PageManager<E> {
         self.pages.iter().filter(|p| p.loaded).count()
     }
 
+    /// Changes the loaded-page limit and enforces it immediately (unlike
+    /// `set_active` reactivating a page, which defers enforcement to the
+    /// next new page load — a user explicitly changing this setting should
+    /// take effect right away).
+    pub fn set_max_loaded_pages(&mut self, limit: Option<usize>) {
+        self.max_loaded_pages = limit;
+        self.enforce_loaded_limit();
+    }
+
     pub fn active_id(&self) -> &str {
         &self.active_id
     }
@@ -325,5 +334,22 @@ mod tests {
         assert!(mgr.is_page_loaded(&id2));
         assert!(mgr.is_page_loaded(&id3));
         assert_eq!(mgr.loaded_page_count(), 3);
+    }
+
+    #[test]
+    fn set_max_loaded_pages_enforces_the_new_limit_immediately() {
+        // Unlike set_active reactivating a page (which defers enforcement),
+        // explicitly changing the limit should evict right away.
+        let mut mgr: PageManager<MockEngine> = PageManager::new(None);
+        let id1 = insert_page(&mut mgr, "https://a.example");
+        let id2 = insert_page(&mut mgr, "https://b.example");
+        let id3 = insert_page(&mut mgr, "https://c.example");
+        assert_eq!(mgr.loaded_page_count(), 3, "no limit yet, all loaded");
+
+        mgr.set_max_loaded_pages(Some(1));
+        assert_eq!(mgr.loaded_page_count(), 1, "tightening the limit evicts immediately");
+        assert!(mgr.is_page_loaded(&id3), "the foreground page survives");
+        assert!(!mgr.is_page_loaded(&id1));
+        assert!(!mgr.is_page_loaded(&id2));
     }
 }

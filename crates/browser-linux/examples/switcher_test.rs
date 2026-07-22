@@ -205,6 +205,30 @@ fn main() -> anyhow::Result<()> {
         app.active_id() != active_before_close,
     );
 
+    // Real end-to-end check that loaded/unloaded tracking works through the
+    // actual WryEngine-backed PageManager and AppState::set_max_loaded_pages
+    // — browser-core's own unit tests for this only exercise a mock engine.
+    let count_before_limit = app.page_ids().len();
+    app.set_max_loaded_pages(Some(2));
+    let loaded_after_limit = app.page_ids().iter().filter(|id| app.is_page_loaded(id)).count();
+    all_ok &= check(
+        "tightening the limit evicts down to it immediately",
+        loaded_after_limit == count_before_limit.min(2),
+    );
+
+    app.add_page(&url_a)?;
+    let loaded_after_new_page = app.page_ids().iter().filter(|id| app.is_page_loaded(id)).count();
+    all_ok &= check("loading a new page past the limit evicts the oldest again", loaded_after_new_page == 2);
+    let newest_id = app.page_ids().last().cloned().unwrap_or_default();
+    all_ok &= check("the newly loaded page itself is loaded", app.is_page_loaded(&newest_id));
+
+    app.set_max_loaded_pages(None);
+    let loaded_after_unlimited = app.page_ids().iter().filter(|id| app.is_page_loaded(id)).count();
+    all_ok &= check(
+        "removing the limit doesn't retroactively reload anything unloaded",
+        loaded_after_unlimited == 2,
+    );
+
     // Close down to zero: shouldn't panic, and should land on some fallback page.
     for id in app.page_ids() {
         app.close_page(&id);
