@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 pub use browser_core::HOME_URL;
-use browser_core::{domain_of, normalize_url, PageManager};
+use browser_core::{domain_of, normalize_url, PageManager, Settings};
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
 
@@ -17,6 +17,13 @@ pub struct AppState {
     /// GTK `Stack` children, keyed by page id — `browser_core::Page` doesn't
     /// hold these since they're a GTK-only concept.
     containers: RefCell<HashMap<String, gtk::Box>>,
+    settings: Settings,
+}
+
+impl AppState {
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
 }
 
 impl AppState {
@@ -431,14 +438,16 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
     switcher_overlay.hide();
     window.set_title("claude-browser");
 
+    let settings = Settings::default();
     let app = Rc::new(AppState {
         address_bar: address_bar.clone(),
         stack,
         switcher_panel: switcher_overlay.clone().upcast::<gtk::Widget>(),
         search_entry: search_entry.clone(),
         flowbox: flowbox.clone(),
-        core: RefCell::new(PageManager::new()),
+        core: RefCell::new(PageManager::new(settings.max_loaded_pages)),
         containers: RefCell::new(HashMap::new()),
+        settings,
     });
 
     let app_weak = Rc::downgrade(&app);

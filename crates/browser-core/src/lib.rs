@@ -7,8 +7,12 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Instant;
 
 use render_engine::RenderEngine;
+
+mod settings;
+pub use settings::{SearchEngine, Settings};
 
 pub const HOME_URL: &str = "about:blank";
 
@@ -37,6 +41,17 @@ pub struct Page<E> {
     pub engine: E,
     pub title: Rc<RefCell<String>>,
     pub color: &'static str,
+    /// Whether this page currently counts against `max_loaded_pages`.
+    /// Bookkeeping only for now — an "unloaded" page's `RenderEngine`/webview
+    /// keeps running underneath; actually suspending/recreating it is a
+    /// follow-up once this tracking exists. Named `loaded` rather than
+    /// "active" to avoid colliding with `PageManager::active_id`, which
+    /// already means "the page currently shown in the UI" — an unrelated
+    /// concept.
+    pub loaded: bool,
+    /// Last time this page was created or switched to. Used to pick which
+    /// loaded page to unload first when over the limit (oldest first).
+    pub last_accessed: Instant,
 }
 
 fn page_matches_query<E: RenderEngine>(page: &Page<E>, query_lower: &str) -> bool {
@@ -52,17 +67,19 @@ pub struct PageManager<E> {
     pages: Vec<Page<E>>,
     active_id: String,
     next_id: u64,
+    /// How many pages may stay `loaded` at once. `None` means unlimited.
+    max_loaded_pages: Option<usize>,
 }
 
 impl<E> Default for PageManager<E> {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
 impl<E> PageManager<E> {
-    pub fn new() -> Self {
-        Self { pages: Vec::new(), active_id: String::new(), next_id: 0 }
+    pub fn new(max_loaded_pages: Option<usize>) -> Self {
+        Self { pages: Vec::new(), active_id: String::new(), next_id: 0, max_loaded_pages }
     }
 
     /// Reserves a fresh page id. Callers build their native container and
@@ -80,8 +97,16 @@ impl<E> PageManager<E> {
     /// the stored `Page` and the callback then share the same cell.
     pub fn insert(&mut self, id: String, engine: E, title: Rc<RefCell<String>>) {
         let color = PALETTE[self.pages.len() % PALETTE.len()];
-        self.pages.push(Page { id: id.clone(), engine, title, color });
+        self.pages.push(Page {
+            id: id.clone(),
+            engine,
+            title,
+            color,
+            loaded: true,
+            last_accessed: Instant::now(),
+        });
         self.active_id = id;
+        self.enforce_loaded_limit();
     }
 
     /// Removes a page and returns it so the caller can clean up its native
@@ -92,8 +117,51 @@ impl<E> PageManager<E> {
         Some(self.pages.remove(index))
     }
 
+    /// Makes `id` the foreground page. Also marks it `loaded` and refreshes
+    /// its `last_accessed` — switching to an old page makes it recently-used
+    /// again — but deliberately does *not* re-enforce `max_loaded_pages`:
+    /// per spec, the limit is only enforced when a new page loads, so
+    /// reactivating an old page can transiently exceed it until then.
     pub fn set_active(&mut self, id: &str) {
         self.active_id = id.to_string();
+        if let Some(page) = self.pages.iter_mut().find(|p| p.id == id) {
+            page.loaded = true;
+            page.last_accessed = Instant::now();
+        }
+    }
+
+    /// While more pages are `loaded` than `max_loaded_pages` allows, unloads
+    /// the loaded page with the oldest `last_accessed` — never the current
+    /// foreground page, which is never unloaded regardless of age. Loops
+    /// rather than a single pass so it fully converges even if several pages
+    /// are loaded at once or the limit is small.
+    fn enforce_loaded_limit(&mut self) {
+        let Some(limit) = self.max_loaded_pages else { return };
+        loop {
+            if self.pages.iter().filter(|p| p.loaded).count() <= limit {
+                return;
+            }
+            let active_id = self.active_id.clone();
+            let oldest = self
+                .pages
+                .iter_mut()
+                .filter(|p| p.loaded && p.id != active_id)
+                .min_by_key(|p| p.last_accessed);
+            match oldest {
+                Some(page) => page.loaded = false,
+                None => return, // nothing left that's safe to unload
+            }
+        }
+    }
+
+    /// Whether `id` currently counts against `max_loaded_pages`.
+    pub fn is_page_loaded(&self, id: &str) -> bool {
+        self.page(id).map(|p| p.loaded).unwrap_or(false)
+    }
+
+    /// How many pages currently count against `max_loaded_pages`.
+    pub fn loaded_page_count(&self) -> usize {
+        self.pages.iter().filter(|p| p.loaded).count()
     }
 
     pub fn active_id(&self) -> &str {
@@ -127,5 +195,135 @@ impl<E: RenderEngine> PageManager<E> {
     pub fn matching_ids(&self, query: &str) -> Vec<String> {
         let query = query.to_lowercase();
         self.pages.iter().filter(|p| page_matches_query(p, &query)).map(|p| p.id.clone()).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Trivial `RenderEngine` for testing `PageManager`'s pure bookkeeping
+    /// logic without any real webview/GTK involved — just enough to satisfy
+    /// the trait bound `matching_ids`/`page_matches_query` need.
+    struct MockEngine {
+        url: RefCell<String>,
+    }
+
+    impl MockEngine {
+        fn new(url: &str) -> Self {
+            Self { url: RefCell::new(url.to_string()) }
+        }
+    }
+
+    impl RenderEngine for MockEngine {
+        fn navigate(&self, url: &str) -> anyhow::Result<()> {
+            *self.url.borrow_mut() = url.to_string();
+            Ok(())
+        }
+        fn current_url(&self) -> anyhow::Result<String> {
+            Ok(self.url.borrow().clone())
+        }
+        fn go_back(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn go_forward(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn reload(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn insert_page(mgr: &mut PageManager<MockEngine>, url: &str) -> String {
+        let id = mgr.allocate_id();
+        mgr.insert(id.clone(), MockEngine::new(url), Rc::new(RefCell::new(String::new())));
+        // Guarantee distinct `last_accessed` timestamps regardless of clock
+        // resolution, so oldest-first ordering in tests is deterministic.
+        std::thread::sleep(Duration::from_millis(2));
+        id
+    }
+
+    #[test]
+    fn new_page_is_loaded_and_becomes_active() {
+        let mut mgr: PageManager<MockEngine> = PageManager::new(None);
+        let id = insert_page(&mut mgr, "https://a.example");
+        assert_eq!(mgr.active_id(), id);
+        assert!(mgr.is_page_loaded(&id));
+        assert_eq!(mgr.loaded_page_count(), 1);
+    }
+
+    #[test]
+    fn no_limit_never_unloads_anything() {
+        let mut mgr: PageManager<MockEngine> = PageManager::new(None);
+        let ids: Vec<_> = (0..5).map(|i| insert_page(&mut mgr, &format!("https://{i}.example"))).collect();
+        assert_eq!(mgr.loaded_page_count(), 5);
+        for id in ids {
+            assert!(mgr.is_page_loaded(&id));
+        }
+    }
+
+    #[test]
+    fn loading_past_the_limit_unloads_the_oldest() {
+        let mut mgr: PageManager<MockEngine> = PageManager::new(Some(2));
+        let id1 = insert_page(&mut mgr, "https://a.example");
+        let id2 = insert_page(&mut mgr, "https://b.example");
+        assert_eq!(mgr.loaded_page_count(), 2, "still at the limit, nothing unloaded yet");
+
+        let id3 = insert_page(&mut mgr, "https://c.example");
+        assert_eq!(mgr.loaded_page_count(), 2, "back down to the limit after the 3rd load");
+        assert!(!mgr.is_page_loaded(&id1), "oldest page should be unloaded");
+        assert!(mgr.is_page_loaded(&id2));
+        assert!(mgr.is_page_loaded(&id3));
+    }
+
+    #[test]
+    fn enforce_loaded_limit_evicts_more_than_one_page_in_a_single_call() {
+        // Reactivating pages via set_active (which doesn't enforce the
+        // limit) can stack up loaded pages beyond it; the next new page load
+        // must then evict more than one to converge, exercising the loop
+        // rather than a single-eviction pass.
+        let mut mgr: PageManager<MockEngine> = PageManager::new(Some(1));
+        let id1 = insert_page(&mut mgr, "https://a.example");
+        let id2 = insert_page(&mut mgr, "https://b.example");
+        assert!(!mgr.is_page_loaded(&id1), "over limit 1, id1 unloaded by id2's insert");
+
+        mgr.set_active(&id1); // reactivates id1 without enforcing the limit
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(mgr.loaded_page_count(), 2, "both loaded transiently, over the limit of 1");
+
+        let id3 = insert_page(&mut mgr, "https://c.example");
+        assert_eq!(mgr.loaded_page_count(), 1, "converged back to the limit in one call");
+        assert!(mgr.is_page_loaded(&id3));
+        assert!(!mgr.is_page_loaded(&id1));
+        assert!(!mgr.is_page_loaded(&id2));
+    }
+
+    #[test]
+    fn current_foreground_page_is_never_unloaded() {
+        let mut mgr: PageManager<MockEngine> = PageManager::new(Some(1));
+        let id1 = insert_page(&mut mgr, "https://a.example");
+        assert!(mgr.is_page_loaded(&id1));
+        // id1 is both the only loaded page and the foreground page; nothing
+        // else exists to unload, so it must survive even at limit 1.
+        assert_eq!(mgr.active_id(), id1);
+    }
+
+    #[test]
+    fn switching_to_an_unloaded_page_reactivates_it_without_evicting_others() {
+        let mut mgr: PageManager<MockEngine> = PageManager::new(Some(2));
+        let id1 = insert_page(&mut mgr, "https://a.example");
+        let id2 = insert_page(&mut mgr, "https://b.example");
+        let id3 = insert_page(&mut mgr, "https://c.example");
+        assert!(!mgr.is_page_loaded(&id1)); // unloaded by the 3rd insert
+
+        mgr.set_active(&id1);
+        assert!(mgr.is_page_loaded(&id1), "switching to it should reactivate it");
+        assert_eq!(mgr.active_id(), id1);
+        // set_active must not itself re-enforce the limit: all three may be
+        // loaded at once transiently until the next new page load.
+        assert!(mgr.is_page_loaded(&id2));
+        assert!(mgr.is_page_loaded(&id3));
+        assert_eq!(mgr.loaded_page_count(), 3);
     }
 }
