@@ -17,3 +17,6 @@ windows = { version = "0.62", features = [
 render-engine = { path = "../render-engine" }
 browser-core = { path = "../browser-core" }
 anyhow = "1"
+
+[build-dependencies]
+embed-resource = "3"
