@@ -25,15 +25,27 @@ pub fn domain_of(url: &str) -> String {
     without_scheme.split('/').next().unwrap_or(without_scheme).to_string()
 }
 
-/// Turns whatever the user typed in the switcher search box into a URL: pass
-/// through anything that already looks like one, otherwise assume `https://`.
-pub fn normalize_url(input: &str) -> String {
+/// Turns whatever the user typed into an address bar (the toolbar one, or
+/// the switcher's search box) into a URL to actually navigate to:
+/// - Already looks like a URL → passed through unchanged.
+/// - Contains whitespace → not a valid single host token, so build a search
+///   URL from the preferred search engine instead.
+/// - Otherwise → assume it's a bare host and prepend `https://` (unchanged
+///   from this function's original, more limited behavior — this is the
+///   case a fixed regression test locks in, so it deliberately didn't change
+///   here even though the function itself grew search-engine awareness).
+pub fn resolve_address_input(input: &str, settings: &Settings) -> String {
     let trimmed = input.trim();
     if trimmed.contains("://") || trimmed.starts_with("about:") {
-        trimmed.to_string()
-    } else {
-        format!("https://{trimmed}")
+        return trimmed.to_string();
     }
+    if trimmed.chars().any(|c| c.is_whitespace()) {
+        if let Some(engine) = settings.default_search_engine() {
+            let encoded = percent_encoding::utf8_percent_encode(trimmed, percent_encoding::NON_ALPHANUMERIC);
+            return engine.query_url_template.replace("{query}", &encoded.to_string());
+        }
+    }
+    format!("https://{trimmed}")
 }
 
 pub struct Page<E> {
@@ -351,5 +363,38 @@ mod tests {
         assert!(mgr.is_page_loaded(&id3), "the foreground page survives");
         assert!(!mgr.is_page_loaded(&id1));
         assert!(!mgr.is_page_loaded(&id2));
+    }
+
+    #[test]
+    fn resolve_address_input_passes_through_urls_unchanged() {
+        let settings = Settings::default();
+        assert_eq!(resolve_address_input("https://example.com/path", &settings), "https://example.com/path");
+        assert_eq!(resolve_address_input("about:blank", &settings), "about:blank");
+    }
+
+    #[test]
+    fn resolve_address_input_no_spaces_still_gets_https_prefix() {
+        // Locked in by switcher_test.rs's existing regression check: this
+        // exact input must keep resolving this exact way.
+        let settings = Settings::default();
+        assert_eq!(
+            resolve_address_input("some-nonexistent-domain-example", &settings),
+            "https://some-nonexistent-domain-example"
+        );
+    }
+
+    #[test]
+    fn resolve_address_input_with_spaces_builds_a_search_url() {
+        let settings = Settings::default();
+        let resolved = resolve_address_input("how to cook rice", &settings);
+        assert_eq!(resolved, "https://www.google.com/search?q=how%20to%20cook%20rice");
+    }
+
+    #[test]
+    fn resolve_address_input_search_uses_whichever_engine_is_default() {
+        let mut settings = Settings::default();
+        settings.default_search_engine = "DuckDuckGo".to_string();
+        let resolved = resolve_address_input("rust programming language", &settings);
+        assert_eq!(resolved, "https://duckduckgo.com/?q=rust%20programming%20language");
     }
 }

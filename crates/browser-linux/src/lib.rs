@@ -2,8 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-pub use browser_core::HOME_URL;
-use browser_core::{domain_of, normalize_url, PageManager, Settings};
+use browser_core::{domain_of, resolve_address_input, PageManager, Settings};
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
 
@@ -144,7 +143,8 @@ impl AppState {
             match next_id {
                 Some(nid) => self.set_active(&nid),
                 None => {
-                    if let Err(err) = self.add_page(HOME_URL) {
+                    let start_page = self.settings.borrow().start_page.clone();
+                    if let Err(err) = self.add_page(&start_page) {
                         eprintln!("failed to open replacement page: {err}");
                     }
                 }
@@ -256,7 +256,8 @@ impl AppState {
         add_tile.add(&add_tile_label);
         let app_clone = Rc::clone(self);
         add_tile.connect_clicked(move |_| {
-            if let Err(err) = app_clone.add_page(HOME_URL) {
+            let start_page = app_clone.settings.borrow().start_page.clone();
+            if let Err(err) = app_clone.add_page(&start_page) {
                 eprintln!("failed to open new page: {err}");
             }
             app_clone.close_switcher();
@@ -314,6 +315,15 @@ impl AppState {
     pub fn search_activate(&self, text: &str) {
         self.search_entry.set_text(text);
         self.search_entry.emit_activate();
+    }
+
+    /// Types `text` into the toolbar address bar and simulates pressing
+    /// Enter — test helper exercising the real `connect_activate` handler
+    /// (and so the real `resolve_address_input` integration), the same way
+    /// `search_activate` does for the switcher's search box.
+    pub fn address_bar_activate(&self, text: &str) {
+        self.address_bar.set_text(text);
+        self.address_bar.emit_activate();
     }
 }
 
@@ -394,13 +404,17 @@ fn show_settings_dialog(app: &Rc<AppState>, parent: &gtk::Window) {
         let new_limit =
             if unlimited_check.is_active() { None } else { Some(limit_spin.value_as_int().max(1) as usize) };
         app.set_max_loaded_pages(new_limit);
+        if let Err(err) = app.settings().save() {
+            eprintln!("failed to save settings: {err}");
+        }
     }
     dialog.close();
 }
 
 /// Builds the full window + chrome (header bar, page stack, switcher overlay)
 /// and wires up all signal handlers. Does not create any page — call
-/// `app.add_page(HOME_URL)` (or any other URL) afterward to open the first one.
+/// `app.add_page(&app.settings().start_page.clone())` (or any other URL)
+/// afterward to open the first one.
 ///
 /// Assumes `gtk::init()` has already been called.
 pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
@@ -548,7 +562,7 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
     switcher_overlay.hide();
     window.set_title("claude-browser");
 
-    let settings = Settings::default();
+    let settings = Settings::load();
     let core = PageManager::new(settings.max_loaded_pages);
     let app = Rc::new(AppState {
         address_bar: address_bar.clone(),
@@ -591,7 +605,7 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
             }
             match app.matching_page_ids(trimmed).as_slice() {
                 [] => {
-                    let url = normalize_url(trimmed);
+                    let url = resolve_address_input(trimmed, &app.settings());
                     if let Err(err) = app.add_page(&url) {
                         eprintln!("failed to open new page: {err}");
                     }
@@ -621,7 +635,8 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
         flowbox.connect_child_activated(move |_, child| {
             let name = child.widget_name();
             if name.as_str() == "__add__" {
-                if let Err(err) = app.add_page(HOME_URL) {
+                let start_page = app.settings.borrow().start_page.clone();
+                if let Err(err) = app.add_page(&start_page) {
                     eprintln!("failed to open new page: {err}");
                 }
                 app.close_switcher();
@@ -664,7 +679,8 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
     {
         let app = Rc::clone(&app);
         address_bar.connect_activate(move |entry| {
-            let url = entry.text().to_string();
+            let text = entry.text().to_string();
+            let url = resolve_address_input(&text, &app.settings());
             app.with_active(|p| p.navigate(&url));
         });
     }

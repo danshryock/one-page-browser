@@ -229,6 +229,17 @@ fn main() -> anyhow::Result<()> {
         loaded_after_unlimited == 2,
     );
 
+    // Real end-to-end check that the toolbar address bar (not just the
+    // switcher's search box) resolves non-URL input via the preferred
+    // search engine — this path had zero coverage before
+    // resolve_address_input existed (the address bar used to navigate with
+    // raw, unresolved text, so a bare search phrase would just fail to load).
+    app.address_bar_activate("how to cook rice");
+    let resolved_search_url = wait_until(TIMEOUT, || {
+        app.active_url().as_deref() == Some("https://www.google.com/search?q=how%20to%20cook%20rice")
+    });
+    all_ok &= check("toolbar address bar resolves multi-word input via the search engine", resolved_search_url);
+
     // Close down to zero: shouldn't panic, and should land on some fallback page.
     for id in app.page_ids() {
         app.close_page(&id);

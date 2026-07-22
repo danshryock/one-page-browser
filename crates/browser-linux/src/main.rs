@@ -1,10 +1,11 @@
-use browser_linux::{build_window_and_app, HOME_URL};
+use browser_linux::build_window_and_app;
 
 fn main() -> anyhow::Result<()> {
     gtk::init()?;
 
     let (_window, app) = build_window_and_app()?;
-    app.add_page(HOME_URL)?;
+    let start_page = app.settings().start_page.clone();
+    app.add_page(&start_page)?;
 
     gtk::main();
     Ok(())
