@@ -8,14 +8,14 @@ A cross-platform web browser written in Rust. No tabs, by design.
 - **Chrome (window, address bar, buttons)** is built with each platform's native UI toolkit rather than a shared cross-platform GUI toolkit — GTK (`gtk-rs`) on Linux today, with Win32/WinUI and AppKit planned for Windows/macOS. This avoids an event-loop conflict that shared toolkits like `iced` would introduce with `wry`/`tao`.
 - Chrome code never depends on `wry` directly — it talks to a `RenderEngine` trait (`crates/render-engine`), so the underlying engine can be swapped later (e.g. Servo, CEF, a custom engine) without touching the app.
 
-Linux (`crates/browser-linux-gtk3`) is implemented and working. Windows (`crates/browser-windows-win32`) has a
-first-milestone native Win32 chrome (single page, back/forward/reload, address bar — no switcher grid
-yet). It's been cross-compiled and run from this same Linux dev machine (see below) — the window, toolbar,
-and message loop are confirmed working under Wine, but WebView2 itself (the actual Edge-based rendering
-engine, distinct from the small `WebView2Loader.dll` stub) isn't available under Wine, so the content area
-won't render there. A window still opens if the webview fails to initialize (logged, not fatal) rather
-than the whole app silently failing to launch — test the actual browsing on a real Windows machine.
-macOS isn't started yet.
+Linux (`crates/browser-linux-gtk3`) is implemented and working. Windows has two native Win32 chrome
+implementations (`crates/browser-windows-win32`, hand-rolled; `crates/browser-windows-nwg`, built on
+`native-windows-gui`) with feature parity to Linux. Both have been cross-compiled and run from this same
+Linux dev machine (see below) — the window, toolbar, switcher, and message loop are confirmed working
+under Wine, and with the Wine setup documented in "WebView2 under Wine" below, WebView2 itself actually
+renders real page content too, not just the native chrome — confirmed by loading a live page over the
+network and seeing it render correctly. A window still opens even if the webview fails to initialize
+(logged, not fatal) rather than the whole app silently failing to launch. macOS isn't started yet.
 
 ## Installing dependencies
 
@@ -125,15 +125,83 @@ need the manual copy — or add its directory to `PATH` — since this trick is 
 cargo run --target x86_64-pc-windows-gnu -p browser-windows-win32
 ```
 
-The window, toolbar, and address bar come up normally. Expect (and it's fine) to see this in the
-output — Wine has no real WebView2 Runtime, so the content area never initializes, but the window and
-chrome still work:
+The window, toolbar, and address bar come up normally. Without the WebView2-under-Wine setup below, expect
+(and it's fine) to see this in the output — Wine has no WebView2 Runtime installed by default, so the
+content area never initializes, but the window and chrome still work:
 
 ```
 Error: WebView2 error: WindowsError(Error { code: HRESULT(0x80070002), message: "File not found." })
 ```
 
 The same applies to `browser-windows-nwg` — swap the `-p` above.
+
+### WebView2 under Wine (optional, for real content rendering)
+
+By default Wine has no WebView2 Runtime installed at all, hence the "File not found" error above — the
+window/toolbar/switcher are real and testable regardless, but the content area stays blank. Getting an
+actual WebView2 Runtime running under Wine is possible, but Ubuntu 24.04's packaged Wine (9.0) is too old:
+the runtime's own process (`msedgewebview2.exe`) fails to start on it. This project uses a **dedicated
+Wine 11.0 build and bottle, both kept project-local under `.wine/`** (gitignored — large, machine-specific
+binary artifacts, not source) rather than anywhere in your home directory, so they're easy to find,
+easy to blow away and redo, and don't leak into other projects' Wine setups — confirmed working
+end-to-end by actually loading `https://example.com` over the network and seeing it render correctly, not
+just opening a blank window.
+
+**1. Get Wine 11.0 without root** (no `sudo`/apt-repo access needed — a `.deb` is just an ar/tar archive,
+so `dpkg-deb -x` extracts its contents anywhere without touching the system package database). Run this
+from the repo root:
+
+```sh
+mkdir -p /tmp/wine11 && cd /tmp/wine11
+for pkg in wine-stable wine-stable-amd64 wine-stable-i386; do
+  arch=amd64; [ "$pkg" = wine-stable-i386 ] && arch=i386
+  packages=$(curl -fsSL "https://dl.winehq.org/wine-builds/ubuntu/dists/noble/main/binary-$arch/Packages")
+  url=$(printf '%s\n' "$packages" | awk -v p="$pkg" '$0=="Package: "p{f=1} f&&/^Filename:/{print $2; exit}')
+  curl -fsSL -o "$pkg.deb" "https://dl.winehq.org/wine-builds/ubuntu/$url"
+  dpkg-deb -x "$pkg.deb" "$OLDPWD/.wine/wine-11.0/"
+done
+cd "$OLDPWD"
+.wine/wine-11.0/opt/wine-stable/bin/wine --version   # should print wine-11.0 (or newer)
+```
+
+(Wine's own binaries resolve their `lib/wine` directory relative to their own location, not a hardcoded
+absolute path — this works regardless of where you extract it to, confirmed empirically.)
+
+**2. Create the `webview2` bottle and set it to report Windows 11** (community reports indicate WebView2
+needs a fairly recent Windows version reported; Windows 7 mode is applied automatically to
+`msedgewebview2.exe` specifically by winetricks' `webview2` verb below, which is the actual per-exe
+workaround needed — see [wine bug 58921](https://bugs.winehq.org/show_bug.cgi?id=58921)). Still from the
+repo root:
+
+```sh
+WINE_BIN="$PWD/.wine/wine-11.0/opt/wine-stable/bin"
+export PATH="$WINE_BIN:$PATH"
+export WINESERVER="$WINE_BIN/wineserver"
+export WINEPREFIX="$PWD/.wine/bottle"
+
+wineboot --init
+```
+
+Then, still with those env vars set, fetch a current `winetricks` (the `webview2` verb is new enough that
+Ubuntu's packaged `winetricks` — 20240105 as of this writing — doesn't have it yet) and use it to set the
+reported Windows version and install the runtime:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks -o /tmp/winetricks
+chmod +x /tmp/winetricks
+/tmp/winetricks -q win11
+/tmp/winetricks -q webview2
+```
+
+The second command downloads and silently installs the real Microsoft Edge WebView2 Runtime from
+Microsoft's servers — it's a genuine ~1.4 GB install (Chromium-based), so it takes a few minutes.
+
+**3. That's it** — `.cargo/wine-runner.sh` (the runner configured in `.cargo/config.toml`) automatically
+detects and uses this Wine build and bottle if present at `.wine/wine-11.0` and `.wine/bottle` (resolved
+relative to the script's own location, so this works no matter which directory inside the repo you invoke
+`cargo` from), falling back to whatever `wine`/`WINEPREFIX` are already on your `PATH`/in your environment
+if you skip this setup. No further configuration needed — `cargo run-win32`, `cargo run-nwg`, or a plain
+`cargo run --target x86_64-pc-windows-gnu -p ...` all pick it up transparently.
 
 ## Testing
 

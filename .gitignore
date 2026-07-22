@@ -1,1 +1,6 @@
 /target
+
+# Wine 11.0 build + the "webview2" bottle (see README.md's "WebView2 under
+# Wine" section) - large (multi-GB), machine-specific binary artifacts, not
+# project source.
+/.wine
