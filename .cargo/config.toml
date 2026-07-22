@@ -19,3 +19,17 @@ runner = ".cargo/wine-runner.sh"
 run-gtk3 = "run -p browser-linux-gtk3"
 run-win32 = "run --target x86_64-pc-windows-gnu -p browser-windows-win32"
 run-nwg = "run --target x86_64-pc-windows-gnu -p browser-windows-nwg"
+# browser-wx (wxDragon) isn't target-gated — see crates/browser-wx/src/lib.rs
+# — so this alias just runs it natively here, same as any other crate.
+run-wx = "run -p browser-wx"
+# There's no [alias] equivalent of run-win32/run-nwg for browser-wx's Windows
+# cross-build: it needs `cargo zigbuild` (see README.md), which — despite
+# having its own internal "run" verb that builds *and* launches — can't be
+# reached through Cargo's [alias]/subcommand dispatch. Cargo always invokes
+# an external plugin as `cargo-<name> <name> <rest>` (repeating the matched
+# name), so "zigbuild run ..." arrives at the cargo-zigbuild binary as
+# arguments to its own "zigbuild" verb, which doesn't recognize "run" and
+# errors — there's no way to get "run" to be the verb cargo-zigbuild receives
+# through `cargo <anything>`. Use `.cargo/run-wx-wine.sh` instead, which
+# calls `cargo zigbuild` (the build verb, which *is* reachable this way) and
+# then the wine-runner.sh above directly, in one script.

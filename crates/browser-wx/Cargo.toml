@@ -1,0 +1,11 @@
+[package]
+name = "browser-wx"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+wxdragon = { version = "0.9", features = ["webview"] }
+render-engine = { path = "../render-engine" }
+browser-core = { path = "../browser-core" }
+anyhow = "1"

@@ -17,6 +17,16 @@ renders real page content too, not just the native chrome — confirmed by loadi
 network and seeing it render correctly. A window still opens even if the webview fails to initialize
 (logged, not fatal) rather than the whole app silently failing to launch. macOS isn't started yet.
 
+There's also a fourth, experimental front end, `crates/browser-wx`, built on
+[wxDragon](https://github.com/AllenDang/wxDragon) (Rust bindings for wxWidgets) instead of `wry` —
+wxWidgets' own `wxWebView` widget wraps the OS webview directly (WebView2 on Windows, WebKitGTK on Linux),
+so this crate doesn't touch `wry`/`render-engine`'s `WryEngine` at all, only the shared `RenderEngine`
+trait. Unlike the other three, it isn't `target_os`-gated — wxWidgets is itself cross-platform, so this is
+one source tree that builds natively on Linux *and* cross-compiles to Windows unchanged. At feature parity
+with `browser-linux-gtk3` (switcher grid, settings dialog, profile label, keyboard shortcuts) and confirmed
+cross-compiled and running under Wine, chrome and real WebView2 content both — see "browser-wx: building
+and running" below for the (different, `zig`-based) cross-compile path this one needs.
+
 ## Installing dependencies
 
 ### Rust
@@ -52,15 +62,20 @@ MSVC toolchain (`rustup default stable-msvc`) or with a full Visual Studio / Bui
 cargo build
 ```
 
-This builds the whole workspace on any host. Each platform-specific crate
-(`browser-linux-gtk3`, `browser-windows-win32`, `browser-windows-nwg`) is gated on its own
-`target_os` — on a platform it doesn't apply to, it compiles to an empty stub binary (which just
-prints a one-line explanation if you run it) instead of failing, so a bare `cargo build` never
-needs `--exclude` flags no matter which of these you're on.
+This builds the whole workspace on any host. Each `target_os`-gated crate
+(`browser-linux-gtk3`, `browser-windows-win32`, `browser-windows-nwg`) compiles to an empty stub binary
+on a platform it doesn't apply to (which just prints a one-line explanation if you run it) instead of
+failing, so a bare `cargo build` never needs `--exclude` flags no matter which of these you're on.
+`browser-wx` isn't gated at all and just builds for real on any host.
 
-The same is true cross-target: `cargo build --target x86_64-pc-windows-gnu` (see below) or
-[`cross build --target x86_64-pc-windows-gnu`](https://github.com/cross-rs/cross) both build the
-whole workspace too — the Windows crates build for real and `browser-linux-gtk3` becomes the stub.
+The same is true cross-target for `cargo build --target x86_64-pc-windows-gnu` (see below) or
+[`cross build --target x86_64-pc-windows-gnu`](https://github.com/cross-rs/cross) — **with one
+exception**: add `--workspace --exclude browser-wx` (or target the other packages by name) when
+cross-compiling to `x86_64-pc-windows-gnu` this way. `browser-wx`'s `wxdragon-sys` dependency builds
+wxWidgets from source when cross-compiling from Linux, and its build script only knows how to do that
+via [`cargo zigbuild`](#browser-wx-building-and-running) — plain `cargo build`/`cross build` pick a CMake
+generator (`MinGW Makefiles`) that assumes a native Windows host and fails outright on Linux. This is a
+gap in `wxdragon-sys`'s own build script, not something fixable from this repo.
 
 ## Running
 
@@ -202,6 +217,46 @@ relative to the script's own location, so this works no matter which directory i
 `cargo` from), falling back to whatever `wine`/`WINEPREFIX` are already on your `PATH`/in your environment
 if you skip this setup. No further configuration needed — `cargo run-win32`, `cargo run-nwg`, or a plain
 `cargo run --target x86_64-pc-windows-gnu -p ...` all pick it up transparently.
+
+### browser-wx: building and running
+
+Native, on any host (Linux here):
+
+```sh
+cargo run -p browser-wx      # or: cargo run-wx
+```
+
+Cross-compiling to Windows needs [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) and
+[Zig](https://ziglang.org/download/) — `wxdragon-sys` builds wxWidgets from source when cross-compiling
+from Linux, and `cargo zigbuild` (using Zig as the C/C++ cross-compiler and linker) is the only path its
+build script actually supports for that; plain `cargo build --target x86_64-pc-windows-gnu` and
+`cross build` both fail (see the note in "Building" above).
+
+```sh
+cargo install cargo-zigbuild
+# Download Zig (a plain tarball, no root needed) and put it on PATH — see
+# https://ziglang.org/download/ for the current release and other platforms:
+curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+tar -C ~/opt -xf /tmp/zig.tar.xz   # or wherever you keep local tool installs
+export PATH="$HOME/opt/zig-x86_64-linux-0.16.0:$PATH"
+
+cargo zigbuild --target x86_64-pc-windows-gnu -p browser-wx
+```
+
+This produces a real, statically-linked `target/x86_64-pc-windows-gnu/debug/browser-wx.exe` — confirmed
+running under this project's Wine 11.0 + WebView2 setup (see "WebView2 under Wine" above), native chrome
+and real WebView2 content both.
+
+There's no `[alias]` equivalent of `run-win32`/`run-nwg` for this one: Cargo's alias mechanism just
+substitutes arguments and re-dispatches through Cargo's own subcommand resolution, which always invokes an
+external plugin as `cargo-<name> <name> <rest>` — so even though `cargo-zigbuild` has its own internal
+`run` verb (which builds *and* launches), there's no way to make `cargo <alias>` land on it rather than its
+`zigbuild` (build-only) verb. Use the wrapper script instead, which runs `cargo zigbuild` and then
+`wine-runner.sh` in one step:
+
+```sh
+.cargo/run-wx-wine.sh
+```
 
 ## Testing
 

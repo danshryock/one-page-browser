@@ -4,3 +4,8 @@
 # Wine" section) - large (multi-GB), machine-specific binary artifacts, not
 # project source.
 /.wine
+
+# Zig toolchain used by `cargo zigbuild` to cross-compile browser-wx to
+# Windows (see README.md's "browser-wx: building and running" section) -
+# a large, machine-specific binary artifact, not project source.
+/.zig
