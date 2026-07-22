@@ -3,8 +3,8 @@ resolver = "2"
 members = [
     "crates/render-engine",
     "crates/browser-core",
-    "crates/browser-linux",
-    "crates/browser-windows",
+    "crates/browser-linux-gtk3",
+    "crates/browser-windows-win32",
 ]
 
 [workspace.package]

@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use browser_linux::build_window_and_app;
+use browser_linux_gtk3::build_window_and_app;
 
 /// Generous ceiling for how long a webview-derived value (current URL,
 /// document title) may take to settle after a navigation. Wide on purpose:

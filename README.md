@@ -8,7 +8,7 @@ A cross-platform web browser written in Rust. No tabs, by design.
 - **Chrome (window, address bar, buttons)** is built with each platform's native UI toolkit rather than a shared cross-platform GUI toolkit — GTK (`gtk-rs`) on Linux today, with Win32/WinUI and AppKit planned for Windows/macOS. This avoids an event-loop conflict that shared toolkits like `iced` would introduce with `wry`/`tao`.
 - Chrome code never depends on `wry` directly — it talks to a `RenderEngine` trait (`crates/render-engine`), so the underlying engine can be swapped later (e.g. Servo, CEF, a custom engine) without touching the app.
 
-Linux (`crates/browser-linux`) is implemented and working. Windows (`crates/browser-windows`) has a
+Linux (`crates/browser-linux-gtk3`) is implemented and working. Windows (`crates/browser-windows-win32`) has a
 first-milestone native Win32 chrome (single page, back/forward/reload, address bar — no switcher grid
 yet). It's been cross-compiled and run from this same Linux dev machine (see below) — the window, toolbar,
 and message loop are confirmed working under Wine, but WebView2 itself (the actual Edge-based rendering
@@ -52,24 +52,24 @@ MSVC toolchain (`rustup default stable-msvc`) or with a full Visual Studio / Bui
 cargo build
 ```
 
-On Linux, this fails on `browser-windows` — it depends on the `windows` crate, which doesn't build
+On Linux, this fails on `browser-windows-win32` — it depends on the `windows` crate, which doesn't build
 outside Windows. Build the Linux pieces explicitly instead:
 
 ```sh
-cargo build --workspace --exclude browser-windows
+cargo build --workspace --exclude browser-windows-win32
 ```
 
 ## Running
 
 ```sh
-cargo run -p browser-linux   # Linux
-cargo run -p browser-windows # Windows (native build)
+cargo run -p browser-linux-gtk3     # Linux
+cargo run -p browser-windows-win32  # Windows (native build)
 ```
 
 Each opens a native window (GTK on Linux, Win32 on Windows) with an address bar and back / forward /
 reload buttons. Type a URL into the address bar and press Enter (or, on Windows, click Go) to navigate.
 
-### Cross-compiling and running `browser-windows` from Linux
+### Cross-compiling and running `browser-windows-win32` from Linux
 
 Useful for testing the native window/chrome/message-loop code without a Windows machine — WebView2 itself
 won't work this way (see below), but everything else can be exercised end-to-end.
@@ -77,7 +77,7 @@ won't work this way (see below), but everything else can be exercised end-to-end
 ```sh
 rustup target add x86_64-pc-windows-gnu
 sudo apt install -y mingw-w64 wine
-cargo build --target x86_64-pc-windows-gnu -p browser-windows
+cargo build --target x86_64-pc-windows-gnu -p browser-windows-win32
 ```
 
 `webview2-com-sys`'s build script vendors `WebView2Loader.dll` but doesn't copy it next to the binary —
@@ -92,7 +92,7 @@ cp target/x86_64-pc-windows-gnu/debug/build/webview2-com-sys-*/out/x64/WebView2L
 Then run it under Wine:
 
 ```sh
-wine target/x86_64-pc-windows-gnu/debug/browser-windows.exe
+wine target/x86_64-pc-windows-gnu/debug/browser-windows-win32.exe
 ```
 
 The window, toolbar, and address bar come up normally. Expect (and it's fine) to see this in the
@@ -112,10 +112,10 @@ machine logic tested with real unit tests against a mock engine — no GTK or we
 cargo test -p browser-core
 ```
 
-`browser-linux` has two example-based regression tests that drive the actual GTK app end-to-end against
+`browser-linux-gtk3` has two example-based regression tests that drive the actual GTK app end-to-end against
 local fixture pages, printing `PASS`/`FAIL` per check and exiting non-zero if anything fails:
 
 ```sh
-cargo run --example nav_test -p browser-linux       # navigate/back/forward/reload
-cargo run --example switcher_test -p browser-linux  # multi-page switcher, search, loaded/unloaded limit
+cargo run --example nav_test -p browser-linux-gtk3       # navigate/back/forward/reload
+cargo run --example switcher_test -p browser-linux-gtk3  # multi-page switcher, search, loaded/unloaded limit
 ```

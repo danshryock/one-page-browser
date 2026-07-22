@@ -1,9 +1,9 @@
 //! Native Win32 chrome for the browser, brought to feature parity with
-//! `browser-linux`: multi-page `browser_core::PageManager`-backed
+//! `browser-linux-gtk3`: multi-page `browser_core::PageManager`-backed
 //! navigation, a native page switcher, `Settings` with disk persistence, and
 //! real resource reclamation for unloaded pages.
 //!
-//! Two deliberate departures from a literal port of `browser-linux`, both
+//! Two deliberate departures from a literal port of `browser-linux-gtk3`, both
 //! confirmed with the user up front given this crate's verification ceiling
 //! (see below): the switcher is a plain `LISTBOX` of open pages, not a port
 //! of Linux's GTK FlowBox tile grid (Win32 has no flow-layout widget), and
@@ -13,7 +13,7 @@
 //! riskier than reusing the plain-window pattern already proven in this
 //! file for the main window).
 //!
-//! Unlike `browser-linux`, this crate has never been linked or run: there is
+//! Unlike `browser-linux-gtk3`, this crate has never been linked or run: there is
 //! no Windows/WebView2 toolchain (nor a real linker for the target) in the
 //! environment it was written in. It has been type-checked successfully
 //! against the real `windows` 0.62 crate via `cargo check --target
@@ -78,10 +78,10 @@ const ID_SETTINGS_CANCEL: u16 = 3006;
 /// window doesn't get a WM_COMMAND notification for that on its own.
 const WM_APP_NAVIGATE: u32 = WM_APP + 1;
 /// Posted by the switcher's search-edit subclass on Enter — mirrors
-/// `browser-linux`'s `search_entry.connect_activate`.
+/// `browser-linux-gtk3`'s `search_entry.connect_activate`.
 const WM_APP_SWITCHER_ACTIVATE: u32 = WM_APP + 2;
 /// Posted by the switcher list's subclass on Delete — mirrors
-/// `browser-linux`'s flowbox `Delete`-closes-the-selected-tile binding.
+/// `browser-linux-gtk3`'s flowbox `Delete`-closes-the-selected-tile binding.
 const WM_APP_SWITCHER_DELETE: u32 = WM_APP + 3;
 /// Posted by a page's title-changed callback so the switcher list (if open)
 /// can refresh — GTK's signal closures let Linux capture a weak self
@@ -97,7 +97,7 @@ const MARGIN: i32 = 4;
 pub struct AppState {
     /// Also used as the parent for every page's `WryEngine` — every page's
     /// webview is a plain sibling child window of the main window, not
-    /// nested inside a per-page container the way `browser-linux` nests
+    /// nested inside a per-page container the way `browser-linux-gtk3` nests
     /// each page in its own `gtk::Box` (Win32 has no `Stack` widget to
     /// automate "show only the active one", so it's done by hand — see
     /// `layout_children`).
@@ -159,7 +159,7 @@ impl AppState {
     /// Actually tears down the engines for pages `PageManager` just flipped
     /// to unloaded. Dropping a `wry::WebView` on Windows tears down its
     /// WebView2 controller — the analogous "the drop is the reclamation"
-    /// mechanism `browser-linux` relies on (there, confirmed directly via
+    /// mechanism `browser-linux-gtk3` relies on (there, confirmed directly via
     /// wry's WebKitGTK `Drop` impl; here, the expected/documented behavior
     /// of dropping a `WebView2Controller`).
     fn unload_engines(&self, ids: &[String]) {
@@ -204,7 +204,7 @@ impl AppState {
     }
 
     /// User explicitly picked a page to view — updates the active page and
-    /// closes the switcher, mirroring `browser-linux`'s `switch_to`.
+    /// closes the switcher, mirroring `browser-linux-gtk3`'s `switch_to`.
     fn switch_to(&self, id: &str) {
         self.set_active(id);
         self.close_switcher();
@@ -243,7 +243,7 @@ impl AppState {
         }
     }
 
-    /// Mirrors `browser-linux`'s own approach: derive from real widget
+    /// Mirrors `browser-linux-gtk3`'s own approach: derive from real widget
     /// state instead of tracking a separate bool that could drift.
     fn is_switcher_open(&self) -> bool {
         unsafe { IsWindowVisible(self.switcher_listbox).as_bool() }
@@ -276,7 +276,7 @@ impl AppState {
 
     /// Rebuilds `switcher_listbox`'s rows (and `switcher_row_ids` alongside
     /// them) from whatever's currently in the search box, via the same
-    /// `matching_ids` substring match `browser-linux`'s filter uses.
+    /// `matching_ids` substring match `browser-linux-gtk3`'s filter uses.
     fn refresh_switcher_list(&self) {
         let query = get_window_text(self.switcher_search_edit);
         let core = self.core.borrow();
@@ -396,7 +396,7 @@ impl AppState {
 /// Builds the closure passed to `WryEngine::new` for a page's document-
 /// title-changed handler: updates the page's shared title cell, then posts
 /// `WM_APP_TITLE_CHANGED` so the switcher list (if open) can refresh.
-/// `browser-linux` captures a weak `Rc<AppState>` for the equivalent
+/// `browser-linux-gtk3` captures a weak `Rc<AppState>` for the equivalent
 /// refresh; Win32 has no per-widget signal-closure mechanism the way GTK
 /// does, so posting a message to the main window and re-resolving
 /// `app_state` there (the same idiom `WM_APP_NAVIGATE` already uses) is the
@@ -445,7 +445,7 @@ fn app_state(hwnd: HWND) -> Option<&'static AppState> {
 /// Creates the main window and all of its chrome, including the switcher's
 /// (initially hidden) controls. Does not open any page — call
 /// `app.add_page(&app.settings().start_page.clone())` afterward, same as
-/// `browser-linux`'s `build_window_and_app`/`main.rs` split.
+/// `browser-linux-gtk3`'s `build_window_and_app`/`main.rs` split.
 ///
 /// Returns an owned `Rc<AppState>` handle alongside the window: `WM_CREATE`
 /// leaks one strong reference into the window's `GWLP_USERDATA` slot (which
@@ -578,7 +578,7 @@ unsafe extern "system" fn search_edit_subclass_proc(
 }
 
 /// Catches Delete while the switcher's listbox has keyboard focus and posts
-/// `WM_APP_SWITCHER_DELETE` — mirrors `browser-linux`'s flowbox
+/// `WM_APP_SWITCHER_DELETE` — mirrors `browser-linux-gtk3`'s flowbox
 /// `connect_key_press_event` Delete binding.
 unsafe extern "system" fn switcher_list_subclass_proc(
     hwnd: HWND,
@@ -947,7 +947,7 @@ fn register_settings_class(instance: HINSTANCE) {
 /// message loop rather than a resource-template dialog (see module doc).
 /// Disables `main_hwnd` while open (the standard hand-rolled-modal idiom,
 /// and what actually blocks background interaction — playing the same role
-/// `browser-linux`'s `dialog.set_modal(true)` does) and re-enables it after.
+/// `browser-linux-gtk3`'s `dialog.set_modal(true)` does) and re-enables it after.
 fn show_settings_dialog(main_hwnd: HWND, app: &'static AppState) {
     unsafe {
         let Ok(module) = GetModuleHandleW(None) else { return };

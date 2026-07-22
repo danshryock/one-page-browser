@@ -1,5 +1,5 @@
 //! Platform-agnostic page/tab management shared by every native chrome
-//! (`browser-linux`, and eventually `browser-windows`/`browser-macos`).
+//! (`browser-linux-gtk3`, and eventually `browser-windows-win32`/`browser-macos`).
 //! Owns the page list, active-page tracking, search matching, and URL
 //! helpers; deliberately knows nothing about any GUI toolkit — each
 //! platform's chrome wires its own widgets to this and does its own native
@@ -425,7 +425,7 @@ mod tests {
         let mut mgr: PageManager<MockEngine> = PageManager::new(None);
         let id = insert_page(&mut mgr, "https://a.example");
         let taken = mgr.take_engine(&id).expect("should have a live engine to take");
-        // Simulate the caller freezing last_url the way browser-linux's
+        // Simulate the caller freezing last_url the way browser-linux-gtk3's
         // unload_engines does, right before dropping the taken engine.
         mgr.page_mut(&id).unwrap().last_url = taken.current_url().unwrap();
         drop(taken);

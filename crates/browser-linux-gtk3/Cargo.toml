@@ -1,5 +1,5 @@
 [package]
-name = "browser-linux"
+name = "browser-linux-gtk3"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
