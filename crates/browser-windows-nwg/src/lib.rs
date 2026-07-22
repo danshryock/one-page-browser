@@ -19,6 +19,11 @@
 //! `gtk::Box` and had to show/hide each page's webview directly) — hiding a
 //! page's `Frame` hides its embedded webview too, via ordinary Win32
 //! parent/child visibility, closer to `browser-linux-gtk3`'s actual model.
+//!
+//! Gated on the whole crate so a bare `cargo build`/`cross build --target
+//! x86_64-pc-windows-gnu` across the whole workspace succeeds everywhere:
+//! this crate compiles to an empty no-op on any other platform.
+#![cfg(target_os = "windows")]
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;

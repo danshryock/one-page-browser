@@ -22,6 +22,11 @@
 //! up, but WebView2 embedding, layout, and actual runtime behavior are still
 //! unverified. Build and run it on a real Windows machine and report back
 //! anything that breaks.
+//!
+//! Gated on the whole crate so a bare `cargo build`/`cross build --target
+//! x86_64-pc-windows-gnu` across the whole workspace succeeds everywhere:
+//! this crate compiles to an empty no-op on any other platform.
+#![cfg(target_os = "windows")]
 
 use std::cell::RefCell;
 use std::rc::Rc;

@@ -1,8 +1,9 @@
-use browser_core::{resolve_profile_name, Profile};
-use native_windows_gui as nwg;
-use nwg::NativeUi;
-
+#[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
+    use browser_core::{resolve_profile_name, Profile};
+    use native_windows_gui as nwg;
+    use nwg::NativeUi;
+
     nwg::init()?;
 
     let app = browser_windows_nwg::App::build_ui(Default::default())?;
@@ -24,4 +25,12 @@ fn main() -> anyhow::Result<()> {
 
     nwg::dispatch_thread_events();
     Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!(
+        "browser-windows-nwg is a Windows-only binary; nothing to run on this platform. \
+         Build with --target x86_64-pc-windows-gnu (cargo build or cross build)."
+    );
 }

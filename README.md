@@ -52,12 +52,15 @@ MSVC toolchain (`rustup default stable-msvc`) or with a full Visual Studio / Bui
 cargo build
 ```
 
-On Linux, this fails on `browser-windows-win32` — it depends on the `windows` crate, which doesn't build
-outside Windows. Build the Linux pieces explicitly instead:
+This builds the whole workspace on any host. Each platform-specific crate
+(`browser-linux-gtk3`, `browser-windows-win32`, `browser-windows-nwg`) is gated on its own
+`target_os` — on a platform it doesn't apply to, it compiles to an empty stub binary (which just
+prints a one-line explanation if you run it) instead of failing, so a bare `cargo build` never
+needs `--exclude` flags no matter which of these you're on.
 
-```sh
-cargo build --workspace --exclude browser-windows-win32
-```
+The same is true cross-target: `cargo build --target x86_64-pc-windows-gnu` (see below) or
+[`cross build --target x86_64-pc-windows-gnu`](https://github.com/cross-rs/cross) both build the
+whole workspace too — the Windows crates build for real and `browser-linux-gtk3` becomes the stub.
 
 ## Running
 
@@ -69,15 +72,33 @@ cargo run -p browser-windows-win32  # Windows (native build)
 Each opens a native window (GTK on Linux, Win32 on Windows) with an address bar and back / forward /
 reload buttons. Type a URL into the address bar and press Enter (or, on Windows, click Go) to navigate.
 
-### Cross-compiling and running `browser-windows-win32` from Linux
+### Cross-compiling and running the Windows crates from Linux
 
 Useful for testing the native window/chrome/message-loop code without a Windows machine — WebView2 itself
-won't work this way (see below), but everything else can be exercised end-to-end.
+won't work this way (see below), but everything else can be exercised end-to-end. Two ways to get the
+mingw-w64 toolchain in place:
+
+**Option A — local mingw-w64:**
 
 ```sh
 rustup target add x86_64-pc-windows-gnu
 sudo apt install -y mingw-w64 wine
 cargo build --target x86_64-pc-windows-gnu -p browser-windows-win32
+```
+
+**Option B — [`cross`](https://github.com/cross-rs/cross), via Docker (no local mingw-w64 install needed):**
+
+```sh
+cargo install cross --locked
+cross build --target x86_64-pc-windows-gnu -p browser-windows-win32
+```
+
+`cross`'s default image for this target bundles a mingw-w64 too old for the `GetHostNameW` symbol current
+Rust `std` needs — if you see a linker error mentioning it, pin the `:edge` image tag in a `Cross.toml`:
+
+```toml
+[target.x86_64-pc-windows-gnu]
+image = "ghcr.io/cross-rs/x86_64-pc-windows-gnu:edge"
 ```
 
 `webview2-com-sys`'s build script vendors `WebView2Loader.dll` but doesn't copy it next to the binary —

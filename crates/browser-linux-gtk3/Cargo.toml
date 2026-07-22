@@ -5,7 +5,9 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
-gtk = "0.18"
 render-engine = { path = "../render-engine" }
 browser-core = { path = "../browser-core" }
 anyhow = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
