@@ -5,6 +5,7 @@ members = [
     "crates/browser-core",
     "crates/browser-linux-gtk3",
     "crates/browser-windows-win32",
+    "crates/browser-windows-nwg",
 ]
 
 [workspace.package]
