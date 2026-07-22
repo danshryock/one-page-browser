@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/render-engine",
     "crates/browser-linux",
+    "crates/browser-windows",
 ]
 
 [workspace.package]
