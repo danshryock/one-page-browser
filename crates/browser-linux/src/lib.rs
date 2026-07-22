@@ -4,7 +4,7 @@ use std::rc::Rc;
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
 
-pub const HOME_URL: &str = "https://www.rust-lang.org";
+pub const HOME_URL: &str = "about:blank";
 
 const PALETTE: &[&str] = &[
     "#3b6fd4", "#d4573b", "#3bd46f", "#8f3bd4", "#d4a63b", "#3bc7d4",
@@ -13,6 +13,26 @@ const PALETTE: &[&str] = &[
 fn domain_of(url: &str) -> String {
     let without_scheme = url.split("://").nth(1).unwrap_or(url);
     without_scheme.split('/').next().unwrap_or(without_scheme).to_string()
+}
+
+/// Turns whatever the user typed in the switcher search box into a URL: pass
+/// through anything that already looks like one, otherwise assume `https://`.
+fn normalize_url(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.contains("://") || trimmed.starts_with("about:") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    }
+}
+
+fn page_matches_query(page: &Page, query_lower: &str) -> bool {
+    if query_lower.is_empty() {
+        return true;
+    }
+    let title = page.title.borrow().to_lowercase();
+    let url = page.engine.current_url().unwrap_or_default().to_lowercase();
+    title.contains(query_lower) || url.contains(query_lower)
 }
 
 struct Page {
@@ -72,12 +92,16 @@ impl AppState {
             color,
         });
 
-        self.switch_to(&id);
+        self.set_active(&id);
         self.rebuild_switcher_grid();
         Ok(())
     }
 
-    pub fn switch_to(self: &Rc<Self>, id: &str) {
+    /// Makes `id` the active/visible page, without touching the switcher
+    /// panel's visibility — used wherever the active page changes as a side
+    /// effect (creating a page, closing the active one) rather than as an
+    /// explicit "go view this page" action from the user.
+    fn set_active(&self, id: &str) {
         self.stack.set_visible_child_name(id);
         *self.active_id.borrow_mut() = id.to_string();
         if let Some(page) = self.pages.borrow().iter().find(|p| p.id == id) {
@@ -85,7 +109,47 @@ impl AppState {
                 self.address_bar.set_text(&url);
             }
         }
+    }
+
+    /// Opens the switcher grid with a cleared, focused search box — used by
+    /// the grid-button toggle as well as the F1 / Ctrl+T / Ctrl+L shortcuts.
+    /// The page stack is made insensitive so the background webview can't
+    /// steal keyboard focus (or process key/pointer input at all) while the
+    /// grid is up.
+    pub fn open_switcher(self: &Rc<Self>) {
+        self.search_entry.set_text("");
+        self.rebuild_switcher_grid();
+        self.stack.set_sensitive(false);
+        self.switcher_panel.show();
+        self.search_entry.grab_focus();
+    }
+
+    /// Hides the switcher grid and restores the page stack's sensitivity.
+    /// Always use this (rather than hiding `switcher_panel` directly) so the
+    /// stack never gets left insensitive.
+    pub fn close_switcher(&self) {
         self.switcher_panel.hide();
+        self.stack.set_sensitive(true);
+    }
+
+    /// Ids of pages matching `query` (case-insensitive substring of title or
+    /// URL), in creation order — same predicate the switcher grid's filter
+    /// uses.
+    fn matching_page_ids(&self, query: &str) -> Vec<String> {
+        let query = query.to_lowercase();
+        self.pages
+            .borrow()
+            .iter()
+            .filter(|p| page_matches_query(p, &query))
+            .map(|p| p.id.clone())
+            .collect()
+    }
+
+    /// User explicitly picked a page to view (clicked a tile, or a single
+    /// search match) — updates the active page and closes the switcher.
+    pub fn switch_to(self: &Rc<Self>, id: &str) {
+        self.set_active(id);
+        self.close_switcher();
     }
 
     pub fn close_page(self: &Rc<Self>, id: &str) {
@@ -97,9 +161,12 @@ impl AppState {
         self.pages.borrow_mut().retain(|p| p.id != id);
 
         if was_active {
+            // Reassign the active page without touching the switcher's
+            // visibility: closing a page from the grid should switch to the
+            // nearest remaining one but leave the grid open, not dismiss it.
             let next_id = self.pages.borrow().first().map(|p| p.id.clone());
             match next_id {
-                Some(nid) => self.switch_to(&nid),
+                Some(nid) => self.set_active(&nid),
                 None => {
                     if let Err(err) = self.add_page(HOME_URL) {
                         eprintln!("failed to open replacement page: {err}");
@@ -127,21 +194,38 @@ impl AppState {
             let tile = gtk::Button::new();
             tile.style_context().add_class("page-tile");
             let css = gtk::CssProvider::new();
+            // Adwaita's button theme draws its own background-image (a
+            // gradient) on top of any background-color, which is why the
+            // tile's real color was only visible on hover (when the theme's
+            // hover state happens to thin that gradient). Explicitly zeroing
+            // background-image/border/box-shadow here removes the theme's
+            // button chrome so the flat color always shows.
             let _ = css.load_from_data(
-                format!(".page-tile {{ background-color: {}; border-radius: 10px; color: #fff; }}", page.color)
-                    .as_bytes(),
+                format!(
+                    ".page-tile {{ background-image: none; background-color: {}; \
+                      border: none; box-shadow: none; border-radius: 10px; color: #fff; }}",
+                    page.color
+                )
+                .as_bytes(),
             );
             tile.style_context()
                 .add_provider(&css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
             tile.set_size_request(150, 110);
+            // Keyboard focus should land on the FlowBoxChild wrapper, not
+            // descend into this button, so arrow keys move between tiles
+            // instead of highlighting sub-widgets. Mouse clicks still work —
+            // can_focus only affects keyboard focus/tab order.
+            tile.set_can_focus(false);
 
             let inner = gtk::Box::new(gtk::Orientation::Vertical, 2);
             inner.set_margin(10);
             inner.set_valign(gtk::Align::End);
             let title_label = gtk::Label::new(Some(&title_text));
             title_label.set_halign(gtk::Align::Start);
+            title_label.style_context().add_class("tile-title");
             let domain_label = gtk::Label::new(Some(&domain));
             domain_label.set_halign(gtk::Align::Start);
+            domain_label.style_context().add_class("tile-subtitle");
             inner.pack_start(&title_label, false, false, 0);
             inner.pack_start(&domain_label, false, false, 0);
             tile.add(&inner);
@@ -152,10 +236,17 @@ impl AppState {
                 app_clone.switch_to(&id_clone);
             });
 
-            let close_btn = gtk::Button::with_label("\u{d7}");
+            let close_btn = gtk::Button::new();
+            close_btn.style_context().add_class("tile-close-btn");
+            let close_label = gtk::Label::new(Some("\u{d7}"));
+            close_label.style_context().add_class("tile-close-label");
+            close_btn.add(&close_label);
             close_btn.set_halign(gtk::Align::End);
             close_btn.set_valign(gtk::Align::Start);
-            close_btn.set_size_request(22, 22);
+            close_btn.set_margin_top(10);
+            close_btn.set_margin_end(10);
+            close_btn.set_size_request(18, 18);
+            close_btn.set_can_focus(false);
             let app_clone = Rc::clone(self);
             let id_clone = id.clone();
             close_btn.connect_clicked(move |_| {
@@ -174,13 +265,18 @@ impl AppState {
         }
 
         let add_tile = gtk::Button::new();
+        add_tile.style_context().add_class("add-tile");
         add_tile.set_size_request(150, 110);
-        add_tile.add(&gtk::Label::new(Some("+")));
+        add_tile.set_can_focus(false);
+        let add_tile_label = gtk::Label::new(Some("+"));
+        add_tile_label.style_context().add_class("add-tile-label");
+        add_tile.add(&add_tile_label);
         let app_clone = Rc::clone(self);
         add_tile.connect_clicked(move |_| {
             if let Err(err) = app_clone.add_page(HOME_URL) {
                 eprintln!("failed to open new page: {err}");
             }
+            app_clone.close_switcher();
         });
 
         let add_child = gtk::FlowBoxChild::new();
@@ -225,6 +321,26 @@ impl AppState {
             .find(|p| p.id == id)
             .map(|p| p.title.borrow().clone())
     }
+
+    /// Whether the switcher grid is currently shown — test/inspection helper.
+    pub fn is_switcher_open(&self) -> bool {
+        self.switcher_panel.is_visible()
+    }
+
+    /// Whether the page stack (and so the background webview) can currently
+    /// take input/focus — test/inspection helper.
+    pub fn is_background_page_interactive(&self) -> bool {
+        self.stack.is_sensitive()
+    }
+
+    /// Types `text` into the switcher's search box and simulates pressing
+    /// Enter — test helper for the "open a new page if nothing matches"
+    /// behavior, exercising the same `connect_activate` handler a real
+    /// keypress would trigger.
+    pub fn search_activate(&self, text: &str) {
+        self.search_entry.set_text(text);
+        self.search_entry.emit_activate();
+    }
 }
 
 /// Builds the full window + chrome (header bar, page stack, switcher overlay)
@@ -233,6 +349,23 @@ impl AppState {
 ///
 /// Assumes `gtk::init()` has already been called.
 pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
+    if let Some(screen) = gtk::gdk::Screen::default() {
+        let provider = gtk::CssProvider::new();
+        let _ = provider.load_from_data(
+            b".tile-title { color: #ffffff; font-weight: 600; } \
+              .tile-subtitle { color: rgba(255, 255, 255, 0.75); } \
+              .add-tile-label { color: #ffffff; font-size: 20px; } \
+              .add-tile { background-image: none; background-color: rgba(255, 255, 255, 0.15); \
+                border: none; box-shadow: none; border-radius: 10px; } \
+              .tile-close-btn { background-image: none; background-color: rgba(0, 0, 0, 0.45); \
+                border: none; box-shadow: none; border-radius: 9999px; padding: 0; \
+                min-width: 0; min-height: 0; } \
+              .tile-close-label { color: #ffffff; } \
+              .switcher-hint { color: rgba(255, 255, 255, 0.6); font-size: 12px; }",
+        );
+        gtk::StyleContext::add_provider_for_screen(&screen, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
     window.set_title("claude-browser");
     window.set_default_size(1024, 768);
@@ -243,24 +376,58 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
 
     let header_bar = gtk::HeaderBar::new();
     header_bar.set_show_close_button(true);
-    header_bar.set_decoration_layout(Some(":close"));
+    header_bar.set_decoration_layout(Some(":minimize,maximize,close"));
 
-    let back_button = gtk::Button::with_label("\u{2190}");
-    let forward_button = gtk::Button::with_label("\u{2192}");
-    let reload_button = gtk::Button::with_label("\u{27f3}");
-    header_bar.pack_start(&back_button);
-    header_bar.pack_start(&forward_button);
-    header_bar.pack_start(&reload_button);
-
-    let address_bar = gtk::Entry::new();
-    address_bar.set_width_chars(50);
-    header_bar.set_custom_title(Some(&address_bar));
-
+    let back_button = gtk::Button::new();
+    back_button.set_image(Some(&gtk::Image::from_icon_name(
+        Some("pan-start-symbolic"),
+        gtk::IconSize::Button,
+    )));
+    let forward_button = gtk::Button::new();
+    forward_button.set_image(Some(&gtk::Image::from_icon_name(
+        Some("pan-end-symbolic"),
+        gtk::IconSize::Button,
+    )));
+    let reload_button = gtk::Button::new();
+    reload_button.set_image(Some(&gtk::Image::from_icon_name(
+        Some("view-refresh-symbolic"),
+        gtk::IconSize::Button,
+    )));
     let switcher_toggle = gtk::Button::new();
     switcher_toggle.set_image(Some(&gtk::Image::from_icon_name(
         Some("view-grid-symbolic"),
         gtk::IconSize::Button,
     )));
+    for button in [&back_button, &forward_button, &reload_button, &switcher_toggle] {
+        button.style_context().add_class("flat");
+    }
+
+    header_bar.pack_start(&back_button);
+    header_bar.pack_start(&forward_button);
+
+    let address_bar = gtk::Entry::new();
+    address_bar.set_width_chars(50);
+    address_bar.set_hexpand(true);
+
+    // Group the reload button with the address bar itself (rather than
+    // packing it into the header bar's separate end-region) so it's centered
+    // as part of the same unit as the address bar, sitting flush against it.
+    // A spacer before the address bar and one after the reload button (each
+    // about one toolbar button wide) doubles as draggable header-bar space
+    // for moving the window.
+    const TOOLBAR_BUTTON_WIDTH: i32 = 36;
+    let spacer_before_address_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer_before_address_bar.set_size_request(TOOLBAR_BUTTON_WIDTH, -1);
+    let spacer_after_reload = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer_after_reload.set_size_request(TOOLBAR_BUTTON_WIDTH, -1);
+
+    let address_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    address_group.pack_start(&spacer_before_address_bar, false, false, 0);
+    address_group.pack_start(&address_bar, true, true, 0);
+    address_group.pack_start(&reload_button, false, false, 0);
+    address_group.pack_start(&spacer_after_reload, false, false, 0);
+    header_bar.set_custom_title(Some(&address_group));
+
     header_bar.pack_end(&switcher_toggle);
 
     window.set_titlebar(Some(&header_bar));
@@ -284,11 +451,19 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
 
     let flowbox = gtk::FlowBox::new();
     flowbox.set_valign(gtk::Align::Start);
-    flowbox.set_selection_mode(gtk::SelectionMode::None);
+    // Browse keeps exactly one child highlighted/selected at all times as
+    // arrow keys move over the grid, which is what lets Delete know which
+    // page to close (via selected_children()) and gives keyboard users a
+    // visible "current" tile.
+    flowbox.set_selection_mode(gtk::SelectionMode::Browse);
     flowbox.set_homogeneous(true);
     flowbox.set_margin(24);
     flowbox.set_row_spacing(16);
     flowbox.set_column_spacing(16);
+
+    let keynav_hint = gtk::Label::new(Some("\u{21b5} Switch to page   \u{2326} Close page"));
+    keynav_hint.style_context().add_class("switcher-hint");
+    keynav_hint.set_halign(gtk::Align::Center);
 
     let grid_content = gtk::Box::new(gtk::Orientation::Vertical, 16);
     grid_content.set_halign(gtk::Align::Fill);
@@ -296,6 +471,7 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
     grid_content.set_margin_top(40);
     grid_content.pack_start(&search_entry, false, false, 0);
     grid_content.pack_start(&flowbox, true, true, 0);
+    grid_content.pack_start(&keynav_hint, false, false, 0);
 
     let switcher_overlay = gtk::Overlay::new();
     switcher_overlay.add(&scrim);
@@ -331,18 +507,11 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
             return true;
         }
         let text = app.search_entry.text().to_lowercase();
-        if text.is_empty() {
-            return true;
-        }
         let pages = app.pages.borrow();
         pages
             .iter()
             .find(|p| p.id == name.as_str())
-            .map(|p| {
-                let title = p.title.borrow().to_lowercase();
-                let url = p.engine.current_url().unwrap_or_default().to_lowercase();
-                title.contains(&text) || url.contains(&text)
-            })
+            .map(|p| page_matches_query(p, &text))
             .unwrap_or(false)
     })));
 
@@ -350,6 +519,73 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
         let flowbox = flowbox.clone();
         search_entry.connect_changed(move |_| {
             flowbox.invalidate_filter();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        search_entry.connect_activate(move |entry| {
+            let text = entry.text().to_string();
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            match app.matching_page_ids(trimmed).as_slice() {
+                [] => {
+                    let url = normalize_url(trimmed);
+                    if let Err(err) = app.add_page(&url) {
+                        eprintln!("failed to open new page: {err}");
+                    }
+                    app.close_switcher();
+                }
+                [only] => app.switch_to(only),
+                _ => {}
+            }
+        });
+    }
+    {
+        // GtkSearchEntry emits "stop-search" (rather than a plain key-press)
+        // when Escape is pressed while it has focus, which is the common
+        // case since open_switcher() focuses it — handle it here so Escape
+        // reliably closes the switcher regardless of the window-level
+        // key-press-event handler below.
+        let app = Rc::clone(&app);
+        search_entry.connect_stop_search(move |_| {
+            app.close_switcher();
+        });
+    }
+    {
+        // Fires when a FlowBoxChild is activated — Enter/Space while it has
+        // keyboard focus (tile/close buttons are can_focus(false), so focus
+        // always lands on the FlowBoxChild itself, never its contents).
+        let app = Rc::clone(&app);
+        flowbox.connect_child_activated(move |_, child| {
+            let name = child.widget_name();
+            if name.as_str() == "__add__" {
+                if let Err(err) = app.add_page(HOME_URL) {
+                    eprintln!("failed to open new page: {err}");
+                }
+                app.close_switcher();
+            } else {
+                app.switch_to(name.as_str());
+            }
+        });
+    }
+    {
+        // Delete closes whichever tile is currently highlighted by keyboard
+        // navigation (Browse selection mode keeps exactly one selected).
+        let app = Rc::clone(&app);
+        flowbox.connect_key_press_event(move |flowbox, event| {
+            let is_delete = event.keyval() == gtk::gdk::keys::Key::from_name("Delete");
+            if !is_delete {
+                return gtk::glib::Propagation::Proceed;
+            }
+            if let Some(child) = flowbox.selected_children().into_iter().next() {
+                let name = child.widget_name();
+                if name.as_str() != "__add__" {
+                    app.close_page(name.as_str());
+                }
+            }
+            gtk::glib::Propagation::Stop
         });
     }
 
@@ -375,18 +611,17 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
     {
         let app = Rc::clone(&app);
         switcher_toggle.connect_clicked(move |_| {
-            if app.switcher_panel.is_visible() {
-                app.switcher_panel.hide();
+            if app.is_switcher_open() {
+                app.close_switcher();
             } else {
-                app.rebuild_switcher_grid();
-                app.switcher_panel.show();
+                app.open_switcher();
             }
         });
     }
     {
         let app = Rc::clone(&app);
         scrim.connect_button_press_event(move |_, _| {
-            app.switcher_panel.hide();
+            app.close_switcher();
             gtk::glib::Propagation::Stop
         });
     }
@@ -394,15 +629,21 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
         let app = Rc::clone(&app);
         window.connect_key_press_event(move |_, event| {
             let ctrl = event.state().contains(gtk::gdk::ModifierType::CONTROL_MASK);
-            let is_t = event
-                .keyval()
-                .to_unicode()
-                .map(|c| c.eq_ignore_ascii_case(&'t'))
-                .unwrap_or(false);
-            if ctrl && is_t {
-                if let Err(err) = app.add_page(HOME_URL) {
-                    eprintln!("failed to open new page: {err}");
-                }
+            let keyval = event.keyval();
+            let is_f1 = keyval == gtk::gdk::keys::Key::from_name("F1");
+            let unicode = keyval.to_unicode();
+            let is_t = unicode.map(|c| c.eq_ignore_ascii_case(&'t')).unwrap_or(false);
+            let is_l = unicode.map(|c| c.eq_ignore_ascii_case(&'l')).unwrap_or(false);
+            let is_w = unicode.map(|c| c.eq_ignore_ascii_case(&'w')).unwrap_or(false);
+            let is_escape = keyval == gtk::gdk::keys::Key::from_name("Escape");
+            if is_f1 || (ctrl && is_t) || (ctrl && is_l) {
+                app.open_switcher();
+                gtk::glib::Propagation::Stop
+            } else if is_escape && app.is_switcher_open() {
+                app.close_switcher();
+                gtk::glib::Propagation::Stop
+            } else if ctrl && is_w {
+                app.close_page(&app.active_id());
                 gtk::glib::Propagation::Stop
             } else {
                 gtk::glib::Propagation::Proceed

@@ -78,6 +78,92 @@ fn main() -> anyhow::Result<()> {
         app.active_id() == id_b || app.active_id() == id_c,
     );
 
+    // open_switcher shows the panel with a cleared, focused search box (this
+    // is what F1 / Ctrl+T / Ctrl+L and the grid button all trigger now).
+    app.open_switcher();
+    pump_for(Duration::from_millis(100));
+    all_ok &= check("open_switcher shows the switcher panel", app.is_switcher_open());
+    all_ok &= check(
+        "open_switcher makes the background page stack insensitive",
+        !app.is_background_page_interactive(),
+    );
+
+    // Typing a query that matches no open page and pressing Enter should
+    // open a new page from it instead of doing nothing.
+    let before_count = app.page_ids().len();
+    app.search_activate("some-nonexistent-domain-example");
+    pump_for(Duration::from_millis(800));
+    all_ok &= check(
+        "search box opens a new page when nothing matches",
+        app.page_ids().len() == before_count + 1,
+    );
+    let new_id = app.page_ids().last().cloned().unwrap_or_default();
+    all_ok &= check("the new page from search becomes active", app.active_id() == new_id);
+    all_ok &= check(
+        "the new page's url gets an https:// prefix added",
+        // WebKitGTK normalizes a bare-domain URL by adding a trailing slash.
+        app.active_url().as_deref() == Some("https://some-nonexistent-domain-example/"),
+    );
+    all_ok &= check("opening a page from search closes the switcher", !app.is_switcher_open());
+    all_ok &= check(
+        "closing the switcher restores background page interactivity",
+        app.is_background_page_interactive(),
+    );
+
+    // Filtering down to exactly one matching page and pressing Enter should
+    // switch to it (not create a duplicate).
+    app.open_switcher();
+    pump_for(Duration::from_millis(100));
+    let existing_count = app.page_ids().len();
+    app.search_activate("page b");
+    pump_for(Duration::from_millis(300));
+    all_ok &= check(
+        "search box does not open a new page when a single match exists",
+        app.page_ids().len() == existing_count,
+    );
+    all_ok &= check("search box switches to the single matching page", app.active_id() == id_b);
+    all_ok &= check(
+        "switching via search closes the switcher",
+        !app.is_switcher_open(),
+    );
+
+    // Filtering to a query matching MORE than one page shouldn't switch
+    // anywhere (ambiguous) or create a duplicate.
+    app.open_switcher();
+    pump_for(Duration::from_millis(100));
+    let active_before = app.active_id();
+    app.search_activate("page");
+    pump_for(Duration::from_millis(300));
+    all_ok &= check(
+        "search box does not open a new page when multiple pages match",
+        app.page_ids().len() == existing_count,
+    );
+    all_ok &= check(
+        "search box does not switch when multiple pages match",
+        app.active_id() == active_before,
+    );
+
+    // Closing the ACTIVE page from an open grid should keep the grid open
+    // and switch to the nearest remaining page, not dismiss the grid.
+    app.open_switcher();
+    pump_for(Duration::from_millis(100));
+    let active_before_close = app.active_id();
+    let count_before_close = app.page_ids().len();
+    app.close_page(&active_before_close);
+    pump_for(Duration::from_millis(200));
+    all_ok &= check(
+        "closing the active page from the grid keeps the grid open",
+        app.is_switcher_open(),
+    );
+    all_ok &= check(
+        "closing the active page from the grid removes it from the list",
+        app.page_ids().len() == count_before_close - 1,
+    );
+    all_ok &= check(
+        "closing the active page from the grid switches to a remaining page",
+        app.active_id() != active_before_close,
+    );
+
     // Close down to zero: shouldn't panic, and should land on some fallback page.
     let remaining = app.page_ids();
     for id in remaining {
