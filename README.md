@@ -72,6 +72,16 @@ cargo run -p browser-windows-win32  # Windows (native build)
 Each opens a native window (GTK on Linux, Win32 on Windows) with an address bar and back / forward /
 reload buttons. Type a URL into the address bar and press Enter (or, on Windows, click Go) to navigate.
 
+`.cargo/config.toml` also defines a build-and-run shortcut per chrome, each pinned to whichever target
+that crate actually applies to (the two Windows ones cross-compile and launch under Wine automatically,
+same as the manual `--target x86_64-pc-windows-gnu` invocations below):
+
+```sh
+cargo run-gtk3   # same as `cargo run -p browser-linux-gtk3`
+cargo run-win32  # same as `cargo run --target x86_64-pc-windows-gnu -p browser-windows-win32`
+cargo run-nwg    # same as `cargo run --target x86_64-pc-windows-gnu -p browser-windows-nwg`
+```
+
 ### Cross-compiling and running the Windows crates from Linux
 
 Useful for testing the native window/chrome/message-loop code without a Windows machine — WebView2 itself
@@ -101,18 +111,15 @@ Rust `std` needs — if you see a linker error mentioning it, pin the `:edge` im
 image = "ghcr.io/cross-rs/x86_64-pc-windows-gnu:edge"
 ```
 
-`webview2-com-sys`'s build script vendors `WebView2Loader.dll` but doesn't copy it next to the binary —
-real Windows/WebView2 projects need this DLL alongside the exe, so copy it manually the first time (or
-after a clean build):
-
-```sh
-cp target/x86_64-pc-windows-gnu/debug/build/webview2-com-sys-*/out/x64/WebView2Loader.dll \
-   target/x86_64-pc-windows-gnu/debug/
-```
-
-`.cargo/config.toml` sets Wine as the runner for this target, so `cargo run`/`cargo test --target
-x86_64-pc-windows-gnu` invoke the built `.exe` under Wine automatically — no need to type `wine
-target/...` by hand:
+`.cargo/config.toml` sets a small wrapper script (`.cargo/wine-runner.sh`) as the runner for this target,
+so `cargo run`/`cargo test --target x86_64-pc-windows-gnu` invoke the built `.exe` under Wine
+automatically — no need to type `wine target/...` by hand, and no manual `WebView2Loader.dll` copying
+either: real Windows/WebView2 projects need that DLL alongside the exe, but `webview2-com-sys` only
+vendors it inside its own crate source and copies it into its own build output for linking purposes, it
+never places it next to the final binary. Rather than duplicating the file (which would go stale if
+`webview2-com-sys` is ever upgraded), the runner script points Wine at the crate's vendored copy directly
+via `WINEPATH`, which Wine also searches for DLLs. (On a real Windows machine, without Wine, you'd still
+need the manual copy — or add its directory to `PATH` — since this trick is Wine-specific.)
 
 ```sh
 cargo run --target x86_64-pc-windows-gnu -p browser-windows-win32

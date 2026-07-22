@@ -3,5 +3,19 @@
 # `wine target/x86_64-pc-windows-gnu/debug/foo.exe` typed out by hand every
 # time (see README.md's cross-compiling section). Only affects this target —
 # native Linux/Windows builds are unaffected.
+#
+# The runner is a small wrapper script (rather than plain "wine") so it can
+# also point Wine at WebView2Loader.dll's vendored location via WINEPATH —
+# see .cargo/wine-runner.sh for why.
 [target.x86_64-pc-windows-gnu]
-runner = "wine"
+runner = ".cargo/wine-runner.sh"
+
+# Build-and-run shortcuts for each native chrome, each pinned to whichever
+# target that crate actually applies to (see the per-crate `#![cfg(target_os
+# = "...")]` guards) — the two Windows ones go through the runner above, so
+# `cargo run-win32`/`cargo run-nwg` launch under Wine automatically, same as
+# a plain `cargo run --target x86_64-pc-windows-gnu -p ...` would.
+[alias]
+run-gtk3 = "run -p browser-linux-gtk3"
+run-win32 = "run --target x86_64-pc-windows-gnu -p browser-windows-win32"
+run-nwg = "run --target x86_64-pc-windows-gnu -p browser-windows-nwg"
