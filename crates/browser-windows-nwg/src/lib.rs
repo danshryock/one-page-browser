@@ -23,7 +23,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use browser_core::{domain_of, resolve_address_input, PageManager, Settings};
+use browser_core::{domain_of, resolve_address_input, PageManager, Profile, Settings};
 use native_windows_derive::NwgUi;
 use native_windows_gui as nwg;
 use render_engine::{RenderEngine, WryEngine};
@@ -106,6 +106,12 @@ pub struct App {
     #[nwg_control(text: "Enter: switch page   Delete: close page")]
     switcher_hint_label: nwg::Label,
 
+    /// Shows the active profile's name in the upper-right corner of the
+    /// switcher — starts empty since the resolved `Profile` isn't known
+    /// until `load_settings` runs (see its doc comment); text is set there.
+    #[nwg_control]
+    switcher_profile_label: nwg::Label,
+
     core: RefCell<PageManager<WryEngine>>,
     settings: RefCell<Settings>,
     /// Per-page containers — the NWG analogue of `browser-linux-gtk3`'s
@@ -126,11 +132,35 @@ pub struct App {
     /// used: it would mean replacing NWG's own message loop, which can't be
     /// verified safe here).
     ctrl_held: Cell<bool>,
+    /// Resolved once, right after `build_ui`, via `load_settings` (see
+    /// there for why `App` can't just resolve this itself: `#[derive(NwgUi)]`
+    /// only ever default-constructs every field, `Profile` included, via
+    /// `Default::default()`) — kept around so the settings dialog's Save
+    /// action can re-save to the same place `load_settings` read from. A
+    /// `RefCell` (unlike the other two front-ends' plain `profile: Profile`
+    /// field) specifically because it has to be *set* after construction
+    /// through `&self`, not just read.
+    profile: RefCell<Profile>,
 }
 
 impl App {
     pub fn settings(&self) -> std::cell::Ref<'_, Settings> {
         self.settings.borrow()
+    }
+
+    /// `#[derive(NwgUi)]` only ever default-constructs every field via
+    /// `Default::default()` (there's no way to inject constructor
+    /// parameters into the generated `build_ui`), so `App` starts with
+    /// `Settings::default()` and `Profile::default()` regardless of
+    /// `--profile` — `main.rs` calls this once, immediately after
+    /// `build_ui` and before the first `add_page`, to load the real
+    /// settings for the actually-resolved profile and remember that
+    /// profile for later saves. This is also where the previously-missing
+    /// `Settings::load` gets wired up at all for this front-end.
+    pub fn load_settings(&self, profile: Profile) {
+        *self.settings.borrow_mut() = Settings::load(&profile);
+        self.switcher_profile_label.set_text(&profile.name);
+        *self.profile.borrow_mut() = profile;
     }
 
     fn with_active<F: FnOnce(&WryEngine) -> anyhow::Result<()>>(&self, f: F) {
@@ -295,6 +325,7 @@ impl App {
         self.switcher_listbox.set_visible(true);
         self.switcher_add_btn.set_visible(true);
         self.switcher_hint_label.set_visible(true);
+        self.switcher_profile_label.set_visible(true);
         self.layout_children();
         self.switcher_search_edit.set_focus();
     }
@@ -304,6 +335,7 @@ impl App {
         self.switcher_listbox.set_visible(false);
         self.switcher_add_btn.set_visible(false);
         self.switcher_hint_label.set_visible(false);
+        self.switcher_profile_label.set_visible(false);
         self.layout_children();
     }
 
@@ -440,10 +472,14 @@ impl App {
             const SEARCH_H: i32 = 28;
             const ROW_H: i32 = 28;
             const HINT_H: i32 = 20;
+            const PROFILE_LABEL_W: i32 = 140;
             let content_width = (width - 2 * MARGIN).max(0);
+            let search_width = (content_width - PROFILE_LABEL_W - MARGIN).max(0);
 
             self.switcher_search_edit.set_position(MARGIN, content_y + MARGIN);
-            self.switcher_search_edit.set_size(content_width as u32, SEARCH_H as u32);
+            self.switcher_search_edit.set_size(search_width as u32, SEARCH_H as u32);
+            self.switcher_profile_label.set_position(MARGIN + search_width + MARGIN, content_y + MARGIN);
+            self.switcher_profile_label.set_size((PROFILE_LABEL_W - MARGIN).max(0) as u32, SEARCH_H as u32);
 
             let list_y = content_y + MARGIN + SEARCH_H + MARGIN;
             let list_h = (content_h - (SEARCH_H + ROW_H + HINT_H + MARGIN * 4)).max(0);
@@ -668,7 +704,7 @@ fn show_settings_dialog(app: std::rc::Rc<App>) {
                 }
                 let new_limit = if is_unlimited { None } else { Some(limit_value) };
                 app.set_max_loaded_pages(new_limit);
-                if let Err(err) = app.settings().save() {
+                if let Err(err) = app.settings().save(&app.profile.borrow()) {
                     eprintln!("failed to save settings: {err:?}");
                 }
 

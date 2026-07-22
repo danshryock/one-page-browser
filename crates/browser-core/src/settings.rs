@@ -1,8 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::HOME_URL;
+use crate::{Profile, HOME_URL};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchEngine {
@@ -28,25 +28,21 @@ impl Settings {
         self.search_engines.iter().find(|e| e.name == self.default_search_engine)
     }
 
-    /// Loads settings from the platform config directory, falling back to
+    /// Loads settings from `profile`'s config directory, falling back to
     /// `Settings::default()` if there's no file yet (first run) or it fails
     /// to read/parse (e.g. from an incompatible older version).
-    pub fn load() -> Self {
-        Self::config_path().and_then(|path| Self::load_from(&path)).unwrap_or_default()
+    pub fn load(profile: &Profile) -> Self {
+        profile.settings_path().and_then(|path| Self::load_from(&path)).unwrap_or_default()
     }
 
-    /// Saves settings to the platform config directory. Fails (rather than
+    /// Saves settings to `profile`'s config directory. Fails (rather than
     /// panicking) on I/O errors — callers should log and continue, not treat
     /// this as fatal.
-    pub fn save(&self) -> anyhow::Result<()> {
-        let path = Self::config_path()
+    pub fn save(&self, profile: &Profile) -> anyhow::Result<()> {
+        let path = profile
+            .settings_path()
             .ok_or_else(|| anyhow::anyhow!("no config directory available on this platform"))?;
         self.save_to(&path)
-    }
-
-    fn config_path() -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
-        Some(dirs.config_dir().join("settings.json"))
     }
 
     /// Split out from `load()` so tests can round-trip through a throwaway
@@ -94,6 +90,7 @@ impl Default for Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("claude-browser-test-{name}-{}.json", std::process::id()))

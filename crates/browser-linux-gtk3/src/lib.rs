@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use browser_core::{domain_of, resolve_address_input, PageManager, Settings};
+use browser_core::{domain_of, resolve_address_input, PageManager, Profile, Settings};
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
 
@@ -17,6 +17,11 @@ pub struct AppState {
     /// hold these since they're a GTK-only concept.
     containers: RefCell<HashMap<String, gtk::Box>>,
     settings: RefCell<Settings>,
+    /// Resolved once at startup (from `--profile`, defaulting to
+    /// `"default"`) — kept around so the settings dialog's Save action can
+    /// re-save to the same place `Settings::load` read from, without
+    /// re-parsing `std::env::args()`.
+    profile: Profile,
 }
 
 impl AppState {
@@ -470,7 +475,7 @@ fn show_settings_dialog(app: &Rc<AppState>, parent: &gtk::Window) {
         let new_limit =
             if unlimited_check.is_active() { None } else { Some(limit_spin.value_as_int().max(1) as usize) };
         app.set_max_loaded_pages(new_limit);
-        if let Err(err) = app.settings().save() {
+        if let Err(err) = app.settings().save(&app.profile) {
             eprintln!("failed to save settings: {err}");
         }
     }
@@ -482,8 +487,13 @@ fn show_settings_dialog(app: &Rc<AppState>, parent: &gtk::Window) {
 /// `app.add_page(&app.settings().start_page.clone())` (or any other URL)
 /// afterward to open the first one.
 ///
+/// `profile` scopes where `Settings` is loaded from/saved to (see
+/// `browser_core::Profile`) — pass `Profile::default()` for the implicit
+/// `"default"` profile, or a profile resolved from `--profile` via
+/// `browser_core::resolve_profile_name`.
+///
 /// Assumes `gtk::init()` has already been called.
-pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
+pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
     if let Some(screen) = gtk::gdk::Screen::default() {
         let provider = gtk::CssProvider::new();
         let _ = provider.load_from_data(
@@ -497,6 +507,7 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
                 min-width: 0; min-height: 0; } \
               .tile-close-label { color: #ffffff; } \
               .switcher-hint { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
+              .switcher-profile-label { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
               .page-tile-unloaded { opacity: 0.5; }",
         );
         gtk::StyleContext::add_provider_for_screen(&screen, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -615,9 +626,17 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
     grid_content.pack_start(&flowbox, true, true, 0);
     grid_content.pack_start(&keynav_hint, false, false, 0);
 
+    let profile_label = gtk::Label::new(Some(&profile.name));
+    profile_label.style_context().add_class("switcher-profile-label");
+    profile_label.set_halign(gtk::Align::End);
+    profile_label.set_valign(gtk::Align::Start);
+    profile_label.set_margin_top(12);
+    profile_label.set_margin_end(16);
+
     let switcher_overlay = gtk::Overlay::new();
     switcher_overlay.add(&scrim);
     switcher_overlay.add_overlay(&grid_content);
+    switcher_overlay.add_overlay(&profile_label);
 
     let root_overlay = gtk::Overlay::new();
     root_overlay.add(&stack);
@@ -628,7 +647,7 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
     switcher_overlay.hide();
     window.set_title("claude-browser");
 
-    let settings = Settings::load();
+    let settings = Settings::load(&profile);
     let core = PageManager::new(settings.max_loaded_pages);
     let app = Rc::new(AppState {
         address_bar: address_bar.clone(),
@@ -639,6 +658,7 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
         core: RefCell::new(core),
         containers: RefCell::new(HashMap::new()),
         settings: RefCell::new(settings),
+        profile,
     });
 
     let app_weak = Rc::downgrade(&app);

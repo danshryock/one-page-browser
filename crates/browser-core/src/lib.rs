@@ -11,7 +11,9 @@ use std::time::Instant;
 
 use render_engine::RenderEngine;
 
+mod profile;
 mod settings;
+pub use profile::{resolve_profile_name, Profile};
 pub use settings::{SearchEngine, Settings};
 
 pub const HOME_URL: &str = "about:blank";

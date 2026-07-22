@@ -27,7 +27,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Once;
 
-use browser_core::{domain_of, resolve_address_input, PageManager, Settings};
+use browser_core::{domain_of, resolve_address_input, PageManager, Profile, Settings};
 use render_engine::{RenderEngine, WryEngine};
 use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
@@ -58,6 +58,7 @@ const ID_SETTINGS: u16 = 1007;
 const ID_SWITCHER_SEARCH: u16 = 1008;
 const ID_SWITCHER_LIST: u16 = 1009;
 const ID_SWITCHER_ADD: u16 = 1010;
+const ID_SWITCHER_PROFILE_LABEL: u16 = 1011;
 
 /// Command ids delivered via `WM_COMMAND` by the accelerator table (see
 /// `run_message_loop`), rather than by a real control — chosen well outside
@@ -107,12 +108,19 @@ pub struct AppState {
     switcher_listbox: HWND,
     switcher_add_btn: HWND,
     switcher_hint_label: HWND,
+    /// Shows the active profile's name in the upper-right corner of the
+    /// switcher — shown/hidden alongside the other switcher-only controls.
+    switcher_profile_label: HWND,
     core: RefCell<PageManager<WryEngine>>,
     settings: RefCell<Settings>,
     /// Ids in the same order as `switcher_listbox`'s rows — a plain LISTBOX
     /// only carries a display string per row, so this is how a selected row
     /// index maps back to a page id. Rebuilt every time the list is.
     switcher_row_ids: RefCell<Vec<String>>,
+    /// Resolved once at startup (from `--profile`, defaulting to
+    /// `"default"`) — kept around so the settings dialog's Save action can
+    /// re-save to the same place `Settings::load` read from.
+    profile: Profile,
 }
 
 impl AppState {
@@ -257,6 +265,7 @@ impl AppState {
             let _ = ShowWindow(self.switcher_listbox, SW_SHOW);
             let _ = ShowWindow(self.switcher_add_btn, SW_SHOW);
             let _ = ShowWindow(self.switcher_hint_label, SW_SHOW);
+            let _ = ShowWindow(self.switcher_profile_label, SW_SHOW);
         }
         self.layout_children();
         unsafe {
@@ -270,6 +279,7 @@ impl AppState {
             let _ = ShowWindow(self.switcher_listbox, SW_HIDE);
             let _ = ShowWindow(self.switcher_add_btn, SW_HIDE);
             let _ = ShowWindow(self.switcher_hint_label, SW_HIDE);
+            let _ = ShowWindow(self.switcher_profile_label, SW_HIDE);
         }
         self.layout_children();
     }
@@ -367,9 +377,19 @@ impl AppState {
             const SEARCH_H: i32 = 28;
             const ROW_H: i32 = 28;
             const HINT_H: i32 = 20;
+            const PROFILE_LABEL_W: i32 = 140;
             let content_width = (width - 2 * MARGIN).max(0);
+            let search_width = (content_width - PROFILE_LABEL_W - MARGIN).max(0);
             unsafe {
-                let _ = MoveWindow(self.switcher_search_edit, MARGIN, content_y + MARGIN, content_width, SEARCH_H, true);
+                let _ = MoveWindow(self.switcher_search_edit, MARGIN, content_y + MARGIN, search_width, SEARCH_H, true);
+                let _ = MoveWindow(
+                    self.switcher_profile_label,
+                    MARGIN + search_width + MARGIN,
+                    content_y + MARGIN,
+                    (PROFILE_LABEL_W - MARGIN).max(0),
+                    SEARCH_H,
+                    true,
+                );
                 let list_y = content_y + MARGIN + SEARCH_H + MARGIN;
                 let list_h = (content_h - (SEARCH_H + ROW_H + HINT_H + MARGIN * 4)).max(0);
                 let _ = MoveWindow(self.switcher_listbox, MARGIN, list_y, content_width, list_h, true);
@@ -447,6 +467,15 @@ fn app_state(hwnd: HWND) -> Option<&'static AppState> {
 /// `app.add_page(&app.settings().start_page.clone())` afterward, same as
 /// `browser-linux-gtk3`'s `build_window_and_app`/`main.rs` split.
 ///
+/// `profile` scopes where `Settings` is loaded from/saved to (see
+/// `browser_core::Profile`) — pass `Profile::default()` for the implicit
+/// `"default"` profile, or a profile resolved from `--profile` via
+/// `browser_core::resolve_profile_name`. Threaded into `WM_CREATE` via
+/// `CreateWindowExW`'s `lpParam` (the same mechanism the settings dialog
+/// already uses — see `show_settings_dialog`): a raw pointer to `profile`
+/// itself is valid for this since `WM_CREATE` fires synchronously inside
+/// this same call, well before `profile` (a local) could be dropped.
+///
 /// Returns an owned `Rc<AppState>` handle alongside the window: `WM_CREATE`
 /// leaks one strong reference into the window's `GWLP_USERDATA` slot (which
 /// `WM_DESTROY` reclaims via `Rc::from_raw` when the window closes, as
@@ -455,7 +484,7 @@ fn app_state(hwnd: HWND) -> Option<&'static AppState> {
 /// to the caller — the standard pattern for getting an extra owned handle
 /// out of a raw pointer that already represents one, without disturbing the
 /// original owner's bookkeeping.
-pub fn create_window() -> anyhow::Result<(HWND, Rc<AppState>)> {
+pub fn create_window(profile: Profile) -> anyhow::Result<(HWND, Rc<AppState>)> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
         let class_name = w!("ClaudeBrowserWindowClass");
@@ -472,6 +501,7 @@ pub fn create_window() -> anyhow::Result<(HWND, Rc<AppState>)> {
         };
         RegisterClassExW(&wc);
 
+        let profile_ptr = &profile as *const Profile as *const std::ffi::c_void;
         let hwnd = CreateWindowExW(
             Default::default(),
             class_name,
@@ -484,7 +514,7 @@ pub fn create_window() -> anyhow::Result<(HWND, Rc<AppState>)> {
             None,
             None,
             Some(instance.into()),
-            None,
+            Some(profile_ptr),
         )?;
 
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -601,6 +631,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_CREATE => {
             let create = &*(lparam.0 as *const CREATESTRUCTW);
             let instance = create.hInstance;
+            let profile = &*(create.lpCreateParams as *const Profile);
 
             let back = CreateWindowExW(
                 Default::default(),
@@ -758,6 +789,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 Some(instance),
                 None,
             );
+            let switcher_profile_label = CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                w!(""),
+                WS_CHILD,
+                0,
+                0,
+                0,
+                0,
+                Some(hwnd),
+                Some(HMENU(ID_SWITCHER_PROFILE_LABEL as usize as *mut _)),
+                Some(instance),
+                None,
+            );
 
             let (
                 Ok(back),
@@ -771,6 +816,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 Ok(switcher_listbox),
                 Ok(switcher_add_btn),
                 Ok(switcher_hint_label),
+                Ok(switcher_profile_label),
             ) = (
                 back,
                 forward,
@@ -783,6 +829,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 switcher_listbox,
                 switcher_add_btn,
                 switcher_hint_label,
+                switcher_profile_label,
             )
             else {
                 return LRESULT(-1);
@@ -793,7 +840,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = SetWindowSubclass(switcher_search_edit, Some(search_edit_subclass_proc), 1, hwnd.0 as usize);
             let _ = SetWindowSubclass(switcher_listbox, Some(switcher_list_subclass_proc), 1, hwnd.0 as usize);
 
-            let settings = Settings::load();
+            set_window_text(switcher_profile_label, &profile.name);
+
+            let settings = Settings::load(profile);
             let core = PageManager::new(settings.max_loaded_pages);
             let app = Rc::new(AppState {
                 hwnd,
@@ -802,9 +851,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 switcher_listbox,
                 switcher_add_btn,
                 switcher_hint_label,
+                switcher_profile_label,
                 core: RefCell::new(core),
                 settings: RefCell::new(settings),
                 switcher_row_ids: RefCell::new(Vec::new()),
+                profile: profile.clone(),
             });
             let raw = Rc::into_raw(app);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw as isize);
@@ -1212,7 +1263,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM,
                         }
                         let new_limit = if is_unlimited { None } else { Some(limit_value) };
                         app.set_max_loaded_pages(new_limit);
-                        if let Err(err) = app.settings().save() {
+                        if let Err(err) = app.settings().save(&app.profile) {
                             eprintln!("failed to save settings: {err:?}");
                         }
                     }

@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use browser_core::Profile;
 use browser_linux_gtk3::build_window_and_app;
 
 /// Generous ceiling for how long a webview-derived value (current URL,
@@ -60,7 +61,7 @@ fn main() -> anyhow::Result<()> {
     let url_c = format!("file://{fixtures}/page_c.html");
 
     gtk::init()?;
-    let (_window, app) = build_window_and_app()?;
+    let (_window, app) = build_window_and_app(Profile::default())?;
 
     let mut all_ok = true;
 
