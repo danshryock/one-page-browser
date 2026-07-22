@@ -38,10 +38,6 @@ impl WryEngine {
         Ok(Self { webview })
     }
 
-    pub fn current_url(&self) -> anyhow::Result<String> {
-        Ok(self.webview.url()?)
-    }
-
     /// Win32 has no layout manager to resize the embedded webview the way
     /// GTK's box layout does on Linux — the app must call this from its
     /// `WM_SIZE` handler with the content area's new bounds.
@@ -58,6 +54,10 @@ impl RenderEngine for WryEngine {
     fn navigate(&self, url: &str) -> anyhow::Result<()> {
         self.webview.load_url(url)?;
         Ok(())
+    }
+
+    fn current_url(&self) -> anyhow::Result<String> {
+        Ok(self.webview.url()?)
     }
 
     fn go_back(&self) -> anyhow::Result<()> {

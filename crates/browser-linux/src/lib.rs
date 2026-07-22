@@ -1,47 +1,11 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
+pub use browser_core::HOME_URL;
+use browser_core::{domain_of, normalize_url, PageManager};
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
-
-pub const HOME_URL: &str = "about:blank";
-
-const PALETTE: &[&str] = &[
-    "#3b6fd4", "#d4573b", "#3bd46f", "#8f3bd4", "#d4a63b", "#3bc7d4",
-];
-
-fn domain_of(url: &str) -> String {
-    let without_scheme = url.split("://").nth(1).unwrap_or(url);
-    without_scheme.split('/').next().unwrap_or(without_scheme).to_string()
-}
-
-/// Turns whatever the user typed in the switcher search box into a URL: pass
-/// through anything that already looks like one, otherwise assume `https://`.
-fn normalize_url(input: &str) -> String {
-    let trimmed = input.trim();
-    if trimmed.contains("://") || trimmed.starts_with("about:") {
-        trimmed.to_string()
-    } else {
-        format!("https://{trimmed}")
-    }
-}
-
-fn page_matches_query(page: &Page, query_lower: &str) -> bool {
-    if query_lower.is_empty() {
-        return true;
-    }
-    let title = page.title.borrow().to_lowercase();
-    let url = page.engine.current_url().unwrap_or_default().to_lowercase();
-    title.contains(query_lower) || url.contains(query_lower)
-}
-
-struct Page {
-    id: String,
-    container: gtk::Box,
-    engine: WryEngine,
-    title: Rc<RefCell<String>>,
-    color: &'static str,
-}
 
 pub struct AppState {
     address_bar: gtk::Entry,
@@ -49,29 +13,29 @@ pub struct AppState {
     switcher_panel: gtk::Widget,
     search_entry: gtk::SearchEntry,
     flowbox: gtk::FlowBox,
-    pages: RefCell<Vec<Page>>,
-    active_id: RefCell<String>,
-    next_id: Cell<u64>,
+    core: RefCell<PageManager<WryEngine>>,
+    /// GTK `Stack` children, keyed by page id — `browser_core::Page` doesn't
+    /// hold these since they're a GTK-only concept.
+    containers: RefCell<HashMap<String, gtk::Box>>,
 }
 
 impl AppState {
-    fn with_active<F: FnOnce(&Page) -> anyhow::Result<()>>(&self, f: F) {
-        let active_id = self.active_id.borrow().clone();
-        let pages = self.pages.borrow();
-        if let Some(page) = pages.iter().find(|p| p.id == active_id) {
-            if let Err(err) = f(page) {
+    fn with_active<F: FnOnce(&WryEngine) -> anyhow::Result<()>>(&self, f: F) {
+        let core = self.core.borrow();
+        if let Some(page) = core.active() {
+            if let Err(err) = f(&page.engine) {
                 eprintln!("action failed: {err}");
             }
         }
     }
 
     pub fn add_page(self: &Rc<Self>, url: &str) -> anyhow::Result<()> {
-        let id = self.next_id.get().to_string();
-        self.next_id.set(self.next_id.get() + 1);
+        let id = self.core.borrow_mut().allocate_id();
 
         let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
         self.stack.add_named(&container, &id);
         container.show_all();
+        self.containers.borrow_mut().insert(id.clone(), container.clone());
 
         let title = Rc::new(RefCell::new(String::new()));
         let title_for_cb = Rc::clone(&title);
@@ -83,14 +47,7 @@ impl AppState {
             }
         })?;
 
-        let color = PALETTE[self.pages.borrow().len() % PALETTE.len()];
-        self.pages.borrow_mut().push(Page {
-            id: id.clone(),
-            container,
-            engine,
-            title,
-            color,
-        });
+        self.core.borrow_mut().insert(id.clone(), engine, title);
 
         self.set_active(&id);
         self.rebuild_switcher_grid();
@@ -102,9 +59,9 @@ impl AppState {
     /// effect (creating a page, closing the active one) rather than as an
     /// explicit "go view this page" action from the user.
     fn set_active(&self, id: &str) {
+        self.core.borrow_mut().set_active(id);
         self.stack.set_visible_child_name(id);
-        *self.active_id.borrow_mut() = id.to_string();
-        if let Some(page) = self.pages.borrow().iter().find(|p| p.id == id) {
+        if let Some(page) = self.core.borrow().page(id) {
             if let Ok(url) = page.engine.current_url() {
                 self.address_bar.set_text(&url);
             }
@@ -136,13 +93,7 @@ impl AppState {
     /// URL), in creation order — same predicate the switcher grid's filter
     /// uses.
     fn matching_page_ids(&self, query: &str) -> Vec<String> {
-        let query = query.to_lowercase();
-        self.pages
-            .borrow()
-            .iter()
-            .filter(|p| page_matches_query(p, &query))
-            .map(|p| p.id.clone())
-            .collect()
+        self.core.borrow().matching_ids(query)
     }
 
     /// User explicitly picked a page to view (clicked a tile, or a single
@@ -153,18 +104,18 @@ impl AppState {
     }
 
     pub fn close_page(self: &Rc<Self>, id: &str) {
-        let was_active = *self.active_id.borrow() == id;
+        let was_active = self.core.borrow().active_id() == id;
 
-        if let Some(page) = self.pages.borrow().iter().find(|p| p.id == id) {
-            self.stack.remove(&page.container);
+        self.core.borrow_mut().remove(id);
+        if let Some(container) = self.containers.borrow_mut().remove(id) {
+            self.stack.remove(&container);
         }
-        self.pages.borrow_mut().retain(|p| p.id != id);
 
         if was_active {
             // Reassign the active page without touching the switcher's
             // visibility: closing a page from the grid should switch to the
             // nearest remaining one but leave the grid open, not dismiss it.
-            let next_id = self.pages.borrow().first().map(|p| p.id.clone());
+            let next_id = self.core.borrow().pages().first().map(|p| p.id.clone());
             match next_id {
                 Some(nid) => self.set_active(&nid),
                 None => {
@@ -182,86 +133,89 @@ impl AppState {
             self.flowbox.remove(&child);
         }
 
-        for page in self.pages.borrow().iter() {
-            let id = page.id.clone();
-            let title_text = {
-                let t = page.title.borrow();
-                if t.is_empty() { "New Page".to_string() } else { t.clone() }
-            };
-            let url = page.engine.current_url().unwrap_or_default();
-            let domain = domain_of(&url);
+        {
+            let core = self.core.borrow();
+            for page in core.pages() {
+                let id = page.id.clone();
+                let title_text = {
+                    let t = page.title.borrow();
+                    if t.is_empty() { "New Page".to_string() } else { t.clone() }
+                };
+                let url = page.engine.current_url().unwrap_or_default();
+                let domain = domain_of(&url);
 
-            let tile = gtk::Button::new();
-            tile.style_context().add_class("page-tile");
-            let css = gtk::CssProvider::new();
-            // Adwaita's button theme draws its own background-image (a
-            // gradient) on top of any background-color, which is why the
-            // tile's real color was only visible on hover (when the theme's
-            // hover state happens to thin that gradient). Explicitly zeroing
-            // background-image/border/box-shadow here removes the theme's
-            // button chrome so the flat color always shows.
-            let _ = css.load_from_data(
-                format!(
-                    ".page-tile {{ background-image: none; background-color: {}; \
-                      border: none; box-shadow: none; border-radius: 10px; color: #fff; }}",
-                    page.color
-                )
-                .as_bytes(),
-            );
-            tile.style_context()
-                .add_provider(&css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-            tile.set_size_request(150, 110);
-            // Keyboard focus should land on the FlowBoxChild wrapper, not
-            // descend into this button, so arrow keys move between tiles
-            // instead of highlighting sub-widgets. Mouse clicks still work —
-            // can_focus only affects keyboard focus/tab order.
-            tile.set_can_focus(false);
+                let tile = gtk::Button::new();
+                tile.style_context().add_class("page-tile");
+                let css = gtk::CssProvider::new();
+                // Adwaita's button theme draws its own background-image (a
+                // gradient) on top of any background-color, which is why the
+                // tile's real color was only visible on hover (when the theme's
+                // hover state happens to thin that gradient). Explicitly zeroing
+                // background-image/border/box-shadow here removes the theme's
+                // button chrome so the flat color always shows.
+                let _ = css.load_from_data(
+                    format!(
+                        ".page-tile {{ background-image: none; background-color: {}; \
+                          border: none; box-shadow: none; border-radius: 10px; color: #fff; }}",
+                        page.color
+                    )
+                    .as_bytes(),
+                );
+                tile.style_context()
+                    .add_provider(&css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+                tile.set_size_request(150, 110);
+                // Keyboard focus should land on the FlowBoxChild wrapper, not
+                // descend into this button, so arrow keys move between tiles
+                // instead of highlighting sub-widgets. Mouse clicks still work —
+                // can_focus only affects keyboard focus/tab order.
+                tile.set_can_focus(false);
 
-            let inner = gtk::Box::new(gtk::Orientation::Vertical, 2);
-            inner.set_margin(10);
-            inner.set_valign(gtk::Align::End);
-            let title_label = gtk::Label::new(Some(&title_text));
-            title_label.set_halign(gtk::Align::Start);
-            title_label.style_context().add_class("tile-title");
-            let domain_label = gtk::Label::new(Some(&domain));
-            domain_label.set_halign(gtk::Align::Start);
-            domain_label.style_context().add_class("tile-subtitle");
-            inner.pack_start(&title_label, false, false, 0);
-            inner.pack_start(&domain_label, false, false, 0);
-            tile.add(&inner);
+                let inner = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                inner.set_margin(10);
+                inner.set_valign(gtk::Align::End);
+                let title_label = gtk::Label::new(Some(&title_text));
+                title_label.set_halign(gtk::Align::Start);
+                title_label.style_context().add_class("tile-title");
+                let domain_label = gtk::Label::new(Some(&domain));
+                domain_label.set_halign(gtk::Align::Start);
+                domain_label.style_context().add_class("tile-subtitle");
+                inner.pack_start(&title_label, false, false, 0);
+                inner.pack_start(&domain_label, false, false, 0);
+                tile.add(&inner);
 
-            let app_clone = Rc::clone(self);
-            let id_clone = id.clone();
-            tile.connect_clicked(move |_| {
-                app_clone.switch_to(&id_clone);
-            });
+                let app_clone = Rc::clone(self);
+                let id_clone = id.clone();
+                tile.connect_clicked(move |_| {
+                    app_clone.switch_to(&id_clone);
+                });
 
-            let close_btn = gtk::Button::new();
-            close_btn.style_context().add_class("tile-close-btn");
-            let close_label = gtk::Label::new(Some("\u{d7}"));
-            close_label.style_context().add_class("tile-close-label");
-            close_btn.add(&close_label);
-            close_btn.set_halign(gtk::Align::End);
-            close_btn.set_valign(gtk::Align::Start);
-            close_btn.set_margin_top(10);
-            close_btn.set_margin_end(10);
-            close_btn.set_size_request(18, 18);
-            close_btn.set_can_focus(false);
-            let app_clone = Rc::clone(self);
-            let id_clone = id.clone();
-            close_btn.connect_clicked(move |_| {
-                app_clone.close_page(&id_clone);
-            });
+                let close_btn = gtk::Button::new();
+                close_btn.style_context().add_class("tile-close-btn");
+                let close_label = gtk::Label::new(Some("\u{d7}"));
+                close_label.style_context().add_class("tile-close-label");
+                close_btn.add(&close_label);
+                close_btn.set_halign(gtk::Align::End);
+                close_btn.set_valign(gtk::Align::Start);
+                close_btn.set_margin_top(10);
+                close_btn.set_margin_end(10);
+                close_btn.set_size_request(18, 18);
+                close_btn.set_can_focus(false);
+                let app_clone = Rc::clone(self);
+                let id_clone = id.clone();
+                close_btn.connect_clicked(move |_| {
+                    app_clone.close_page(&id_clone);
+                });
 
-            let tile_overlay = gtk::Overlay::new();
-            tile_overlay.add(&tile);
-            tile_overlay.add_overlay(&close_btn);
+                let tile_overlay = gtk::Overlay::new();
+                tile_overlay.add(&tile);
+                tile_overlay.add_overlay(&close_btn);
 
-            let flow_child = gtk::FlowBoxChild::new();
-            flow_child.set_widget_name(&id);
-            flow_child.add(&tile_overlay);
-            flow_child.show_all();
-            self.flowbox.insert(&flow_child, -1);
+                let flow_child = gtk::FlowBoxChild::new();
+                flow_child.set_widget_name(&id);
+                flow_child.add(&tile_overlay);
+                flow_child.show_all();
+                self.flowbox.insert(&flow_child, -1);
+            }
         }
 
         let add_tile = gtk::Button::new();
@@ -288,12 +242,12 @@ impl AppState {
 
     /// Page ids in creation order — test/inspection helper.
     pub fn page_ids(&self) -> Vec<String> {
-        self.pages.borrow().iter().map(|p| p.id.clone()).collect()
+        self.core.borrow().page_ids()
     }
 
     /// Currently active page id — test/inspection helper.
     pub fn active_id(&self) -> String {
-        self.active_id.borrow().clone()
+        self.core.borrow().active_id().to_string()
     }
 
     /// The `Stack`'s visible child name, so tests can confirm the UI (not just
@@ -304,22 +258,13 @@ impl AppState {
 
     /// The active page's current URL — test/inspection helper.
     pub fn active_url(&self) -> Option<String> {
-        let active_id = self.active_id.borrow().clone();
-        self.pages
-            .borrow()
-            .iter()
-            .find(|p| p.id == active_id)
-            .and_then(|p| p.engine.current_url().ok())
+        self.core.borrow().active().and_then(|p| p.engine.current_url().ok())
     }
 
     /// A page's tracked title (updated via wry's document-title-changed
     /// handler) — test/inspection helper.
     pub fn page_title(&self, id: &str) -> Option<String> {
-        self.pages
-            .borrow()
-            .iter()
-            .find(|p| p.id == id)
-            .map(|p| p.title.borrow().clone())
+        self.core.borrow().page(id).map(|p| p.title.borrow().clone())
     }
 
     /// Whether the switcher grid is currently shown — test/inspection helper.
@@ -492,9 +437,8 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
         switcher_panel: switcher_overlay.clone().upcast::<gtk::Widget>(),
         search_entry: search_entry.clone(),
         flowbox: flowbox.clone(),
-        pages: RefCell::new(Vec::new()),
-        active_id: RefCell::new(String::new()),
-        next_id: Cell::new(0),
+        core: RefCell::new(PageManager::new()),
+        containers: RefCell::new(HashMap::new()),
     });
 
     let app_weak = Rc::downgrade(&app);
@@ -506,13 +450,9 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
         if name.as_str() == "__add__" {
             return true;
         }
-        let text = app.search_entry.text().to_lowercase();
-        let pages = app.pages.borrow();
-        pages
-            .iter()
-            .find(|p| p.id == name.as_str())
-            .map(|p| page_matches_query(p, &text))
-            .unwrap_or(false)
+        let text = app.search_entry.text().to_string();
+        let matches = app.core.borrow().matching_ids(&text);
+        matches.iter().any(|m| m == name.as_str())
     })));
 
     {
@@ -591,21 +531,21 @@ pub fn build_window_and_app() -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
 
     {
         let app = Rc::clone(&app);
-        back_button.connect_clicked(move |_| app.with_active(|p| p.engine.go_back()));
+        back_button.connect_clicked(move |_| app.with_active(|p| p.go_back()));
     }
     {
         let app = Rc::clone(&app);
-        forward_button.connect_clicked(move |_| app.with_active(|p| p.engine.go_forward()));
+        forward_button.connect_clicked(move |_| app.with_active(|p| p.go_forward()));
     }
     {
         let app = Rc::clone(&app);
-        reload_button.connect_clicked(move |_| app.with_active(|p| p.engine.reload()));
+        reload_button.connect_clicked(move |_| app.with_active(|p| p.reload()));
     }
     {
         let app = Rc::clone(&app);
         address_bar.connect_activate(move |entry| {
             let url = entry.text().to_string();
-            app.with_active(|p| p.engine.navigate(&url));
+            app.with_active(|p| p.navigate(&url));
         });
     }
     {

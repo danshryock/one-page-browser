@@ -7,6 +7,7 @@ pub trait RenderEngine {
     fn go_back(&self) -> anyhow::Result<()>;
     fn go_forward(&self) -> anyhow::Result<()>;
     fn reload(&self) -> anyhow::Result<()>;
+    fn current_url(&self) -> anyhow::Result<String>;
 }
 
 #[cfg(target_os = "linux")]

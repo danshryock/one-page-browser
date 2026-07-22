@@ -19,16 +19,16 @@ impl WryEngine {
             .build_gtk(container)?;
         Ok(Self { webview })
     }
-
-    pub fn current_url(&self) -> anyhow::Result<String> {
-        Ok(self.webview.url()?)
-    }
 }
 
 impl RenderEngine for WryEngine {
     fn navigate(&self, url: &str) -> anyhow::Result<()> {
         self.webview.load_url(url)?;
         Ok(())
+    }
+
+    fn current_url(&self) -> anyhow::Result<String> {
+        Ok(self.webview.url()?)
     }
 
     fn go_back(&self) -> anyhow::Result<()> {

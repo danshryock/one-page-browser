@@ -1,11 +1,9 @@
 [package]
-name = "browser-linux"
+name = "browser-core"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
 
 [dependencies]
-gtk = "0.18"
 render-engine = { path = "../render-engine" }
-browser-core = { path = "../browser-core" }
 anyhow = "1"
