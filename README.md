@@ -110,10 +110,12 @@ cp target/x86_64-pc-windows-gnu/debug/build/webview2-com-sys-*/out/x64/WebView2L
    target/x86_64-pc-windows-gnu/debug/
 ```
 
-Then run it under Wine:
+`.cargo/config.toml` sets Wine as the runner for this target, so `cargo run`/`cargo test --target
+x86_64-pc-windows-gnu` invoke the built `.exe` under Wine automatically — no need to type `wine
+target/...` by hand:
 
 ```sh
-wine target/x86_64-pc-windows-gnu/debug/browser-windows-win32.exe
+cargo run --target x86_64-pc-windows-gnu -p browser-windows-win32
 ```
 
 The window, toolbar, and address bar come up normally. Expect (and it's fine) to see this in the
@@ -121,8 +123,10 @@ output — Wine has no real WebView2 Runtime, so the content area never initiali
 chrome still work:
 
 ```
-failed to create webview: WebView2 error: WindowsError(Error { code: HRESULT(0x80070002), message: "File not found." })
+Error: WebView2 error: WindowsError(Error { code: HRESULT(0x80070002), message: "File not found." })
 ```
+
+The same applies to `browser-windows-nwg` — swap the `-p` above.
 
 ## Testing
 

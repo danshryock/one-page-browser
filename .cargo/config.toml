@@ -1,0 +1,7 @@
+# Lets `cargo run`/`cargo test --target x86_64-pc-windows-gnu` execute the
+# resulting .exe under Wine automatically, instead of needing
+# `wine target/x86_64-pc-windows-gnu/debug/foo.exe` typed out by hand every
+# time (see README.md's cross-compiling section). Only affects this target —
+# native Linux/Windows builds are unaffected.
+[target.x86_64-pc-windows-gnu]
+runner = "wine"
