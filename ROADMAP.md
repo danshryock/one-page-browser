@@ -86,13 +86,26 @@ Nothing specifically queued — pick the next item from the backlog below.
 - macOS: native chrome via AppKit, following the same `RenderEngine`-trait pattern as the other front ends.
 - `browser-windows-winui`: unified search/URL bar and bookmarks, matching what `browser-linux-gtk3` now has
   (both landed there only, per scope — see "Done" above).
-- External password manager integration.
-- Internal password manager.
+- External password manager integration — not attempted: which manager(s) and which integration protocol
+  (native messaging, a browser-extension-equivalent, direct API) is a real design decision, not something
+  to guess at unsupervised.
+- Internal password manager — not attempted: this is genuinely large (encrypted credential storage — could
+  reuse the new profile-passphrase infrastructure, gated on a profile actually having one set — plus a
+  management UI, plus autofill via detecting login forms and injecting values into arbitrary third-party
+  page DOMs) and the highest-risk remaining item to get subtly wrong. Autofill correctness in particular
+  varies a lot site-to-site in ways headless fixture-page testing can't validate — this deserves focused
+  attention with real-site testing, not a rushed pass at the end of an already-long session.
 - Changing/removing a profile's passphrase, or migrating an existing unencrypted profile to encrypted
   (`sqlite3_rekey` is available via libsql-sys but not wired up yet).
 - `browser-windows-winui` debugging — it's been cross-compile/link-verified only all along (see "Done"
   above), never actually run; once it can be run on real Windows, expect a real debugging pass (custom
   title bar drag, the `WM_KEYDOWN` HWND-subclass keybinding capture, `WebView2` control behavior, etc. are
   all unverified at runtime).
-- Add vector search to the page/history search using libsql's
-  native vector search
+- Add vector search to the page/history search using libsql's native vector search — investigated, not
+  implemented: libsql's vector functions (`vector32`, `vector_distance_cos`, etc.) are real and already
+  present in the bundled SQLite build, so the SQL side is straightforward. The actual blocker is that vector
+  search is meaningless without real semantic embeddings of page titles/content, and generating those needs
+  either a local embedding model (a real dependency-size/complexity decision) or a network-based embedding
+  API (a cost/network-access/API-key decision) — picking between those isn't something to guess at
+  unsupervised. A naive local pseudo-embedding (e.g. hashing/n-grams) wouldn't add genuine value over the
+  substring search already in place, so wasn't built just to check the box.
