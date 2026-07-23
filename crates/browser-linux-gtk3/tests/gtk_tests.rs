@@ -643,3 +643,38 @@ fn keybindings_editor_lives_inside_settings() {
         cleanup_test_profile(&profile);
     });
 }
+
+#[test]
+fn search_engine_management_add_and_remove() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("engine-management");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        app.open_settings();
+        let default_count = app.settings_engine_names().len();
+        assert_eq!(app.engines_row_count(), default_count, "the management list should start with one row per default engine");
+
+        // Adding a new engine should update the real Settings data, the
+        // management list, and the default-engine dropdown (the fix for the
+        // dropdown previously always showing a fixed list regardless of
+        // what Settings actually contained).
+        app.add_search_engine_via_fields("Kagi", "https://kagi.com/search?q={query}");
+        assert!(app.settings_engine_names().contains(&"Kagi".to_string()));
+        assert_eq!(app.engines_row_count(), default_count + 1);
+
+        // Re-adding the same name updates in place rather than duplicating.
+        app.add_search_engine_via_fields("Kagi", "https://kagi.com/search?q={query}&updated=1");
+        assert_eq!(app.engines_row_count(), default_count + 1, "re-adding an existing name shouldn't duplicate its row");
+
+        // Removing every engine down to one should leave the dropdown
+        // correctly reflecting whichever one engine remains as the default.
+        while app.settings_engine_names().len() > 1 {
+            let name = app.settings_engine_names()[0].clone();
+            app.remove_search_engine_by_name(&name);
+        }
+        assert_eq!(app.settings_engine_names().len(), 1);
+        assert_eq!(app.engine_combo_active_id().as_deref(), Some(app.settings_engine_names()[0].as_str()));
+
+        cleanup_test_profile(&profile);
+    });
+}

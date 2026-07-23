@@ -51,6 +51,9 @@ build/run instructions.
 - Moved the keybindings editor into the settings overlay (`browser-linux-gtk3`) instead of its own overlay/
   toolbar button — one "app configuration" destination instead of two, with the row list in a scrollable
   section so the combined overlay doesn't grow too tall. See `summaries/move-keybindings-into-settings.md`.
+- Search engine management (`browser-core` + `browser-linux-gtk3`): add/remove custom search engines from the
+  settings overlay, plus a fix for the default-engine dropdown always showing a fixed list instead of the
+  live per-profile `Settings::search_engines`. See `summaries/search-engine-management.md`.
 
 ## Next
 
@@ -71,7 +74,6 @@ Nothing specifically queued — pick the next item from the backlog below.
   above), never actually run; once it can be run on real Windows, expect a real debugging pass (custom
   title bar drag, the `WM_KEYDOWN` HWND-subclass keybinding capture, `WebView2` control behavior, etc. are
   all unverified at runtime).
-- Add the search engine management features
 - Add vector search to the page/history search using libsql's
   native vector search
 - Add passphrase support to profiles, use native encryption

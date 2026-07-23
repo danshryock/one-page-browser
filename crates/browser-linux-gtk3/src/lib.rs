@@ -39,6 +39,12 @@ pub struct AppState {
     settings_panel: gtk::Widget,
     start_page_entry: gtk::Entry,
     engine_combo: gtk::ComboBoxText,
+    /// Rebuilt from `Settings::search_engines` each time settings opens and
+    /// after every add/remove — holds one row per engine, with a "×" to
+    /// remove it.
+    engines_list_box: gtk::Box,
+    new_engine_name_entry: gtk::Entry,
+    new_engine_url_entry: gtk::Entry,
     unlimited_check: gtk::CheckButton,
     limit_spin: gtk::SpinButton,
     /// The profile picker overlay's root widget — same in-window-overlay
@@ -297,7 +303,6 @@ impl AppState {
         self.close_bookmarks();
         let settings = self.settings.borrow();
         self.start_page_entry.set_text(&settings.start_page);
-        self.engine_combo.set_active_id(Some(&settings.default_search_engine));
         match settings.max_loaded_pages {
             Some(n) => {
                 self.unlimited_check.set_active(false);
@@ -310,6 +315,10 @@ impl AppState {
             }
         }
         drop(settings);
+        self.refresh_engine_combo();
+        self.rebuild_engines_list();
+        self.new_engine_name_entry.set_text("");
+        self.new_engine_url_entry.set_text("");
         self.listening_for.set(None);
         self.rebuild_keybindings_list();
         self.stack.set_sensitive(false);
@@ -355,6 +364,96 @@ impl AppState {
     /// helper.
     pub fn is_settings_open(&self) -> bool {
         self.settings_panel.is_visible()
+    }
+
+    /// Repopulates the default-search-engine dropdown from the live
+    /// `Settings::search_engines` (rather than a fixed list) and re-selects
+    /// the current default — called whenever settings opens and after every
+    /// engine add/remove, so it never goes stale.
+    fn refresh_engine_combo(&self) {
+        self.engine_combo.remove_all();
+        let settings = self.settings.borrow();
+        for engine in &settings.search_engines {
+            self.engine_combo.append(Some(&engine.name), &engine.name);
+        }
+        self.engine_combo.set_active_id(Some(&settings.default_search_engine));
+    }
+
+    /// Rebuilds the search engine management list from scratch, one row per
+    /// `Settings::search_engines` entry with its query URL template shown
+    /// underneath and a "×" to remove it. The "×" is omitted entirely when
+    /// only one engine remains, since `Settings::remove_search_engine`
+    /// refuses to remove the last one anyway — no point offering a button
+    /// that would just silently do nothing.
+    fn rebuild_engines_list(self: &Rc<Self>) {
+        for child in self.engines_list_box.children() {
+            self.engines_list_box.remove(&child);
+        }
+
+        let engines = self.settings.borrow().search_engines.clone();
+        let can_remove = engines.len() > 1;
+        for engine in engines {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+
+            let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let name_label = gtk::Label::new(Some(&engine.name));
+            name_label.set_halign(gtk::Align::Start);
+            let url_label = gtk::Label::new(Some(&engine.query_url_template));
+            url_label.set_halign(gtk::Align::Start);
+            url_label.style_context().add_class("tile-subtitle");
+            labels.pack_start(&name_label, false, false, 0);
+            labels.pack_start(&url_label, false, false, 0);
+            row.pack_start(&labels, true, true, 0);
+
+            if can_remove {
+                let remove_button = gtk::Button::with_label("\u{d7}");
+                let app_clone = Rc::clone(self);
+                let name = engine.name.clone();
+                remove_button.connect_clicked(move |_| {
+                    app_clone.remove_search_engine_by_name(&name);
+                });
+                row.pack_start(&remove_button, false, false, 0);
+            }
+
+            self.engines_list_box.pack_start(&row, false, false, 0);
+        }
+        self.engines_list_box.show_all();
+    }
+
+    /// Removes a search engine by name, saves immediately, and refreshes
+    /// both the management list and the default-engine dropdown (which may
+    /// have had its selection reassigned, if the removed engine was the
+    /// default — see `Settings::remove_search_engine`). The management
+    /// list's "×" button action.
+    pub fn remove_search_engine_by_name(self: &Rc<Self>, name: &str) {
+        self.settings.borrow_mut().remove_search_engine(name);
+        if let Err(err) = self.settings().save(&self.profile) {
+            eprintln!("failed to save settings: {err}");
+        }
+        self.rebuild_engines_list();
+        self.refresh_engine_combo();
+    }
+
+    /// Reads the "Add engine" row's fields and adds a new search engine
+    /// (or updates an existing one with the same name), saves immediately,
+    /// clears the fields, and refreshes both the management list and the
+    /// dropdown. Does nothing if either field is blank.
+    pub fn add_search_engine_from_fields(self: &Rc<Self>) {
+        let name = self.new_engine_name_entry.text().to_string();
+        let name = name.trim();
+        let url = self.new_engine_url_entry.text().to_string();
+        let url = url.trim();
+        if name.is_empty() || url.is_empty() {
+            return;
+        }
+        self.settings.borrow_mut().add_search_engine(name, url);
+        if let Err(err) = self.settings().save(&self.profile) {
+            eprintln!("failed to save settings: {err}");
+        }
+        self.new_engine_name_entry.set_text("");
+        self.new_engine_url_entry.set_text("");
+        self.rebuild_engines_list();
+        self.refresh_engine_combo();
     }
 
     /// Shows the profile picker, rebuilt from `list_profile_names()` each
@@ -1032,6 +1131,36 @@ impl AppState {
     pub fn set_settings_start_page(&self, text: &str) {
         self.start_page_entry.set_text(text);
     }
+
+    /// Names of every search engine currently in `Settings::search_engines`
+    /// — test helper for confirming add/remove actually changed the
+    /// underlying data (not just the management list widget).
+    pub fn settings_engine_names(&self) -> Vec<String> {
+        self.settings.borrow().search_engines.iter().map(|e| e.name.clone()).collect()
+    }
+
+    /// The default-search-engine dropdown's currently active id (which is
+    /// also the engine's name) — test helper for confirming
+    /// `refresh_engine_combo` actually re-selects the current default after
+    /// being repopulated.
+    pub fn engine_combo_active_id(&self) -> Option<String> {
+        self.engine_combo.active_id().map(|s| s.to_string())
+    }
+
+    /// Types into the "Add engine" row's fields and clicks "Add engine" —
+    /// test helper exercising the real `add_search_engine_from_fields`
+    /// handler a real click would trigger.
+    pub fn add_search_engine_via_fields(self: &Rc<Self>, name: &str, url_template: &str) {
+        self.new_engine_name_entry.set_text(name);
+        self.new_engine_url_entry.set_text(url_template);
+        self.add_search_engine_from_fields();
+    }
+
+    /// Number of rows currently shown in the search engine management list
+    /// — test/inspection helper.
+    pub fn engines_row_count(&self) -> usize {
+        self.engines_list_box.children().len()
+    }
 }
 
 /// Current time as Unix seconds — used as a bookmark's `created_at` when
@@ -1297,12 +1426,34 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
 
     let engine_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     engine_row.pack_start(&gtk::Label::new(Some("Search engine")), false, false, 0);
+    // Populated for real (from the live per-profile Settings, not this
+    // hardcoded default) by `refresh_engine_combo`, called from
+    // `open_settings` every time it opens — left empty here since nothing
+    // shows until the overlay is opened anyway.
     let engine_combo = gtk::ComboBoxText::new();
-    for engine in &Settings::default().search_engines {
-        engine_combo.append(Some(&engine.name), &engine.name);
-    }
     engine_row.pack_start(&engine_combo, true, true, 0);
     settings_box.pack_start(&engine_row, false, false, 0);
+
+    // Search engine management: add/remove entries from Settings::search_engines.
+    // Unlike the fields above (staged until Save), these take effect and save
+    // immediately on each add/remove — the same immediate-save convention this
+    // session's bookmarks/keybindings editors already use, rather than adding a
+    // separate staged/cancel-able list-editing model just for this section.
+    let engines_list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    settings_box.pack_start(&engines_list_box, false, false, 0);
+
+    let new_engine_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let new_engine_name_entry = gtk::Entry::new();
+    new_engine_name_entry.set_placeholder_text(Some("Name"));
+    new_engine_name_entry.set_hexpand(true);
+    let new_engine_url_entry = gtk::Entry::new();
+    new_engine_url_entry.set_placeholder_text(Some("https://example.com/search?q={query}"));
+    new_engine_url_entry.set_hexpand(true);
+    let add_engine_button = gtk::Button::with_label("Add engine");
+    new_engine_row.pack_start(&new_engine_name_entry, true, true, 0);
+    new_engine_row.pack_start(&new_engine_url_entry, true, true, 0);
+    new_engine_row.pack_start(&add_engine_button, false, false, 0);
+    settings_box.pack_start(&new_engine_row, false, false, 0);
 
     let limit_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     limit_row.pack_start(&gtk::Label::new(Some("Loaded pages limit")), false, false, 0);
@@ -1460,6 +1611,9 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         settings_panel: settings_overlay.clone().upcast::<gtk::Widget>(),
         start_page_entry: start_page_entry.clone(),
         engine_combo: engine_combo.clone(),
+        engines_list_box: engines_list_box.clone(),
+        new_engine_name_entry: new_engine_name_entry.clone(),
+        new_engine_url_entry: new_engine_url_entry.clone(),
         unlimited_check: unlimited_check.clone(),
         limit_spin: limit_spin.clone(),
         profile_panel: profile_overlay.clone().upcast::<gtk::Widget>(),
@@ -1645,6 +1799,18 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         let app = Rc::clone(&app);
         settings_save_button.connect_clicked(move |_| {
             app.save_settings();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        add_engine_button.connect_clicked(move |_| {
+            app.add_search_engine_from_fields();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        new_engine_url_entry.connect_activate(move |_| {
+            app.add_search_engine_from_fields();
         });
     }
     {

@@ -28,6 +28,37 @@ impl Settings {
         self.search_engines.iter().find(|e| e.name == self.default_search_engine)
     }
 
+    /// Adds a search engine, or updates its query URL template in place if
+    /// an engine with this name already exists — never creates a duplicate
+    /// entry for the same name, matching `Bookmarks::add`'s convention.
+    pub fn add_search_engine(&mut self, name: &str, query_url_template: &str) {
+        if let Some(existing) = self.search_engines.iter_mut().find(|e| e.name == name) {
+            existing.query_url_template = query_url_template.to_string();
+        } else {
+            self.search_engines.push(SearchEngine { name: name.to_string(), query_url_template: query_url_template.to_string() });
+        }
+    }
+
+    /// Removes a search engine by name. Refuses to remove the last
+    /// remaining engine — there must always be at least one to fall back to
+    /// — and reassigns `default_search_engine` to the first remaining entry
+    /// if the one removed was the default. Returns whether anything was
+    /// actually removed.
+    pub fn remove_search_engine(&mut self, name: &str) -> bool {
+        if self.search_engines.len() <= 1 {
+            return false;
+        }
+        let before = self.search_engines.len();
+        self.search_engines.retain(|e| e.name != name);
+        let removed = self.search_engines.len() != before;
+        if removed && self.default_search_engine == name {
+            if let Some(first) = self.search_engines.first() {
+                self.default_search_engine = first.name.clone();
+            }
+        }
+        removed
+    }
+
     /// Loads settings from `profile`'s config directory, falling back to
     /// `Settings::default()` if there's no file yet (first run) or it fails
     /// to read/parse (e.g. from an incompatible older version). An
@@ -138,5 +169,51 @@ mod tests {
             profile.settings_path().map(|p| !p.exists()).unwrap_or(true),
             "an ephemeral profile's settings should never actually be written to disk"
         );
+    }
+
+    #[test]
+    fn add_search_engine_appends_a_new_one() {
+        let mut settings = Settings::default();
+        let before = settings.search_engines.len();
+        settings.add_search_engine("Kagi", "https://kagi.com/search?q={query}");
+        assert_eq!(settings.search_engines.len(), before + 1);
+        assert_eq!(settings.search_engines.last().unwrap().name, "Kagi");
+    }
+
+    #[test]
+    fn add_search_engine_with_an_existing_name_updates_instead_of_duplicating() {
+        let mut settings = Settings::default();
+        let before = settings.search_engines.len();
+        settings.add_search_engine("Google", "https://google.example/?q={query}");
+        assert_eq!(settings.search_engines.len(), before, "re-adding an existing name shouldn't duplicate it");
+        assert_eq!(
+            settings.search_engines.iter().find(|e| e.name == "Google").unwrap().query_url_template,
+            "https://google.example/?q={query}"
+        );
+    }
+
+    #[test]
+    fn remove_search_engine_reassigns_the_default_if_it_was_removed() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.default_search_engine, "Google");
+
+        assert!(settings.remove_search_engine("Google"));
+        assert!(settings.search_engines.iter().all(|e| e.name != "Google"));
+        assert_ne!(settings.default_search_engine, "Google", "the default should have been reassigned");
+        assert_eq!(settings.default_search_engine, settings.search_engines[0].name);
+    }
+
+    #[test]
+    fn remove_search_engine_refuses_to_remove_the_last_one() {
+        let mut settings = Settings::default();
+        while settings.search_engines.len() > 1 {
+            let name = settings.search_engines[0].name.clone();
+            settings.remove_search_engine(&name);
+        }
+        assert_eq!(settings.search_engines.len(), 1);
+
+        let last_name = settings.search_engines[0].name.clone();
+        assert!(!settings.remove_search_engine(&last_name), "removing the last remaining engine should be refused");
+        assert_eq!(settings.search_engines.len(), 1);
     }
 }
