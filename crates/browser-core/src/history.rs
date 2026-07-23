@@ -405,6 +405,13 @@ mod tests {
         }
     }
 
+    // These three exercise the *real* `open_encrypted` implementation, which
+    // only exists on Linux (see its `#[cfg]` and doc comment) — gated so
+    // they don't run (and fail on the stub's `Err`) on a genuine non-Linux
+    // CI runner, e.g. GitHub Actions' `windows-latest`, which actually
+    // *executes* `browser-core`'s test suite natively rather than only
+    // cross-compiling it.
+    #[cfg(target_os = "linux")]
     #[test]
     fn encrypted_store_round_trips_with_the_right_passphrase() {
         let profile = temp_profile("round-trip");
@@ -425,6 +432,7 @@ mod tests {
         cleanup_profile(&profile);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn encrypted_store_rejects_the_wrong_passphrase() {
         let profile = temp_profile("wrong-passphrase");
@@ -438,6 +446,7 @@ mod tests {
         cleanup_profile(&profile);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_plain_unencrypted_open_cannot_read_an_encrypted_store() {
         let profile = temp_profile("plain-vs-encrypted");
@@ -447,6 +456,23 @@ mod tests {
 
         let result = HistoryStore::open(&profile);
         assert!(result.is_err(), "opening an encrypted store without any passphrase should fail, not silently succeed");
+
+        cleanup_profile(&profile);
+    }
+
+    /// The non-Linux counterpart to the three tests above: confirms the
+    /// stub `open_encrypted` (see its `#[cfg(not(target_os = "linux"))]`
+    /// impl) does what it's documented to do — return an error — rather
+    /// than silently falling back to an unencrypted open, which would be a
+    /// silent security downgrade for anyone who thinks they got encryption.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn open_encrypted_returns_an_error_rather_than_silently_opening_unencrypted_on_this_platform() {
+        let profile = temp_profile("stub-platform");
+        cleanup_profile(&profile);
+
+        let result = HistoryStore::open_encrypted(&profile, "some passphrase");
+        assert!(result.is_err(), "open_encrypted should report an error on this platform, not silently succeed");
 
         cleanup_profile(&profile);
     }

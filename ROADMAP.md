@@ -83,6 +83,13 @@ build/run instructions.
   available here, and picking between those is a real decision, not something to guess at), so this finds
   entries sharing vocabulary with a query regardless of word order/exact substring, shown as a third
   `.similar-tile` category in the switcher grid. See `summaries/vector-search.md`.
+- Windows CI via GitHub Actions (`.github/workflows/windows.yml`): runs on a genuine `windows-latest` runner —
+  `cargo test -p browser-core` natively (not just cross-compile-checked), and a `browser-windows-winui` build
+  + real launch + screenshot, the first environment able to actually run WinUI 3 rather than only
+  cross-compile/link-verify it (WinUI 3 needs the real Windows App SDK runtime, unavailable under Wine).
+  Local VMs (Docker/KVM) were considered and rejected: a local macOS VM would violate Apple's EULA on
+  non-Apple hardware, and `cross` only cross-compiles, it doesn't run foreign-OS binaries. Not yet actually
+  run — no GitHub remote is connected to this repo yet. See `summaries/windows-github-actions-ci.md`.
 
 ## Next
 

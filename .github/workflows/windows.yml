@@ -1,0 +1,125 @@
+name: Windows
+
+# Runs on GitHub's real windows-latest runners — genuine Windows, not a
+# cross-compile or Wine emulation. This is deliberately independent of the
+# xwin/cargo-xwin cross-compilation setup documented in README.md (used for
+# local development on Linux): a native Windows machine already has the real
+# MSVC toolchain and Windows SDK, so none of that is needed here — this
+# workflow builds every Windows crate the plain, direct way
+# (`cargo build`/`cargo test`, no `cargo xwin`), and — for
+# browser-windows-winui specifically — actually *launches* it, which has
+# never been possible before (Wine can't host the real Windows App SDK/
+# WebView2 runtime WinUI 3 needs; see ROADMAP.md).
+#
+# browser-windows-win32/browser-windows-nwg/browser-wx are intentionally not
+# built here — deprioritized in favor of browser-windows-winui (see
+# ROADMAP.md's "Done" section); win32/nwg already have a working local
+# Wine-based build+run loop, so there's little this workflow would add for
+# them.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-core:
+    name: Test browser-core + check render-engine (native Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # browser-core is meant to work on every platform; encryption-specific
+      # tests are #[cfg(target_os = "linux")]-gated (real HistoryStore
+      # encryption is Linux-only for now — see Cargo.toml/history.rs) so this
+      # exercises everything else for real on native Windows, something the
+      # Linux-only local dev loop never has.
+      - name: cargo test -p browser-core
+        run: cargo test -p browser-core --verbose
+
+      # render-engine's windows.rs (win32/nwg's WryEngine) and winui.rs
+      # (WebView2Engine) both compile on this target; a plain `check` (rather
+      # than `build`, which browser-windows-winui's own job below already
+      # covers via its dependency on render-engine) is enough to confirm the
+      # crate itself is sound here.
+      - name: cargo check -p render-engine
+        run: cargo check -p render-engine --verbose
+
+  build-and-smoke-winui:
+    name: Build + launch browser-windows-winui (native Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # WinUI 3's Microsoft.UI.Xaml.* types aren't in the OS's WinRT catalog
+      # until the Windows App SDK framework package is present and located
+      # via PackageDependency::initialize_version(WindowsAppSDKVersion::V2)
+      # (see browser-windows-winui/src/main.rs's comment on that call) —
+      # skipping this produces a "Class not registered" error at runtime.
+      # UNVERIFIED: this exact install step hasn't been run for real yet (no
+      # GitHub remote was configured for this repo when it was written — see
+      # summaries/windows-ci-and-macos-scaffold.md). GitHub's windows-latest
+      # image may already bundle a compatible Windows App SDK via its Visual
+      # Studio workloads, in which case this becomes a no-op; if the aka.ms
+      # redirect below is stale by the time this actually runs, that's the
+      # first thing to fix. `continue-on-error` so a failure here doesn't
+      # block the build step from at least being attempted — the smoke-test
+      # step further down will fail clearly (and visibly) if the runtime
+      # genuinely isn't present.
+      - name: Install Windows App SDK runtime (v2.x)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = "$env:RUNNER_TEMP\windowsappruntimeinstall-x64.exe"
+          Invoke-WebRequest -Uri "https://aka.ms/windowsappsdk/2.0/latest/windowsappruntimeinstall-x64.exe" -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList "--quiet" -Wait
+
+      - name: Build (native MSVC — no cargo-xwin needed on a real Windows runner)
+        run: cargo build -p browser-windows-winui --target x86_64-pc-windows-msvc --verbose
+
+      # windows-latest runners provide a real interactive desktop session
+      # (unlike Linux runners), so this can actually launch a visible window
+      # and screenshot it — genuine visual confirmation the app renders,
+      # rather than only "it compiled and linked."
+      - name: Launch and screenshot
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Get-ChildItem -Recurse -Filter "browser-windows-winui.exe" -Path target |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) {
+            Write-Error "browser-windows-winui.exe not found under target/ after build"
+            exit 1
+          }
+
+          $proc = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 8
+
+          if ($proc.HasExited) {
+            Write-Error "browser-windows-winui exited on its own within 8 seconds (exit code $($proc.ExitCode)) — see the Windows App SDK install step above if this is a 'Class not registered'-style failure"
+            exit 1
+          }
+
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+          $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+          $bitmap.Save("$env:GITHUB_WORKSPACE\browser-windows-winui-screenshot.png")
+
+          Stop-Process -Id $proc.Id -Force
+
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-windows-winui-screenshot
+          path: browser-windows-winui-screenshot.png
+          if-no-files-found: ignore
