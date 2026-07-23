@@ -1,0 +1,15 @@
+[package]
+name = "browser-macos-appkit"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+render-engine = { path = "../render-engine" }
+browser-core = { path = "../browser-core" }
+anyhow = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"

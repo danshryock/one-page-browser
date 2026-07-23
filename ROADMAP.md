@@ -90,6 +90,15 @@ build/run instructions.
   Local VMs (Docker/KVM) were considered and rejected: a local macOS VM would violate Apple's EULA on
   non-Apple hardware, and `cross` only cross-compiles, it doesn't run foreign-OS binaries. Not yet actually
   run — no GitHub remote is connected to this repo yet. See `summaries/windows-github-actions-ci.md`.
+- `browser-macos-appkit` (new crate) + `render-engine::macos`: a **minimal scaffold**, not feature parity —
+  a single native `NSWindow` with a toolbar strip (back/forward/reload `NSButton`s + an address-bar
+  `NSTextField`) and a `WKWebView` (via `wry`, embedded as a real AppKit view, no `tao`/`winit`, matching
+  every other front end's "native widget wraps native webview child" pattern), using `objc2`/`objc2-app-kit`.
+  Written and dependency-resolved/`cargo check`-clean on this Linux dev machine, but genuinely **never
+  compiled** — no macOS toolchain is available here, and (per the Windows CI entry above) a local macOS VM
+  isn't an option on this non-Apple hardware either. Needs a real compile pass (on real macOS, or a future
+  `macos-latest` GitHub Actions workflow) before it's trustworthy. See
+  `summaries/macos-appkit-scaffold.md`.
 
 ## Next
 
@@ -97,7 +106,10 @@ Nothing specifically queued — pick the next item from the backlog below.
 
 ## Backlog (not yet started, roughly in the order raised)
 
-- macOS: native chrome via AppKit, following the same `RenderEngine`-trait pattern as the other front ends.
+- `browser-macos-appkit`: bring it to feature parity with `browser-linux-gtk3` (switcher grid, settings/
+  bookmarks/keybindings/profile-picker overlays, history integration) — see "Done" above for what exists so
+  far (a minimal single-page scaffold only), and a `macos-latest` GitHub Actions CI workflow once it's known
+  to actually compile.
 - `browser-windows-winui`: unified search/URL bar and bookmarks, matching what `browser-linux-gtk3` now has
   (both landed there only, per scope — see "Done" above).
 - External password manager integration — not attempted: which manager(s) and which integration protocol

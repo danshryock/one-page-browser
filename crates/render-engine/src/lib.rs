@@ -30,3 +30,8 @@ pub use windows::WryEngine;
 mod winui;
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
 pub use winui::{AssertSend, WebView2Engine};
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::WryEngine;
