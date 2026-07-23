@@ -44,6 +44,10 @@ build/run instructions.
   defaults, `Bookmarks` always starts empty, `HistoryStore` opens in-memory, and none of it is ever written
   to disk. Launch via `--incognito`/`--private`/`--guest`, or the profile picker's new "New Private Window"
   button. See `summaries/private-incognito-guest-profile.md`.
+- Fixed illegible label colors in the settings/profile-picker/keybindings/bookmarks overlays: plain labels
+  (row labels, the "Unlimited" checkbox, bookmark rows) and flat-button text had no explicit color and fell
+  back to the system theme's default (low-contrast against the overlays' dark background). See
+  `summaries/fix-overlay-label-colors.md`.
 
 ## Next
 
@@ -64,7 +68,6 @@ Nothing specifically queued — pick the next item from the backlog below.
   above), never actually run; once it can be run on real Windows, expect a real debugging pass (custom
   title bar drag, the `WM_KEYDOWN` HWND-subclass keybinding capture, `WebView2` control behavior, etc. are
   all unverified at runtime).
-- fix colors in settings/bookmarks overlays
 - Move the keybindings screen into the settings screen
 - Add the search engine management features
 - Add vector search to the page/history search using libsql's

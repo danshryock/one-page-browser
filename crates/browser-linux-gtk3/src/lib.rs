@@ -1126,7 +1126,11 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
               .settings-title { color: #ffffff; font-weight: 600; font-size: 14px; } \
               .history-tile { background-image: none; background-color: rgba(255, 255, 255, 0.12); \
                 border: 1px dashed rgba(255, 255, 255, 0.3); box-shadow: none; border-radius: 10px; \
-                color: #fff; opacity: 0.75; }",
+                color: #fff; opacity: 0.75; } \
+              .settings-box label:not(.settings-title) { color: rgba(255, 255, 255, 0.92); } \
+              .settings-box button.flat, .settings-box button.flat:hover { \
+                background-image: none; background-color: transparent; } \
+              .settings-box button.flat label { color: rgba(255, 255, 255, 0.92); }",
         );
         gtk::StyleContext::add_provider_for_screen(&screen, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
