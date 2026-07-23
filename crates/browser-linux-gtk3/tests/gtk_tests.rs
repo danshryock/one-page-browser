@@ -702,3 +702,28 @@ fn switcher_grid_shows_bookmark_matches_not_currently_open() {
         cleanup_test_profile(&profile);
     });
 }
+
+#[test]
+fn screenshot_saves_a_real_png_file() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("screenshot");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&fixture_url("page_a.html")).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().is_some()));
+
+        let path = std::env::temp_dir().join(format!("claude-browser-test-screenshot-{}.png", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // save_screenshot_to (the capture/write logic) rather than
+        // take_screenshot (which shows a real, blocking native save dialog
+        // that nothing in an automated test can drive).
+        app.save_screenshot_to(path.clone());
+        assert!(wait_until(|| path.exists()), "a screenshot file should be written");
+
+        let bytes = std::fs::read(&path).expect("screenshot file should be readable");
+        assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']), "the saved file should be a real PNG");
+
+        let _ = std::fs::remove_file(&path);
+        cleanup_test_profile(&profile);
+    });
+}

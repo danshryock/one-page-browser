@@ -2233,7 +2233,9 @@ name = "render-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cairo-rs",
  "gtk",
+ "webkit2gtk",
  "windows 0.62.2",
  "windows-core 0.62.2",
  "winio-winui3",

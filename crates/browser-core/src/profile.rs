@@ -61,6 +61,17 @@ impl Profile {
         let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
         Some(dirs.data_dir().join(&self.name).join("history.db"))
     }
+
+    /// Where this profile's page screenshots are saved by default — kept
+    /// per-profile (rather than a shared system Pictures folder) for the
+    /// same reason every other piece of profile data is: a browser profile
+    /// keeps its own things to itself. Just a starting suggestion for the
+    /// save dialog, not a forced location — the directory isn't created
+    /// until a screenshot is actually about to be saved there.
+    pub fn screenshots_dir(&self) -> Option<PathBuf> {
+        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        Some(dirs.data_dir().join(&self.name).join("screenshots"))
+    }
 }
 
 impl Default for Profile {
@@ -253,6 +264,13 @@ mod tests {
         let profile = Profile::new("work");
         let path = profile.bookmarks_path().expect("a config dir should be available in tests");
         assert!(path.ends_with("work/bookmarks.json"), "{path:?}");
+    }
+
+    #[test]
+    fn screenshots_dir_is_scoped_under_the_profile_name() {
+        let profile = Profile::new("work");
+        let path = profile.screenshots_dir().expect("a data dir should be available in tests");
+        assert!(path.ends_with("work/screenshots"), "{path:?}");
     }
 
     #[test]

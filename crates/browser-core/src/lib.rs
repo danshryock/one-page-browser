@@ -309,6 +309,9 @@ mod tests {
         fn reload(&self) -> anyhow::Result<()> {
             Ok(())
         }
+        fn screenshot(&self, callback: Box<dyn Fn(anyhow::Result<Vec<u8>>)>) {
+            callback(Ok(Vec::new()));
+        }
     }
 
     fn insert_page(mgr: &mut PageManager<MockEngine>, url: &str) -> String {

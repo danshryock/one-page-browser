@@ -1,5 +1,6 @@
 use gtk::Container;
-use wry::{WebView, WebViewBuilder, WebViewBuilderExtUnix};
+use webkit2gtk::WebViewExt as _;
+use wry::{WebView, WebViewBuilder, WebViewBuilderExtUnix, WebViewExtUnix};
 
 use crate::RenderEngine;
 
@@ -59,5 +60,25 @@ impl RenderEngine for WryEngine {
     fn reload(&self) -> anyhow::Result<()> {
         self.webview.reload()?;
         Ok(())
+    }
+
+    fn screenshot(&self, callback: Box<dyn Fn(anyhow::Result<Vec<u8>>)>) {
+        self.webview.webview().snapshot(
+            webkit2gtk::SnapshotRegion::FullDocument,
+            webkit2gtk::SnapshotOptions::NONE,
+            gtk::gio::Cancellable::NONE,
+            move |result| {
+                let outcome = result
+                    .map_err(|err| anyhow::anyhow!("snapshot failed: {err}"))
+                    .and_then(|surface| {
+                        let image_surface: gtk::cairo::ImageSurface =
+                            surface.try_into().map_err(|_| anyhow::anyhow!("snapshot surface wasn't an image surface"))?;
+                        let mut bytes = Vec::new();
+                        image_surface.write_to_png(&mut bytes).map_err(|err| anyhow::anyhow!("failed to encode PNG: {err}"))?;
+                        Ok(bytes)
+                    });
+                callback(outcome);
+            },
+        );
     }
 }

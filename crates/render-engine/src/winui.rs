@@ -127,4 +127,12 @@ impl RenderEngine for WebView2Engine {
         self.control.Reload()?;
         Ok(())
     }
+
+    // Not yet implemented for this backend — landed for
+    // browser-linux-gtk3/render-engine::linux first (see ROADMAP.md).
+    // WebView2 does have a real async capture API of its own
+    // (`CoreWebView2.CapturePreview`) that a future pass could wire up here.
+    fn screenshot(&self, callback: Box<dyn Fn(anyhow::Result<Vec<u8>>)>) {
+        callback(Err(anyhow::anyhow!("screenshot is not yet implemented on this platform")));
+    }
 }

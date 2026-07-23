@@ -57,6 +57,10 @@ build/run instructions.
 - The switcher grid now shows matching bookmarks (not just open pages/history) when searching, with a
   distinct `.bookmark-tile` style — deduped against open-page and history matches for the same URL. See
   `summaries/show-bookmarks-in-switcher-grid.md`.
+- Page screenshotting: `RenderEngine` gained an async `screenshot` method, implemented for real in
+  `render-engine::linux` (WebKitGTK's snapshot → cairo → PNG) and wired to a new toolbar button in
+  `browser-linux-gtk3` with a native save dialog. Other `RenderEngine` implementers got a stub to stay
+  compiling. See `summaries/page-screenshotting.md`.
 
 ## Next
 
@@ -67,7 +71,6 @@ Nothing specifically queued — pick the next item from the backlog below.
 - macOS: native chrome via AppKit, following the same `RenderEngine`-trait pattern as the other front ends.
 - `browser-windows-winui`: unified search/URL bar and bookmarks, matching what `browser-linux-gtk3` now has
   (both landed there only, per scope — see "Done" above).
-- Page screenshotting.
 - Reader mode.
 - External password manager integration.
 - Internal password manager.

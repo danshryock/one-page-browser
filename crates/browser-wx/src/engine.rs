@@ -100,4 +100,12 @@ impl RenderEngine for WxEngine {
         self.webview.reload(WebViewReloadFlags::Default);
         Ok(())
     }
+
+    // Not yet implemented for this backend — browser-wx is unmaintained
+    // (see ROADMAP.md); landed for browser-linux-gtk3/render-engine::linux
+    // first. wxWebView has no built-in screenshot call of its own either,
+    // so this would need a widget-level Cairo/GDI capture.
+    fn screenshot(&self, callback: Box<dyn Fn(anyhow::Result<Vec<u8>>)>) {
+        callback(Err(anyhow::anyhow!("screenshot is not yet implemented on this platform")));
+    }
 }

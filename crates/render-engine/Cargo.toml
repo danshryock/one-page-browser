@@ -17,6 +17,17 @@ wry = "0.55"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+# For `screenshot`: `wry::WebViewExtUnix::webview()` hands back the raw
+# webkit2gtk `WebView`, whose `.snapshot()` is what actually captures a
+# page. Already resolved in the workspace's dependency tree via wry/gtk
+# themselves, so adding it directly here doesn't pull in anything new.
+webkit2gtk = "2.0"
+# `gtk` re-exports this same cairo-rs as `gtk::cairo`, but without its
+# `png` feature enabled (nothing else in this workspace needed PNG
+# encoding before now) — depending on it directly here with `png` turned
+# on unifies with that same dependency and enables `ImageSurface::write_to_png`
+# everywhere, including through the `gtk::cairo` re-export.
+cairo-rs = { version = "0.18", features = ["png"] }
 
 [target.'cfg(all(target_os = "windows", target_env = "gnu"))'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation"] }

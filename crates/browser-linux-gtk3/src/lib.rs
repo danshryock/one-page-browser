@@ -642,6 +642,60 @@ impl AppState {
         self.refresh_bookmark_toggle_button();
     }
 
+    /// Shows a native "Save Screenshot" dialog (suggesting a filename built
+    /// from the active page's domain and the current time, starting in this
+    /// profile's `screenshots_dir()`) and, if confirmed, hands the chosen
+    /// path to `save_screenshot_to`. Split out from the actual capture logic
+    /// since the dialog blocks on real user input (`.run()`) — nothing that
+    /// can run inside an automated test.
+    pub fn take_screenshot(self: &Rc<Self>) {
+        let default_name = {
+            let core = self.core.borrow();
+            let domain = core.active().map(|p| domain_of(&p.current_url())).unwrap_or_else(|| "page".to_string());
+            format!("{domain}-{}.png", now_unix())
+        };
+
+        let dialog = gtk::FileChooserNative::new(
+            Some("Save Screenshot"),
+            gtk::Window::NONE,
+            gtk::FileChooserAction::Save,
+            Some("Save"),
+            Some("Cancel"),
+        );
+        dialog.set_current_name(&default_name);
+        if let Some(dir) = self.profile.screenshots_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = dialog.set_current_folder(&dir);
+        }
+
+        if dialog.run() == gtk::ResponseType::Accept {
+            if let Some(path) = dialog.filename() {
+                self.save_screenshot_to(path);
+            }
+        }
+    }
+
+    /// Captures the active page and writes it to `path` — the actual
+    /// screenshot logic, independent of `take_screenshot`'s save dialog, so
+    /// it can be driven directly from a test. Screenshotting is inherently
+    /// async on every platform (see `RenderEngine::screenshot`), so the
+    /// write happens in the callback, after this method has already
+    /// returned — errors are logged rather than propagated, consistent with
+    /// this codebase's other fire-and-forget UI actions.
+    pub fn save_screenshot_to(self: &Rc<Self>, path: std::path::PathBuf) {
+        self.with_active(|engine| {
+            engine.screenshot(Box::new(move |result| match result {
+                Ok(bytes) => {
+                    if let Err(err) = std::fs::write(&path, &bytes) {
+                        eprintln!("failed to write screenshot to {path:?}: {err}");
+                    }
+                }
+                Err(err) => eprintln!("failed to capture screenshot: {err}"),
+            }));
+            Ok(())
+        });
+    }
+
     /// Updates the toolbar star button's icon/tooltip to reflect whether the
     /// active page is currently bookmarked — called whenever the active page
     /// changes or a bookmark is toggled, so it never shows stale state.
@@ -1386,6 +1440,12 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         Some("user-bookmarks-symbolic"),
         gtk::IconSize::Button,
     )));
+    let screenshot_button = gtk::Button::new();
+    screenshot_button.set_image(Some(&gtk::Image::from_icon_name(
+        Some("camera-photo-symbolic"),
+        gtk::IconSize::Button,
+    )));
+    screenshot_button.set_tooltip_text(Some("Save screenshot"));
     for button in [
         &back_button,
         &forward_button,
@@ -1395,6 +1455,7 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         &profile_button,
         &bookmark_toggle_button,
         &bookmarks_button,
+        &screenshot_button,
     ] {
         button.style_context().add_class("flat");
     }
@@ -1430,6 +1491,7 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     header_bar.pack_end(&settings_button);
     header_bar.pack_end(&profile_button);
     header_bar.pack_end(&bookmarks_button);
+    header_bar.pack_end(&screenshot_button);
 
     window.set_titlebar(Some(&header_bar));
 
@@ -1945,6 +2007,12 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         let app = Rc::clone(&app);
         bookmarks_button.connect_clicked(move |_| {
             app.open_bookmarks();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        screenshot_button.connect_clicked(move |_| {
+            app.take_screenshot();
         });
     }
     {

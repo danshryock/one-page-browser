@@ -83,4 +83,11 @@ impl RenderEngine for WryEngine {
         self.webview.reload()?;
         Ok(())
     }
+
+    // Not yet implemented for this backend (browser-windows-win32/nwg are
+    // both deprioritized — see ROADMAP.md) — landed for
+    // browser-linux-gtk3/render-engine::linux first.
+    fn screenshot(&self, callback: Box<dyn Fn(anyhow::Result<Vec<u8>>)>) {
+        callback(Err(anyhow::anyhow!("screenshot is not yet implemented on this platform")));
+    }
 }

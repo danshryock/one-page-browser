@@ -8,6 +8,12 @@ pub trait RenderEngine {
     fn go_forward(&self) -> anyhow::Result<()>;
     fn reload(&self) -> anyhow::Result<()>;
     fn current_url(&self) -> anyhow::Result<String>;
+    /// Captures the current page as PNG-encoded image bytes, delivered to
+    /// `callback` — every platform's native screenshot capability is
+    /// async/callback-based (WebKitGTK's `snapshot`, WebView2's
+    /// `CapturePreview`), not synchronous, so this stays async here too
+    /// rather than forcing callers to block on it.
+    fn screenshot(&self, callback: Box<dyn Fn(anyhow::Result<Vec<u8>>)>);
 }
 
 #[cfg(target_os = "linux")]
