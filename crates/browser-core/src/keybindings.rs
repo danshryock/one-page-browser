@@ -16,6 +16,7 @@ use crate::Profile;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Action {
     OpenSwitcher,
+    EditUrl,
     ClosePage,
     Reload,
     GoBack,
@@ -29,6 +30,7 @@ pub enum Action {
 impl Action {
     pub const ALL: &'static [Action] = &[
         Action::OpenSwitcher,
+        Action::EditUrl,
         Action::ClosePage,
         Action::Reload,
         Action::GoBack,
@@ -41,7 +43,8 @@ impl Action {
 
     pub fn label(&self) -> &'static str {
         match self {
-            Action::OpenSwitcher => "Open switcher",
+            Action::OpenSwitcher => "Open switcher (new page)",
+            Action::EditUrl => "Edit current URL",
             Action::ClosePage => "Close page",
             Action::Reload => "Reload",
             Action::GoBack => "Go back",
@@ -150,8 +153,9 @@ impl Default for Keybindings {
         let mut map = HashMap::new();
         map.insert(
             Action::OpenSwitcher,
-            vec![KeyChord::new(false, false, false, "F1"), KeyChord::new(true, false, false, "T"), KeyChord::new(true, false, false, "L")],
+            vec![KeyChord::new(false, false, false, "F1"), KeyChord::new(true, false, false, "T")],
         );
+        map.insert(Action::EditUrl, vec![KeyChord::new(true, false, false, "L")]);
         map.insert(Action::ClosePage, vec![KeyChord::new(true, false, false, "W")]);
         map.insert(Action::Reload, vec![KeyChord::new(false, false, false, "F5")]);
         map.insert(Action::GoBack, vec![KeyChord::new(false, true, false, "Left")]);
@@ -180,7 +184,11 @@ mod tests {
             Some(Action::OpenSwitcher)
         );
         assert_eq!(defaults.action_for(&KeyChord::new(true, false, false, "T")), Some(Action::OpenSwitcher));
-        assert_eq!(defaults.action_for(&KeyChord::new(true, false, false, "L")), Some(Action::OpenSwitcher));
+        assert_eq!(
+            defaults.action_for(&KeyChord::new(true, false, false, "L")),
+            Some(Action::EditUrl),
+            "Ctrl+L is the traditional \"edit the URL\" binding, distinct from Ctrl+T/F1's \"open switcher for a new page\""
+        );
         assert_eq!(defaults.action_for(&KeyChord::new(true, false, false, "W")), Some(Action::ClosePage));
     }
 

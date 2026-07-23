@@ -36,6 +36,9 @@ build/run instructions.
 - Ctrl+Enter in the switcher's search box now forces a brand-new page open even when the typed text matches
   an open page/history entry (plain Enter still switches to a single match, as before). See
   `summaries/ctrl-enter-force-new-page.md`.
+- Separate `EditUrl`/`OpenSwitcher` actions (`browser-core` + `browser-linux-gtk3`): Ctrl+L now opens the
+  switcher with the current URL preloaded and fully selected (not blanked); Ctrl+T/F1 keep the old
+  blank-search behavior. See `summaries/edit-url-vs-new-page-actions.md`.
 
 ## Next
 
@@ -57,8 +60,6 @@ Nothing specifically queued — pick the next item from the backlog below.
   above), never actually run; once it can be run on real Windows, expect a real debugging pass (custom
   title bar drag, the `WM_KEYDOWN` HWND-subclass keybinding capture, `WebView2` control behavior, etc. are
   all unverified at runtime).
-- users need to be able to edit urls, so we need separate actions
-  for grid/new page and grid/edit url.  Ctrl+L would move to the url box, select all text but not blank it, Ctrl+T and F1 would move to the url box and start with it blank.
 - fix colors in settings/bookmarks overlays
 - Move the keybindings screen into the settings screen
 - Add the search engine management features

@@ -539,6 +539,26 @@ fn bookmarks_toggle_and_overlay() {
 }
 
 #[test]
+fn edit_url_opens_switcher_with_current_url_selected_not_blanked() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("edit-url");
+        let url_a = fixture_url("page_a.html");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&url_a).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())));
+
+        // Unlike open_switcher (blank, ready to filter), open_switcher_editing_url
+        // is Ctrl+L's role: preload the current URL, fully selected, not blank.
+        app.open_switcher_editing_url();
+        assert!(app.is_switcher_open(), "open_switcher_editing_url should still show the grid underneath");
+        assert_eq!(app.address_bar_text(), url_a, "the address bar should be preloaded with the current URL, not blanked");
+        assert!(app.address_bar_is_fully_selected(), "the preloaded URL should be fully selected, ready to be typed over");
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
 fn ctrl_enter_forces_a_new_page_even_when_one_match_exists() {
     run_on_gtk_thread(|| {
         let profile = test_profile("ctrl-enter-force-open");

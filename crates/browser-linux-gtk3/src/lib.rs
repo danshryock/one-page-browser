@@ -225,26 +225,50 @@ impl AppState {
         self.refresh_bookmark_toggle_button();
     }
 
-    /// Opens the switcher grid with a cleared, focused search box — used by
-    /// the grid-button toggle as well as the F1 / Ctrl+T / Ctrl+L shortcuts.
-    /// The page stack is made insensitive so the background webview can't
-    /// steal keyboard focus (or process key/pointer input at all) while the
-    /// grid is up. Closes the other overlays first if either is open — the
-    /// header bar's switcher/settings/profile buttons are all reachable
-    /// regardless of which overlay (if any) is currently shown, so every
-    /// `open_*` method defensively closes the other two rather than ever
-    /// showing more than one at once.
-    pub fn open_switcher(self: &Rc<Self>) {
+    /// Shared by `open_switcher`/`open_switcher_editing_url`: everything
+    /// about showing the grid except how the address bar's text ends up
+    /// seeded, since that differs between the two (blank vs. the active
+    /// page's current URL). The page stack is made insensitive so the
+    /// background webview can't steal keyboard focus (or process key/pointer
+    /// input at all) while the grid is up. Closes the other overlays first if
+    /// any are open — the header bar's buttons are all reachable regardless
+    /// of which overlay (if any) is currently shown, so every `open_*` method
+    /// defensively closes the others rather than ever showing more than one
+    /// at once.
+    fn open_switcher_common(self: &Rc<Self>) {
         self.close_settings();
         self.close_profile_picker();
         self.close_keybindings();
         self.close_bookmarks();
-        self.address_bar.set_text("");
-        self.address_bar.set_placeholder_text(Some("Type to filter open pages…"));
         self.rebuild_switcher_grid();
         self.stack.set_sensitive(false);
         self.switcher_panel.show();
         self.address_bar.grab_focus();
+    }
+
+    /// Opens the switcher grid with a cleared, focused search box, ready to
+    /// filter to an open page or start typing a fresh one — used by the
+    /// grid-button toggle as well as the F1 / Ctrl+T shortcuts ("grid, for a
+    /// new page").
+    pub fn open_switcher(self: &Rc<Self>) {
+        self.address_bar.set_text("");
+        self.address_bar.set_placeholder_text(Some("Type to filter open pages…"));
+        self.open_switcher_common();
+    }
+
+    /// Opens the switcher grid with the address bar preloaded with the
+    /// active page's current URL, fully selected rather than blanked —
+    /// Ctrl+L's traditional "edit the URL" role, adapted to this browser's
+    /// unified address bar ("grid, to edit the URL"): the grid is still
+    /// shown underneath (so clicking another open page still works exactly
+    /// like `open_switcher`), but retyping/pressing Enter acts on the
+    /// current URL instead of starting from a blank filter.
+    pub fn open_switcher_editing_url(self: &Rc<Self>) {
+        let current_url = self.core.borrow().active().map(|p| p.current_url()).unwrap_or_default();
+        self.address_bar.set_text(&current_url);
+        self.address_bar.set_placeholder_text(None);
+        self.open_switcher_common();
+        self.address_bar.select_region(0, -1);
     }
 
     /// Hides the switcher grid and restores the page stack's sensitivity, as
@@ -642,6 +666,7 @@ impl AppState {
     fn dispatch_action(self: &Rc<Self>, action: Action) {
         match action {
             Action::OpenSwitcher => self.open_switcher(),
+            Action::EditUrl => self.open_switcher_editing_url(),
             Action::ClosePage => self.close_page(&self.active_id()),
             Action::Reload => self.with_active(|p| p.reload()),
             Action::GoBack => self.with_active(|p| p.go_back()),
@@ -981,6 +1006,14 @@ impl AppState {
     /// setting up the "typed a filter, then closed without selecting" case.
     pub fn set_address_bar_text(&self, text: &str) {
         self.address_bar.set_text(text);
+    }
+
+    /// Whether the address bar's entire current text is selected — test
+    /// helper for confirming `open_switcher_editing_url` selects rather than
+    /// blanks the current URL.
+    pub fn address_bar_is_fully_selected(&self) -> bool {
+        let len = self.address_bar.text().len() as i32;
+        len > 0 && self.address_bar.selection_bounds() == Some((0, len))
     }
 
     /// The settings overlay's start-page field, as currently shown — test

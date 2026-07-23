@@ -518,10 +518,10 @@ impl AppState {
             Action::GoForward => self.with_active(|p| p.go_forward()),
             Action::OpenSettings => self.open_settings(),
             Action::OpenProfilePicker => self.open_profile_picker(),
-            // Bookmarks landed in browser-core + browser-linux-gtk3 only so
-            // far (see ROADMAP.md's Backlog) — no winui3 UI to dispatch to
-            // yet.
-            Action::ToggleBookmark | Action::OpenBookmarks => {}
+            // Bookmarks, and the Ctrl+L/Ctrl+T split (EditUrl vs. OpenSwitcher),
+            // landed in browser-core + browser-linux-gtk3 only so far (see
+            // ROADMAP.md's Backlog) — no winui3 UI to dispatch either to yet.
+            Action::ToggleBookmark | Action::OpenBookmarks | Action::EditUrl => {}
         }
     }
 
