@@ -33,6 +33,9 @@ build/run instructions.
   star-toggle button and a bookmarks overlay (same overlay pattern as settings/switcher/profile-picker/
   keybindings), with a new `ToggleBookmark`/`OpenBookmarks` pair of keybindable actions.
   `browser-windows-winui` untouched (was never scoped to it).
+- Ctrl+Enter in the switcher's search box now forces a brand-new page open even when the typed text matches
+  an open page/history entry (plain Enter still switches to a single match, as before). See
+  `summaries/ctrl-enter-force-new-page.md`.
 
 ## Next
 
@@ -41,8 +44,6 @@ Nothing specifically queued — pick the next item from the backlog below.
 ## Backlog (not yet started, roughly in the order raised)
 
 - macOS: native chrome via AppKit, following the same `RenderEngine`-trait pattern as the other front ends.
-- Ctrl+Enter to force-open a new page even when the typed text matches an existing open page/history entry
-  (today, a single match always switches to it instead).
 - `browser-windows-winui`: unified search/URL bar and bookmarks, matching what `browser-linux-gtk3` now has
   (both landed there only, per scope — see "Done" above).
 - Private/incognito/guest profile.

@@ -667,6 +667,24 @@ impl AppState {
         self.close_switcher();
     }
 
+    /// Ctrl+Enter in the switcher's search box: always opens a brand-new page
+    /// from the typed text, even when it matches an open page or history
+    /// entry (which plain Enter, via `address_bar`'s `connect_activate`,
+    /// would instead switch to) — the escape hatch for deliberately wanting a
+    /// second page at the same URL. Caller must have already called
+    /// `open_switcher()`; does nothing if the text is blank.
+    pub fn force_new_page_from_search(self: &Rc<Self>, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let url = resolve_address_input(trimmed, &self.settings());
+        if let Err(err) = self.add_page(&url) {
+            eprintln!("failed to open new page: {err}");
+        }
+        self.close_switcher();
+    }
+
     pub fn close_page(self: &Rc<Self>, id: &str) {
         let was_active = self.core.borrow().active_id() == id;
 
@@ -1449,6 +1467,26 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
             if app.is_switcher_open() {
                 app.rebuild_switcher_grid();
             }
+        });
+    }
+    {
+        // Ctrl+Enter always opens a fresh page, even when the typed text
+        // matches an open page/history entry — checked ahead of the plain
+        // `connect_activate` handler below (which GtkEntry still emits
+        // afterward for a bare Enter, since we only `Stop` when Ctrl is
+        // actually held).
+        let app = Rc::clone(&app);
+        address_bar.connect_key_press_event(move |entry, event| {
+            if !app.is_switcher_open() {
+                return gtk::glib::Propagation::Proceed;
+            }
+            let is_enter = matches!(event.keyval().name().as_deref(), Some("Return") | Some("KP_Enter"));
+            let ctrl_held = event.state().contains(gtk::gdk::ModifierType::CONTROL_MASK);
+            if is_enter && ctrl_held {
+                app.force_new_page_from_search(&entry.text());
+                return gtk::glib::Propagation::Stop;
+            }
+            gtk::glib::Propagation::Proceed
         });
     }
     {

@@ -537,3 +537,35 @@ fn bookmarks_toggle_and_overlay() {
         cleanup_test_profile(&profile);
     });
 }
+
+#[test]
+fn ctrl_enter_forces_a_new_page_even_when_one_match_exists() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("ctrl-enter-force-open");
+        let url_a = fixture_url("page_a.html");
+        let url_b = fixture_url("page_b.html");
+
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&url_a).expect("add_page should succeed");
+        let id_b = {
+            app.add_page(&url_b).expect("add_page should succeed");
+            app.active_id()
+        };
+        assert!(wait_until(|| app.page_title(&id_b).as_deref() == Some("Page B")));
+
+        // Plain Enter with a single match switches to the existing page
+        // instead of opening a new one (already covered by
+        // `switcher_search_and_grid`) — Ctrl+Enter is the escape hatch from
+        // that: it should open a brand-new page at the same URL instead.
+        app.open_switcher();
+        let count_before = app.page_ids().len();
+        app.force_new_page_from_search("page b");
+        assert_eq!(app.page_ids().len(), count_before + 1, "Ctrl+Enter should open a new page rather than switching to the match");
+        let new_id = app.page_ids().last().cloned().unwrap_or_default();
+        assert_ne!(new_id, id_b, "the new page should be a distinct page from the existing match");
+        assert_eq!(app.active_id(), new_id, "the freshly opened page should become active");
+        assert!(!app.is_switcher_open(), "Ctrl+Enter should close the switcher, same as plain Enter");
+
+        cleanup_test_profile(&profile);
+    });
+}
