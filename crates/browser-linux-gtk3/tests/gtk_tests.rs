@@ -41,8 +41,8 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use browser_core::{Action, Profile};
-use browser_linux_gtk3::build_window_and_app;
+use browser_core::{Action, HistoryStore, Profile};
+use browser_linux_gtk3::{build_window_and_app, build_window_and_app_with_history};
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
 
@@ -757,6 +757,34 @@ fn switching_to_light_theme_reloads_the_theme_css() {
         assert!(
             !app.theme_provider_css().contains("rgb(46,46,44)"),
             "the old dark-theme CSS shouldn't still be loaded after switching to light"
+        );
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn encrypted_profile_records_visits_through_the_real_app() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("encrypted-app");
+        let history = HistoryStore::open_encrypted(&profile, "a test passphrase").expect("open_encrypted should succeed");
+        let (_window, app) =
+            build_window_and_app_with_history(profile.clone(), history).expect("build_window_and_app_with_history should succeed");
+
+        app.add_page(&fixture_url("page_a.html")).expect("add_page should succeed");
+        let id_a = app.active_id();
+        assert!(wait_until(|| app.page_title(&id_a).as_deref() == Some("Page A")));
+
+        // A separate connection to the same encrypted database, opened with
+        // the same passphrase, should see the visit the app's own
+        // HistoryStore just recorded — proving the running app is actually
+        // writing through to the real encrypted store, not silently
+        // failing (record_visit's errors are only logged, not propagated).
+        let verify =
+            HistoryStore::open_encrypted(&profile, "a test passphrase").expect("reopening with the same passphrase should succeed");
+        assert!(
+            wait_until(|| !verify.search("page a", 10).unwrap_or_default().is_empty()),
+            "a visit made through the app should be readable back from a separate connection to the same encrypted database"
         );
 
         cleanup_test_profile(&profile);

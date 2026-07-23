@@ -61,6 +61,7 @@ pub struct AppState {
     /// picker opens — holds one row per existing profile.
     profile_list_box: gtk::Box,
     new_profile_entry: gtk::Entry,
+    new_profile_encrypted_check: gtk::CheckButton,
     /// The keybindings editor's row list — lives inside the settings overlay
     /// (see `open_settings`'s doc comment for why it's not a separate
     /// overlay of its own), rebuilt from `Keybindings::bindings_for` each
@@ -487,6 +488,7 @@ impl AppState {
         self.close_settings();
         self.close_bookmarks();
         self.new_profile_entry.set_text("");
+        self.new_profile_encrypted_check.set_active(false);
         self.rebuild_profile_list();
         self.stack.set_sensitive(false);
         self.profile_panel.show();
@@ -544,14 +546,24 @@ impl AppState {
     /// Reads the new-profile field and launches a new process for it — the
     /// profile picker's "Create & Open" action. The new process creates the
     /// profile's directory lazily on first `Settings`/`HistoryStore` access;
-    /// nothing needs pre-creating here.
+    /// nothing needs pre-creating here. If `new_profile_encrypted_check` is
+    /// checked, the new process is launched with `--setup-passphrase`
+    /// instead, and will prompt for a passphrase itself rather than opening
+    /// straight to the browser window — see `resolve_passphrase_setup_requested`'s
+    /// doc comment for why the passphrase can't just be collected here and
+    /// handed to the new process directly.
     pub fn create_and_open_profile(&self) {
         let name = self.new_profile_entry.text().to_string();
         let name = name.trim();
         if name.is_empty() {
             return;
         }
-        if let Err(err) = browser_core::launch_new_profile_process(name) {
+        let result = if self.new_profile_encrypted_check.is_active() {
+            browser_core::launch_new_encrypted_profile_process(name)
+        } else {
+            browser_core::launch_new_profile_process(name)
+        };
+        if let Err(err) = result {
             eprintln!("failed to launch a new process for profile {name:?}: {err}");
         }
         self.close_profile_picker();
@@ -1427,6 +1439,17 @@ fn gtk_key_to_chord(event: &gtk::gdk::EventKey) -> Option<KeyChord> {
 ///
 /// Assumes `gtk::init()` has already been called.
 pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
+    let history = if profile.ephemeral { HistoryStore::open_in_memory()? } else { HistoryStore::open(&profile)? };
+    build_window_and_app_with_history(profile, history)
+}
+
+/// Same as `build_window_and_app`, but takes an already-opened
+/// `HistoryStore` instead of opening one itself — the passphrase-unlock
+/// flow needs this, since collecting (and verifying) a passphrase and
+/// opening an *encrypted* `HistoryStore` has to happen before this function
+/// runs, not inside it (see `show_passphrase_prompt`). Every other caller
+/// should keep using the plain `build_window_and_app` above.
+pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore) -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
     let theme_provider = gtk::CssProvider::new();
     if let Some(screen) = gtk::gdk::Screen::default() {
         // Theme-invariant rules: the switcher grid's tiles and hints always
@@ -1768,6 +1791,10 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     new_profile_row.pack_start(&create_profile_button, false, false, 0);
     profile_box.pack_start(&new_profile_row, false, false, 0);
 
+    let new_profile_encrypted_check = gtk::CheckButton::new();
+    new_profile_encrypted_check.set_label("Encrypt with a passphrase");
+    profile_box.pack_start(&new_profile_encrypted_check, false, false, 0);
+
     let profile_buttons_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     profile_buttons_row.set_halign(gtk::Align::End);
     let new_private_window_button = gtk::Button::with_label("New Private Window");
@@ -1827,9 +1854,6 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     bookmarks_overlay.hide();
 
     let settings = Settings::load(&profile);
-    // An ephemeral (private/incognito/guest) profile's history should never
-    // touch disk at all — see `Profile::ephemeral`'s doc comment.
-    let history = if profile.ephemeral { HistoryStore::open_in_memory()? } else { HistoryStore::open(&profile)? };
     let bookmarks = Bookmarks::load(&profile);
     let core = PageManager::new(settings.max_loaded_pages);
     let app = Rc::new(AppState {
@@ -1851,6 +1875,7 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         profile_panel: profile_overlay.clone().upcast::<gtk::Widget>(),
         profile_list_box: profile_list_box.clone(),
         new_profile_entry: new_profile_entry.clone(),
+        new_profile_encrypted_check: new_profile_encrypted_check.clone(),
         keybindings_list_box: keybindings_list_box.clone(),
         keybindings: RefCell::new(Keybindings::load(&profile)),
         listening_for: Cell::new(None),
@@ -2248,6 +2273,143 @@ pub fn show_external_link_chooser(url: String, default_profile: String) -> anyho
                 Err(err) => eprintln!("failed to open the browser window: {err}"),
             }
         });
+    }
+
+    Ok(())
+}
+
+/// Shows a small standalone window collecting a passphrase for `profile`,
+/// either to set up *new* encryption (`setup: true`, when launched with
+/// `--setup-passphrase`, on a profile with no history database yet) or to
+/// *unlock* an already-encrypted one (`setup: false`, when
+/// `profile.has_passphrase()` — retries in place on a wrong passphrase
+/// rather than closing). On success, builds the real browser window the
+/// same way `show_external_link_chooser` does.
+///
+/// Assumes `gtk::init()` has already been called, and that the caller will
+/// still call `gtk::main()` afterward regardless of which path (this or
+/// `build_window_and_app`) ends up running — this only ever shows a window,
+/// never drives its own event loop.
+pub fn show_passphrase_prompt(profile: Profile, setup: bool) -> anyhow::Result<()> {
+    let window = gtk::Window::new(gtk::WindowType::Toplevel);
+    window.set_title(if setup { "Set a passphrase" } else { "Enter passphrase" });
+    window.set_default_size(420, 160);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin(16);
+
+    let prompt_text = if setup {
+        format!("Choose a passphrase to encrypt \u{201c}{}\u{201d}'s history.", profile.name)
+    } else {
+        format!("\u{201c}{}\u{201d}'s history is passphrase-protected.", profile.name)
+    };
+    let prompt_label = gtk::Label::new(Some(&prompt_text));
+    prompt_label.set_line_wrap(true);
+    prompt_label.set_halign(gtk::Align::Start);
+    content.pack_start(&prompt_label, false, false, 0);
+
+    let passphrase_entry = gtk::Entry::new();
+    passphrase_entry.set_visibility(false);
+    passphrase_entry.set_placeholder_text(Some("Passphrase"));
+    content.pack_start(&passphrase_entry, false, false, 0);
+
+    let error_label = gtk::Label::new(None);
+    error_label.set_halign(gtk::Align::Start);
+    content.pack_start(&error_label, false, false, 0);
+
+    let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    button_row.set_halign(gtk::Align::End);
+    let cancel_button = gtk::Button::with_label("Cancel");
+    let confirm_button = gtk::Button::with_label(if setup { "Set Passphrase" } else { "Unlock" });
+    button_row.pack_start(&cancel_button, false, false, 0);
+    button_row.pack_start(&confirm_button, false, false, 0);
+    content.pack_start(&button_row, false, false, 0);
+
+    window.add(&content);
+    window.show_all();
+
+    // Same "was this close a real quit, or a handoff to the main window"
+    // distinction `show_external_link_chooser` makes.
+    let transitioning = Rc::new(Cell::new(false));
+    {
+        let transitioning = Rc::clone(&transitioning);
+        window.connect_delete_event(move |_, _| {
+            if !transitioning.get() {
+                gtk::main_quit();
+            }
+            gtk::glib::Propagation::Proceed
+        });
+    }
+    {
+        let window = window.clone();
+        cancel_button.connect_clicked(move |_| {
+            window.close();
+        });
+    }
+
+    // Shared between the button click and the entry's Enter-to-submit —
+    // wrapped in `Rc<dyn Fn()>` rather than relying on the closure itself
+    // being `Clone` (it would be here, since every capture is `Clone`, but
+    // this doesn't depend on that holding for whatever this closure grows
+    // to capture later).
+    let try_unlock: Rc<dyn Fn()> = {
+        let window = window.clone();
+        let passphrase_entry = passphrase_entry.clone();
+        let error_label = error_label.clone();
+        let transitioning = Rc::clone(&transitioning);
+        Rc::new(move || {
+            let passphrase = passphrase_entry.text().to_string();
+            if passphrase.is_empty() {
+                error_label.set_text("Passphrase can't be empty.");
+                return;
+            }
+
+            match HistoryStore::open_encrypted(&profile, &passphrase) {
+                Ok(history) => {
+                    // See `HistoryStore::open_encrypted`'s doc comment: the
+                    // very first successful open with a passphrase is what
+                    // establishes a fresh database's encryption, so "setup"
+                    // and "unlock" both just open_encrypted the same way —
+                    // this call *is* the setup step when `setup` is true.
+                    if setup {
+                        if let Err(err) = profile.enable_passphrase() {
+                            eprintln!("failed to mark profile as passphrase-protected: {err}");
+                        }
+                    }
+                    transitioning.set(true);
+                    window.close();
+                    match build_window_and_app_with_history(profile.clone(), history) {
+                        Ok((_main_window, app)) => {
+                            let start_page = app.settings().start_page.clone();
+                            if let Err(err) = app.add_page(&start_page) {
+                                eprintln!("failed to open the start page: {err}");
+                            }
+                        }
+                        Err(err) => eprintln!("failed to open the browser window: {err}"),
+                    }
+                }
+                Err(err) => {
+                    // A wrong passphrase surfaces here as a generic error
+                    // from the schema query (see `HistoryStore::open_encrypted`'s
+                    // doc comment for why) — indistinguishable in practice
+                    // from other open failures, so the message stays
+                    // generic too rather than claiming more certainty than
+                    // is actually known.
+                    error_label.set_text("Couldn't open this profile with that passphrase. Try again.");
+                    eprintln!("failed to open encrypted history store: {err}");
+                    passphrase_entry.set_text("");
+                    passphrase_entry.grab_focus();
+                }
+            }
+        })
+    };
+    {
+        let try_unlock = Rc::clone(&try_unlock);
+        confirm_button.connect_clicked(move |_| try_unlock());
+    }
+    {
+        let try_unlock = Rc::clone(&try_unlock);
+        passphrase_entry.connect_activate(move |_| try_unlock());
     }
 
     Ok(())

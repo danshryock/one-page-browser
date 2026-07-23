@@ -1,7 +1,9 @@
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
-    use browser_core::{resolve_ephemeral_requested, resolve_profile_name, resolve_url_argument, Profile};
-    use browser_linux_gtk3::{build_window_and_app, show_external_link_chooser};
+    use browser_core::{
+        resolve_ephemeral_requested, resolve_passphrase_setup_requested, resolve_profile_name, resolve_url_argument, Profile,
+    };
+    use browser_linux_gtk3::{build_window_and_app, show_external_link_chooser, show_passphrase_prompt};
 
     gtk::init()?;
 
@@ -13,11 +15,27 @@ fn main() -> anyhow::Result<()> {
         // see `Profile::ephemeral`'s doc comment) take priority over
         // --profile: a private window is never "the work profile, but
         // private", it's always its own unlinked session.
-        let profile =
-            if resolve_ephemeral_requested(args.clone()) { Profile::ephemeral() } else { Profile::new(resolve_profile_name(args)) };
-        let (_window, app) = build_window_and_app(profile)?;
-        let start_page = app.settings().start_page.clone();
-        app.add_page(&start_page)?;
+        let profile = if resolve_ephemeral_requested(args.clone()) {
+            Profile::ephemeral()
+        } else {
+            Profile::new(resolve_profile_name(args.clone()))
+        };
+
+        // A passphrase must never cross a process boundary via argv (see
+        // `resolve_passphrase_setup_requested`'s doc comment) — so both
+        // setting one up and unlocking an existing one are collected right
+        // here, in whichever process actually needs it, via a window
+        // instead. Either way, `gtk::main()` below drives it exactly like it
+        // drives `build_window_and_app`'s window in the plain case.
+        if resolve_passphrase_setup_requested(args.clone()) {
+            show_passphrase_prompt(profile, true)?;
+        } else if profile.has_passphrase() {
+            show_passphrase_prompt(profile, false)?;
+        } else {
+            let (_window, app) = build_window_and_app(profile)?;
+            let start_page = app.settings().start_page.clone();
+            app.add_page(&start_page)?;
+        }
     }
 
     gtk::main();

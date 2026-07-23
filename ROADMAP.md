@@ -66,6 +66,12 @@ build/run instructions.
   covering the settings/profile/keybindings/bookmarks overlays' background and the switcher grid's
   history/bookmark tiles, the only surfaces with a real theme-dependent background. See
   `summaries/color-themes.md`.
+- Passphrase support for profiles (`browser-core` + `browser-linux-gtk3`), using libsql's native encryption
+  (SQLite3 Multiple Ciphers, AES-256-CBC) for the history database only — `Settings`/`Keybindings`/
+  `Bookmarks` stay plain JSON. Passphrases are collected in-process (a new standalone prompt window), never
+  passed cross-process via argv. Found and fixed a real cross-compile break along the way: libsql's
+  `encryption` feature needs `llvm-lib` when cross-compiling for MSVC, not available here, so it's now scoped
+  to Linux only with a non-Linux stub. See `summaries/profile-passphrase-encryption.md`.
 
 ## Next
 
@@ -79,11 +85,11 @@ Nothing specifically queued — pick the next item from the backlog below.
 - Reader mode.
 - External password manager integration.
 - Internal password manager.
+- Changing/removing a profile's passphrase, or migrating an existing unencrypted profile to encrypted
+  (`sqlite3_rekey` is available via libsql-sys but not wired up yet).
 - `browser-windows-winui` debugging — it's been cross-compile/link-verified only all along (see "Done"
   above), never actually run; once it can be run on real Windows, expect a real debugging pass (custom
   title bar drag, the `WM_KEYDOWN` HWND-subclass keybinding capture, `WebView2` control behavior, etc. are
   all unverified at runtime).
 - Add vector search to the page/history search using libsql's
   native vector search
-- Add passphrase support to profiles, use native encryption
-  features of libsql if available.

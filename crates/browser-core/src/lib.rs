@@ -20,8 +20,8 @@ pub use bookmarks::{Bookmark, Bookmarks};
 pub use history::{HistoryEntry, HistoryStore};
 pub use keybindings::{Action, KeyChord, Keybindings};
 pub use profile::{
-    launch_new_ephemeral_process, launch_new_profile_process, list_profile_names, resolve_ephemeral_requested,
-    resolve_profile_name, resolve_url_argument, Profile,
+    launch_new_encrypted_profile_process, launch_new_ephemeral_process, launch_new_profile_process, list_profile_names,
+    resolve_ephemeral_requested, resolve_passphrase_setup_requested, resolve_profile_name, resolve_url_argument, Profile,
 };
 pub use settings::{SearchEngine, Settings, Theme};
 

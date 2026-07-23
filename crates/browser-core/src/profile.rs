@@ -72,6 +72,44 @@ impl Profile {
         let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
         Some(dirs.data_dir().join(&self.name).join("screenshots"))
     }
+
+    /// Path to this profile's passphrase marker — an empty sentinel file
+    /// (never holds the passphrase itself, or anything derived from it)
+    /// whose mere *existence* means `history_db_path()` is encrypted and a
+    /// passphrase must be collected before `HistoryStore::open_encrypted`
+    /// can succeed. Needed because there's no way to tell an encrypted
+    /// database from a corrupt/missing one just by trying to open it
+    /// without a key first — SQLite (and the cipher extension `libsql`
+    /// layers on top of it) only discovers that on the first real read.
+    pub fn passphrase_marker_path(&self) -> Option<PathBuf> {
+        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        Some(dirs.data_dir().join(&self.name).join("passphrase-enabled"))
+    }
+
+    /// Whether this profile's history database is passphrase-protected —
+    /// always `false` for an `ephemeral` profile (it never touches disk at
+    /// all, see `ephemeral`'s doc comment, so there's nothing to check).
+    pub fn has_passphrase(&self) -> bool {
+        !self.ephemeral && self.passphrase_marker_path().map(|p| p.exists()).unwrap_or(false)
+    }
+
+    /// Marks this profile as passphrase-protected going forward — called
+    /// once, right after successfully establishing encryption on a brand
+    /// new (empty) history database with a chosen passphrase (see
+    /// `HistoryStore::open_encrypted`'s doc comment for why that's the
+    /// point encryption gets "set up" — there's no separate step). Does
+    /// nothing to the database itself; purely bookkeeping so future launches
+    /// know to prompt for a passphrase before trying to open it.
+    pub fn enable_passphrase(&self) -> anyhow::Result<()> {
+        let path = self
+            .passphrase_marker_path()
+            .ok_or_else(|| anyhow::anyhow!("no data directory available on this platform"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, b"")?;
+        Ok(())
+    }
 }
 
 impl Default for Profile {
@@ -110,6 +148,18 @@ pub fn resolve_profile_name<I: IntoIterator<Item = String>>(args: I) -> String {
 /// `resolve_profile_name`.
 pub fn resolve_ephemeral_requested<I: IntoIterator<Item = String>>(args: I) -> bool {
     args.into_iter().any(|arg| arg == "--incognito" || arg == "--private" || arg == "--guest")
+}
+
+/// Whether `--setup-passphrase` was passed — tells a freshly launched
+/// process to prompt for a *new* passphrase and establish encryption on
+/// `--profile`'s (necessarily brand-new) history database, rather than
+/// prompting to *unlock* an already-encrypted one (which instead is driven
+/// by `Profile::has_passphrase()`, not a flag). Deliberately a flag, not the
+/// passphrase itself: passphrases must never cross a process boundary via
+/// `argv`, since that's visible to any other user on the system (e.g. via
+/// `ps`) — see `launch_new_profile_process`'s callers for how this is used.
+pub fn resolve_passphrase_setup_requested<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter().any(|arg| arg == "--setup-passphrase")
 }
 
 /// Pulls the first positional (non-flag) argument out — used for launching
@@ -176,6 +226,17 @@ fn list_profile_names_in(dir: &Path) -> Vec<String> {
 pub fn launch_new_profile_process(profile_name: &str) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     std::process::Command::new(exe).arg("--profile").arg(profile_name).spawn()?;
+    Ok(())
+}
+
+/// Same as `launch_new_profile_process`, but also passes `--setup-passphrase`
+/// so the new process prompts to set up (rather than unlock) passphrase
+/// protection for this brand-new profile — see
+/// `resolve_passphrase_setup_requested`'s doc comment for why the passphrase
+/// itself is never passed here, only this flag.
+pub fn launch_new_encrypted_profile_process(profile_name: &str) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe).arg("--profile").arg(profile_name).arg("--setup-passphrase").spawn()?;
     Ok(())
 }
 
@@ -292,6 +353,32 @@ mod tests {
         assert!(resolve_ephemeral_requested(args(&["program", "--guest"])));
         assert!(!resolve_ephemeral_requested(args(&["program", "--profile", "work"])));
         assert!(!resolve_ephemeral_requested(args(&[])));
+    }
+
+    #[test]
+    fn resolve_passphrase_setup_requested_recognizes_the_flag() {
+        assert!(resolve_passphrase_setup_requested(args(&["program", "--setup-passphrase"])));
+        assert!(!resolve_passphrase_setup_requested(args(&["program", "--profile", "work"])));
+        assert!(!resolve_passphrase_setup_requested(args(&[])));
+    }
+
+    #[test]
+    fn has_passphrase_reflects_the_marker_file() {
+        let profile = Profile::new(format!("passphrase-marker-test-{}", std::process::id()));
+        let marker = profile.passphrase_marker_path().expect("a data dir should be available in tests");
+        let _ = std::fs::remove_dir_all(marker.parent().unwrap());
+        assert!(!profile.has_passphrase(), "a fresh profile shouldn't have a passphrase marker yet");
+
+        profile.enable_passphrase().expect("enable_passphrase should succeed");
+        assert!(profile.has_passphrase(), "after enable_passphrase, has_passphrase should be true");
+        assert!(marker.exists());
+
+        let _ = std::fs::remove_dir_all(marker.parent().unwrap());
+    }
+
+    #[test]
+    fn ephemeral_profiles_never_report_having_a_passphrase() {
+        assert!(!Profile::ephemeral().has_passphrase());
     }
 
     #[test]

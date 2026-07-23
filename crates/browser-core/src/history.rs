@@ -59,9 +59,58 @@ impl HistoryStore {
         Self::open_at(&path)
     }
 
-    /// Split out from `open` so tests can round-trip through a throwaway
-    /// path instead of the real user data directory — same reasoning as
-    /// `Settings::load_from`/`save_to`.
+    /// Same as `open`, but encrypted at rest with `passphrase` — for a
+    /// profile with `Profile::has_passphrase()` set. Uses libsql's native
+    /// encryption support (SQLite3 Multiple Ciphers' AES-256-CBC cipher,
+    /// applied via `sqlite3_key` under the hood): the raw passphrase bytes
+    /// are handed straight to it, the same way SQLCipher/wxSQLite3-family
+    /// APIs work — key derivation from the passphrase happens inside the
+    /// cipher extension itself, not something this code needs to do.
+    ///
+    /// The very first successful open of a brand-new (empty) database file
+    /// with a given passphrase is what *establishes* that database's
+    /// encryption — there's no separate "set up encryption" step. Opening
+    /// an *existing* encrypted database with the wrong passphrase doesn't
+    /// fail immediately (the cipher extension doesn't know the key is wrong
+    /// until it actually tries to decrypt a page): it's only once
+    /// `execute_batch(SCHEMA_SQL)` below actually reads from the database
+    /// that a bad passphrase surfaces as a real error — which callers should
+    /// treat as "wrong passphrase, ask again," not a generic I/O failure.
+    ///
+    /// Only actually implemented on Linux (see the `libsql` dependency's
+    /// `[target.'cfg(target_os = "linux")']` scoping in `Cargo.toml` for
+    /// why) — every other target gets a plain error instead, deliberately
+    /// *not* silently falling back to an unencrypted open, which would be a
+    /// silent security downgrade for anyone who thinks they got encryption.
+    #[cfg(target_os = "linux")]
+    pub fn open_encrypted(profile: &Profile, passphrase: &str) -> anyhow::Result<Self> {
+        let path = profile
+            .history_db_path()
+            .ok_or_else(|| anyhow::anyhow!("no data directory available on this platform"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let rt = tokio::runtime::Builder::new_current_thread().build()?;
+        let builder = libsql::Builder::new_local(&path).encryption_config(libsql::EncryptionConfig::new(
+            libsql::Cipher::Aes256Cbc,
+            bytes::Bytes::copy_from_slice(passphrase.as_bytes()),
+        ));
+        let db = rt.block_on(builder.build())?;
+        let conn = db.connect()?;
+        rt.block_on(conn.execute_batch(SCHEMA_SQL))?;
+        Ok(Self { _db: db, conn, rt })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn open_encrypted(_profile: &Profile, _passphrase: &str) -> anyhow::Result<Self> {
+        anyhow::bail!("passphrase-protected profiles aren't available on this platform yet")
+    }
+
+    /// Split out from `open`/`open_in_memory` so tests can round-trip
+    /// through a throwaway path instead of the real user data directory —
+    /// same reasoning as `Settings::load_from`/`save_to`. Unlike
+    /// `open_encrypted`, never touches encryption at all — no need for this
+    /// one to vary by platform.
     fn open_at(path: &Path) -> anyhow::Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread().build()?;
         let db = rt.block_on(libsql::Builder::new_local(path).build())?;
@@ -205,5 +254,61 @@ mod tests {
         let results = store.search("example.com", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].url, "https://example.com/a");
+    }
+
+    fn temp_profile(name: &str) -> Profile {
+        Profile::new(format!("history-crypto-test-{name}-{}", std::process::id()))
+    }
+
+    fn cleanup_profile(profile: &Profile) {
+        if let Some(parent) = profile.history_db_path().as_deref().and_then(Path::parent) {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn encrypted_store_round_trips_with_the_right_passphrase() {
+        let profile = temp_profile("round-trip");
+        cleanup_profile(&profile);
+
+        {
+            let store = HistoryStore::open_encrypted(&profile, "correct horse battery staple")
+                .expect("opening a fresh encrypted store should succeed");
+            store.record_visit("https://example.com/a", "A").unwrap();
+        }
+
+        let reopened = HistoryStore::open_encrypted(&profile, "correct horse battery staple")
+            .expect("reopening with the same passphrase should succeed");
+        let results = reopened.search("example.com", 10).unwrap();
+        assert_eq!(results.len(), 1, "the recorded visit should still be there after reopening");
+        assert_eq!(results[0].url, "https://example.com/a");
+
+        cleanup_profile(&profile);
+    }
+
+    #[test]
+    fn encrypted_store_rejects_the_wrong_passphrase() {
+        let profile = temp_profile("wrong-passphrase");
+        cleanup_profile(&profile);
+
+        HistoryStore::open_encrypted(&profile, "the right one").expect("opening a fresh encrypted store should succeed");
+
+        let result = HistoryStore::open_encrypted(&profile, "definitely not it");
+        assert!(result.is_err(), "opening an encrypted store with the wrong passphrase should fail, not silently succeed");
+
+        cleanup_profile(&profile);
+    }
+
+    #[test]
+    fn a_plain_unencrypted_open_cannot_read_an_encrypted_store() {
+        let profile = temp_profile("plain-vs-encrypted");
+        cleanup_profile(&profile);
+
+        HistoryStore::open_encrypted(&profile, "some passphrase").expect("opening a fresh encrypted store should succeed");
+
+        let result = HistoryStore::open(&profile);
+        assert!(result.is_err(), "opening an encrypted store without any passphrase should fail, not silently succeed");
+
+        cleanup_profile(&profile);
     }
 }

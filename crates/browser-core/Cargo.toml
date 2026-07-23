@@ -17,3 +17,20 @@ libsql = { version = "0.9", default-features = false, features = ["core"] }
 # to the build — just enough (`rt`) for HistoryStore's single-threaded
 # `Builder::new_current_thread()` to block_on each call synchronously.
 tokio = { version = "1", default-features = false, features = ["rt"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `encryption` builds libsql-ffi's bundled SQLite3 Multiple Ciphers via
+# CMake, which needs `llvm-lib` when cross-compiling for the MSVC target
+# (`cargo build-windows-winui`, via xwin/clang-cl) — not available in this
+# environment's toolchain, confirmed by actually hitting the build failure,
+# not assumed. Scoping the feature to Linux only (where
+# `HistoryStore::open_encrypted` is actually used — see its `#[cfg]` in
+# history.rs) sidesteps that entirely, and honors the roadmap item's own
+# "if available" wording. `history.rs`'s `#[cfg(not(target_os = "linux"))]`
+# fallback keeps every other target's `HistoryStore::open_encrypted` call
+# site compiling regardless.
+libsql = { version = "0.9", default-features = false, features = ["encryption"] }
+# For EncryptionConfig::new's `encryption_key` — already resolved transitively
+# via libsql's own "encryption" feature (see Cargo.lock), so this adds no new
+# crate to the build.
+bytes = "1"
