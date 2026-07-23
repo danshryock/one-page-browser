@@ -314,10 +314,24 @@ machine logic tested with real unit tests against a mock engine — no GTK or we
 cargo test -p browser-core
 ```
 
-`browser-linux-gtk3` has two example-based regression tests that drive the actual GTK app end-to-end against
-local fixture pages, printing `PASS`/`FAIL` per check and exiting non-zero if anything fails:
+`browser-linux-gtk3` has real `cargo test`-integrated regression tests (`tests/gtk_tests.rs`, using
+`gtk-test` as a dev-dependency) that drive the actual GTK app end-to-end against local fixture pages:
 
 ```sh
-cargo run --example nav_test -p browser-linux-gtk3       # navigate/back/forward/reload
-cargo run --example switcher_test -p browser-linux-gtk3  # multi-page switcher, search, loaded/unloaded limit
+cargo test -p browser-linux-gtk3
+```
+
+These need a real display — `DISPLAY` pointed at a working X11/Xwayland server, same as running the app
+itself. Each test uses its own disposable profile (so nothing pollutes real user data) and GTK's main loop
+is only ever driven from one thread at a time (a process-wide `Mutex` serializes the tests — GTK's default
+backend isn't safe to drive from multiple threads concurrently, which is otherwise exactly how Rust's test
+harness runs `#[test]` functions), so no `--test-threads=1` is needed on the invocation above.
+
+If there's no physical display available (a plain terminal, CI), `xwayland-run` gets a genuinely isolated
+one — a headless Wayland compositor plus `Xwayland` on top of it, unlike `Xephyr`, which needs a real host
+display to nest a window inside:
+
+```sh
+sudo apt-get install -y xwayland-run cage  # cage: a minimal ~76 KB compositor backend, enough for this
+xwayland-run -- cargo test -p browser-linux-gtk3
 ```

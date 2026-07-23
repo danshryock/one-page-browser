@@ -11,3 +11,6 @@ anyhow = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+gtk-test = "0.18"

@@ -1,0 +1,467 @@
+//! Real `cargo test`-integrated GTK unit tests, using `gtk-test` (see
+//! `Cargo.toml`) as the dev-dependency backing this — though the actual
+//! value taken from it here is running as ordinary `#[test]` functions and
+//! its `run_loop`-style polling approach, not its `enigo`-backed synthetic
+//! mouse/keyboard functions (`click`/`key_press`/etc.): those drive the UI
+//! via real OS-level input against the on-screen window and explicitly
+//! require it to have real focus/stacking (documented in `gtk-test`'s own
+//! source), which this app's own `AppState` methods
+//! (`add_page`/`switch_to`/`search_activate`/`address_bar_activate`/etc.)
+//! don't need at all — they drive behavior directly, and are more robust
+//! for this than synthetic input would be.
+//!
+//! Needs a real display (`DISPLAY` pointed at a working X11/Xwayland
+//! server) to run at all — GTK itself, not just this file, requires one.
+//! `xwayland-run` (a headless Wayland compositor + Xwayland, genuinely
+//! isolated from any real desktop) is the recommended way to get one in a
+//! terminal/CI with no physical display; see `README.md`'s Testing section.
+//!
+//! GTK doesn't just require staying on one thread at a time — `gtk::init()`
+//! (see `gtk-0.18.2/src/rt.rs`) permanently remembers *which* thread called
+//! it first via a `thread_local!` flag, and panics ("Attempted to initialize
+//! GTK from two different threads") if any *other* thread ever calls it
+//! again, even long after the first thread has finished. Rust's test harness
+//! spawns a fresh OS thread per `#[test]` function even under
+//! `--test-threads=1` (confirmed by actually running this suite: the first
+//! test passed, every subsequent one panicked with exactly that message) —
+//! so a per-test `Mutex` guarding sequential access isn't enough; GTK must
+//! be initialized and driven from the *same* thread for the whole process.
+//!
+//! Fixed with a single persistent worker thread (`gtk_thread`, spawned once,
+//! lazily), which is the only thread that ever touches GTK. Each test sends
+//! its body to it via `run_on_gtk_thread` and blocks for the result,
+//! `catch_unwind`-ing on the worker side and re-panicking on the calling
+//! (real test) thread so `cargo test`'s reporting still attributes failures
+//! to the right test name. This also fully serializes the suite as a side
+//! effect (one job runs at a time on the worker), so no separate lock is
+//! needed on top.
+
+use std::panic::AssertUnwindSafe;
+use std::sync::mpsc::{self, Sender};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+use browser_core::Profile;
+use browser_linux_gtk3::build_window_and_app;
+use gtk::prelude::*;
+use render_engine::{RenderEngine, WryEngine};
+
+type Job = Box<dyn FnOnce() + Send>;
+
+/// The single, persistent GTK-owning thread's job queue — spawned on first
+/// use, lives for the rest of the process.
+fn gtk_thread() -> &'static Sender<Job> {
+    static SENDER: OnceLock<Sender<Job>> = OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<Job>();
+        std::thread::spawn(move || {
+            gtk::init().expect("gtk::init should succeed against a real display");
+            for job in rx {
+                job();
+            }
+        });
+        tx
+    })
+}
+
+/// Runs `body` on the single GTK-owning thread and blocks until it's done,
+/// re-panicking on the calling thread if `body` panicked there — see this
+/// module's doc comment for why this exists at all. `body` must not capture
+/// anything non-`Send` (none of the tests here need to: each builds its own
+/// profile/window/app entirely inside the closure).
+fn run_on_gtk_thread<F: FnOnce() + Send + 'static>(body: F) {
+    let (done_tx, done_rx) = mpsc::channel::<Option<String>>();
+    let job: Job = Box::new(move || {
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(body));
+        let failure = outcome.err().map(|payload| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "GTK thread panicked with a non-string payload".to_string())
+        });
+        let _ = done_tx.send(failure);
+    });
+    gtk_thread().send(job).expect("GTK worker thread should still be alive");
+    if let Some(message) = done_rx.recv().expect("GTK worker thread should reply") {
+        panic!("{message}");
+    }
+}
+
+/// Generous ceiling for how long a webview-derived value (current URL,
+/// document title) may take to settle after a navigation. Wide on purpose:
+/// this only slows a run down when a check genuinely never becomes true (a
+/// real failure) — `wait_until` returns the moment the condition is met, so
+/// under normal load this costs milliseconds, not seconds.
+const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Minimum extra time to keep pumping after `condition` first becomes true,
+/// before trusting it. E.g. `active_url()` can report the destination URL
+/// before WebKitGTK has actually finished registering that navigation in its
+/// joint history stack — returning the instant a condition matches leaves
+/// too little real time elapsed for whatever runs next to be reliable.
+/// Confirmed empirically (carried over from this suite's original
+/// example-binary form): without this settle window, polling that returns
+/// as soon as the condition matches reproduces a real flake; with it, ten
+/// runs straight pass.
+const SETTLE: Duration = Duration::from_millis(200);
+
+/// Polls `condition` (pumping the GTK loop between attempts) until it's true
+/// or `TIMEOUT` elapses. Use this for anything that depends on the embedded
+/// webview's async state (URL after a navigation, title after a document
+/// load) — plain app state (page list, active id, overlay visibility)
+/// updates synchronously in Rust and never needs this.
+fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        while gtk::events_pending() {
+            gtk::main_iteration_do(false);
+        }
+        if condition() {
+            let settle_until = Instant::now() + SETTLE;
+            while Instant::now() < settle_until {
+                while gtk::events_pending() {
+                    gtk::main_iteration_do(false);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn fixture_url(name: &str) -> String {
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fixtures");
+    format!("file://{fixtures}/{name}")
+}
+
+/// A profile scoped to this test alone (unique per test name + process),
+/// so tests never share or pollute each other's — or the real user's —
+/// `Settings`/`HistoryStore`/`Keybindings` files on disk. Removes its
+/// on-disk directory up front (in case a previous run of this same test
+/// left one) and returns it ready to use; callers should also remove it
+/// afterward via `cleanup_test_profile`.
+fn test_profile(name: &str) -> Profile {
+    let profile = Profile::new(format!("gtk-test-{name}-{}", std::process::id()));
+    cleanup_test_profile(&profile);
+    profile
+}
+
+/// Best-effort removal of a test profile's on-disk directories. Ignores
+/// errors — this is cleanup, not something a test should fail over.
+/// `settings_path`/`keybindings_path` live under the config dir,
+/// `history_db_path` under the data dir (a genuinely different path on
+/// Linux — `~/.config/claude-browser/...` vs. `~/.local/share/claude-browser/...`)
+/// — both need removing, or `HistoryStore::open`'s `history.db` is left
+/// behind under the data dir even after the config-dir side is cleaned up.
+fn cleanup_test_profile(profile: &Profile) {
+    for path in [profile.settings_path(), profile.history_db_path()].into_iter().flatten() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+}
+
+/// Exercises `render_engine::WryEngine` directly (the same object the app's
+/// back/forward/reload toolbar buttons drive through `AppState::with_active`,
+/// a private method with no public test hook) rather than through
+/// `AppState`/`build_window_and_app` like the other tests here — this one is
+/// about `WryEngine`'s own navigation/history behavior specifically.
+#[test]
+fn navigation_back_forward_reload() {
+    run_on_gtk_thread(|| {
+        let url_a = fixture_url("page_a.html");
+        let url_b = fixture_url("page_b.html");
+
+        let window = gtk::Window::new(gtk::WindowType::Toplevel);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        window.add(&content);
+        window.show_all();
+
+        let engine = WryEngine::new(&content, &url_a, |_| {}).expect("WryEngine::new should succeed");
+        assert!(
+            wait_until(|| engine.current_url().ok().as_deref() == Some(url_a.as_str())),
+            "initial load should reach page A"
+        );
+
+        engine.navigate(&url_b).expect("navigate should succeed");
+        assert!(
+            wait_until(|| engine.current_url().ok().as_deref() == Some(url_b.as_str())),
+            "navigating should reach page B"
+        );
+
+        engine.go_back().expect("go_back should succeed");
+        assert!(
+            wait_until(|| engine.current_url().ok().as_deref() == Some(url_a.as_str())),
+            "go_back should return to page A"
+        );
+
+        engine.go_forward().expect("go_forward should succeed");
+        assert!(
+            wait_until(|| engine.current_url().ok().as_deref() == Some(url_b.as_str())),
+            "go_forward should return to page B"
+        );
+
+        engine.reload().expect("reload should succeed");
+        assert!(
+            wait_until(|| engine.current_url().ok().as_deref() == Some(url_b.as_str())),
+            "reload should stay on page B"
+        );
+    });
+}
+
+#[test]
+fn page_lifecycle_add_switch_close() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("page-lifecycle");
+        let url_a = fixture_url("page_a.html");
+        let url_b = fixture_url("page_b.html");
+        let url_c = fixture_url("page_c.html");
+
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        app.add_page(&url_a).expect("add_page should succeed");
+        assert_eq!(app.page_ids().len(), 1, "adding the first page should open exactly one page");
+        let id_a = app.page_ids()[0].clone();
+        assert_eq!(app.active_id(), id_a, "the first page should become active");
+        assert_eq!(app.stack_visible_child_name().as_deref(), Some(id_a.as_str()));
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())));
+        assert!(wait_until(|| app.page_title(&id_a).as_deref() == Some("Page A")));
+
+        app.add_page(&url_b).expect("add_page should succeed");
+        assert_eq!(app.page_ids().len(), 2, "adding a second page should grow the list to 2");
+        let id_b = app.page_ids()[1].clone();
+        assert_eq!(app.active_id(), id_b, "the new page should become active");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url_b.as_str())));
+
+        app.add_page(&url_c).expect("add_page should succeed");
+        assert_eq!(app.page_ids().len(), 3, "adding a third page should grow the list to 3");
+        let id_c = app.page_ids()[2].clone();
+        assert_eq!(app.active_id(), id_c, "the third page should become active");
+
+        app.switch_to(&id_a);
+        assert_eq!(app.active_id(), id_a, "switching back to A should update the active id");
+        assert_eq!(app.stack_visible_child_name().as_deref(), Some(id_a.as_str()));
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())));
+        assert_eq!(app.page_ids().len(), 3, "switching shouldn't drop other pages");
+
+        // A is active; closing it should fall back to a remaining page, not vanish.
+        app.close_page(&id_a);
+        assert_eq!(app.page_ids().len(), 2, "closing the active page should remove it from the list");
+        assert_ne!(app.active_id(), id_a, "closing the active page should pick a new active page");
+        assert!(
+            app.active_id() == id_b || app.active_id() == id_c,
+            "the new active page should be one of the remaining ones"
+        );
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn switcher_search_and_grid() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("switcher-search");
+        let url_a = fixture_url("page_a.html");
+        let url_b = fixture_url("page_b.html");
+        let url_c = fixture_url("page_c.html");
+
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&url_a).expect("add_page should succeed");
+        app.add_page(&url_b).expect("add_page should succeed");
+        let id_b = app.active_id();
+        // The later "page b" search matches on title (the URL has an underscore,
+        // not a space, so it can't match "page b"), so B's title has to have
+        // settled before that point.
+        assert!(wait_until(|| app.page_title(&id_b).as_deref() == Some("Page B")));
+        app.add_page(&url_c).expect("add_page should succeed");
+
+        // open_switcher shows the panel with a cleared, focused search box (this
+        // is what F1/Ctrl+T/Ctrl+L and the grid button all trigger now).
+        app.open_switcher();
+        assert!(app.is_switcher_open(), "open_switcher should show the switcher panel");
+        assert!(!app.is_background_page_interactive(), "open_switcher should make the background page stack insensitive");
+
+        // Typing a query that matches no open page and pressing Enter should
+        // open a new page from it instead of doing nothing.
+        let before_count = app.page_ids().len();
+        app.search_activate("some-nonexistent-domain-example");
+        assert_eq!(app.page_ids().len(), before_count + 1, "search should open a new page when nothing matches");
+        let new_id = app.page_ids().last().cloned().unwrap_or_default();
+        assert_eq!(app.active_id(), new_id, "the new page from search should become active");
+        // WebKitGTK normalizes a bare-domain URL by adding a trailing slash.
+        assert!(wait_until(|| app.active_url().as_deref() == Some("https://some-nonexistent-domain-example/")));
+        assert!(!app.is_switcher_open(), "opening a page from search should close the switcher");
+        assert!(app.is_background_page_interactive(), "closing the switcher should restore background page interactivity");
+
+        // Filtering down to exactly one matching page and pressing Enter should
+        // switch to it (not create a duplicate).
+        app.open_switcher();
+        let existing_count = app.page_ids().len();
+        app.search_activate("page b");
+        assert_eq!(app.page_ids().len(), existing_count, "search shouldn't open a new page when a single match exists");
+        assert_eq!(app.active_id(), id_b, "search should switch to the single matching page");
+        assert!(!app.is_switcher_open(), "switching via search should close the switcher");
+
+        // Filtering to a query matching MORE than one page shouldn't switch
+        // anywhere (ambiguous) or create a duplicate.
+        app.open_switcher();
+        let active_before = app.active_id();
+        app.search_activate("page");
+        assert_eq!(app.page_ids().len(), existing_count, "search shouldn't open a new page when multiple pages match");
+        assert_eq!(app.active_id(), active_before, "search shouldn't switch when multiple pages match");
+
+        // Closing the ACTIVE page from an open grid should keep the grid open
+        // and switch to the nearest remaining page, not dismiss the grid.
+        let active_before_close = app.active_id();
+        let count_before_close = app.page_ids().len();
+        app.close_page(&active_before_close);
+        assert!(app.is_switcher_open(), "closing the active page from the grid should keep the grid open");
+        assert_eq!(app.page_ids().len(), count_before_close - 1);
+        assert_ne!(app.active_id(), active_before_close, "closing the active page from the grid should switch to a remaining page");
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn loaded_page_limit_evicts_and_reclaims() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("loaded-limit");
+        let url_a = fixture_url("page_a.html");
+        let url_b = fixture_url("page_b.html");
+        let url_c = fixture_url("page_c.html");
+
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&url_a).expect("add_page should succeed");
+        app.add_page(&url_b).expect("add_page should succeed");
+        app.add_page(&url_c).expect("add_page should succeed");
+
+        // Real end-to-end check that loaded/unloaded tracking works through the
+        // actual WryEngine-backed PageManager and AppState::set_max_loaded_pages
+        // — browser-core's own unit tests for this only exercise a mock engine.
+        let count_before_limit = app.page_ids().len();
+        app.set_max_loaded_pages(Some(2));
+        let loaded_after_limit = app.page_ids().iter().filter(|id| app.is_page_loaded(id)).count();
+        assert_eq!(loaded_after_limit, count_before_limit.min(2), "tightening the limit should evict down to it immediately");
+
+        app.add_page(&url_a).expect("add_page should succeed");
+        let loaded_after_new_page = app.page_ids().iter().filter(|id| app.is_page_loaded(id)).count();
+        assert_eq!(loaded_after_new_page, 2, "loading a new page past the limit should evict the oldest again");
+        let newest_id = app.page_ids().last().cloned().unwrap_or_default();
+        assert!(app.is_page_loaded(&newest_id), "the newly loaded page itself should be loaded");
+
+        app.set_max_loaded_pages(None);
+        let loaded_after_unlimited = app.page_ids().iter().filter(|id| app.is_page_loaded(id)).count();
+        assert_eq!(loaded_after_unlimited, 2, "removing the limit shouldn't retroactively reload anything unloaded");
+
+        // The `loaded` flag alone only proves bookkeeping, not real resource
+        // reclamation. Tighten the limit to 1 to force an eviction, confirm the
+        // evicted page's webview widget was actually torn down (its stack
+        // container has zero children), then confirm switching back to it
+        // rebuilds a live widget reloaded at its original URL.
+        app.set_max_loaded_pages(Some(1));
+        let reclaimed_id = app
+            .page_ids()
+            .into_iter()
+            .find(|id| !app.is_page_loaded(id))
+            .expect("tightening to limit 1 with more than one open page should evict at least one");
+        let reclaimed_url = app.page_url(&reclaimed_id).expect("an evicted page should still remember its last URL");
+        assert_eq!(
+            app.page_container_child_count(&reclaimed_id),
+            0,
+            "the evicted page's webview widget should be actually torn down, not just flagged"
+        );
+
+        app.switch_to(&reclaimed_id);
+        assert_eq!(app.page_container_child_count(&reclaimed_id), 1, "switching to an unloaded page should rebuild a live webview widget");
+        assert!(app.is_page_loaded(&reclaimed_id), "switching to an unloaded page should mark it loaded again");
+        assert!(
+            wait_until(|| app.active_url().as_deref() == Some(reclaimed_url.as_str())),
+            "the rebuilt webview should reload the page's original URL"
+        );
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn toolbar_address_bar_resolves_search_queries() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("address-bar-search");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&fixture_url("page_a.html")).expect("add_page should succeed");
+
+        // Real end-to-end check that the toolbar address bar (not just the
+        // switcher's search box) resolves non-URL input via the preferred
+        // search engine.
+        app.address_bar_activate("how to cook rice");
+        assert!(
+            wait_until(|| app.active_url().as_deref() == Some("https://www.google.com/search?q=how%20to%20cook%20rice")),
+            "the toolbar address bar should resolve multi-word input via the search engine"
+        );
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn settings_overlay_mutual_exclusion_and_save() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("settings-overlay");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&fixture_url("page_a.html")).expect("add_page should succeed");
+
+        // Settings overlay: shows/hides in place of a modal dialog, is mutually
+        // exclusive with the switcher grid (both are reachable from the header
+        // bar regardless of which, if either, is currently open), pre-populates
+        // from the current Settings, and Save actually persists an edit.
+        app.open_settings();
+        assert!(app.is_settings_open(), "open_settings should show the settings overlay");
+        assert_eq!(
+            app.settings_start_page_entry_text(),
+            app.settings().start_page,
+            "open_settings should pre-populate the start-page field from current settings"
+        );
+
+        app.open_switcher();
+        assert!(!app.is_settings_open(), "opening the switcher while settings is open should close settings");
+        assert!(app.is_switcher_open(), "opening the switcher while settings is open should still open the switcher");
+        app.close_switcher();
+
+        app.open_settings();
+        app.open_settings(); // re-opening while already open should stay open, not toggle closed
+        assert!(app.is_settings_open(), "opening settings while already open should leave it open");
+
+        let edited_start_page = "https://edited-start-page.example";
+        app.set_settings_start_page(edited_start_page);
+        app.save_settings();
+        assert_eq!(app.settings().start_page, edited_start_page, "Save should persist an edited start page into Settings");
+        assert!(!app.is_settings_open(), "Save should close the settings overlay");
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn closing_every_page_leaves_one_fallback() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("close-to-fallback");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&fixture_url("page_a.html")).expect("add_page should succeed");
+        app.add_page(&fixture_url("page_b.html")).expect("add_page should succeed");
+        app.add_page(&fixture_url("page_c.html")).expect("add_page should succeed");
+
+        // Closing every page shouldn't panic, and should land on some fallback page.
+        for id in app.page_ids() {
+            app.close_page(&id);
+        }
+        assert_eq!(app.page_ids().len(), 1, "closing every page should leave exactly one fallback page instead of zero");
+
+        cleanup_test_profile(&profile);
+    });
+}
