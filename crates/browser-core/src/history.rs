@@ -12,7 +12,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{domain_of, Profile};
+use crate::{domain_of, embedding, Profile};
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS history (
@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS history (
     title TEXT NOT NULL DEFAULT '',
     first_visited_at INTEGER NOT NULL,
     visited_at INTEGER NOT NULL,
-    visit_count INTEGER NOT NULL DEFAULT 1
+    visit_count INTEGER NOT NULL DEFAULT 1,
+    embedding BLOB
 );
 ";
 
@@ -98,6 +99,7 @@ impl HistoryStore {
         let db = rt.block_on(builder.build())?;
         let conn = db.connect()?;
         rt.block_on(conn.execute_batch(SCHEMA_SQL))?;
+        migrate_add_embedding_column(&conn, &rt);
         Ok(Self { _db: db, conn, rt })
     }
 
@@ -116,6 +118,7 @@ impl HistoryStore {
         let db = rt.block_on(libsql::Builder::new_local(path).build())?;
         let conn = db.connect()?;
         rt.block_on(conn.execute_batch(SCHEMA_SQL))?;
+        migrate_add_embedding_column(&conn, &rt);
         Ok(Self { _db: db, conn, rt })
     }
 
@@ -138,17 +141,22 @@ impl HistoryStore {
     /// `title`. Upserts by `url`: a repeat visit updates `title`/`visited_at`
     /// and increments `visit_count`, rather than growing an unbounded visit
     /// log — `first_visited_at`/`domain` are set once and never overwritten.
+    /// Also (re-)computes `title`'s embedding (see the `embedding` module)
+    /// for `search_similar` to use, since a revisit's title may have changed
+    /// since the last time this URL was recorded.
     pub fn record_visit(&self, url: &str, title: &str) -> anyhow::Result<()> {
         let domain = domain_of(url);
         let now = now_unix();
+        let embedding_literal = embedding::to_sql_literal(&embedding::embed(title));
         self.rt.block_on(self.conn.execute(
-            "INSERT INTO history (url, domain, title, first_visited_at, visited_at, visit_count) \
-             VALUES (?1, ?2, ?3, ?4, ?4, 1) \
+            "INSERT INTO history (url, domain, title, first_visited_at, visited_at, visit_count, embedding) \
+             VALUES (?1, ?2, ?3, ?4, ?4, 1, vector32(?5)) \
              ON CONFLICT(url) DO UPDATE SET \
                 title = excluded.title, \
                 visited_at = excluded.visited_at, \
-                visit_count = visit_count + 1",
-            libsql::params![url, domain, title, now],
+                visit_count = visit_count + 1, \
+                embedding = excluded.embedding",
+            libsql::params![url, domain, title, now, embedding_literal],
         ))?;
         Ok(())
     }
@@ -166,20 +174,65 @@ impl HistoryStore {
              WHERE url LIKE ?1 OR title LIKE ?1 ORDER BY visited_at DESC LIMIT ?2",
             libsql::params![pattern, limit as i64],
         ))?;
-
-        let mut entries = Vec::new();
-        while let Some(row) = self.rt.block_on(rows.next())? {
-            entries.push(HistoryEntry {
-                url: row.get(0)?,
-                domain: row.get(1)?,
-                title: row.get(2)?,
-                first_visited_at: row.get(3)?,
-                visited_at: row.get(4)?,
-                visit_count: row.get(5)?,
-            });
-        }
-        Ok(entries)
+        collect_entries(&self.rt, &mut rows)
     }
+
+    /// Entries whose *title* is lexically similar to `query`'s, by cosine
+    /// distance between their hashing-trick embeddings (see the `embedding`
+    /// module's doc comment for exactly what kind of "similar" this is —
+    /// shared vocabulary, not semantic meaning), most-similar first. Uses
+    /// libsql's native `vector_distance_cos` — a real, built-in SQL function
+    /// in the bundled SQLite, not something this code implements itself.
+    ///
+    /// Caps results to distance `< 0.9` (empirically: two titles sharing
+    /// essentially no vocabulary land close to `1.0`, near-orthogonal random
+    /// hashed vectors) so a query with nothing genuinely similar in history
+    /// doesn't just return whatever rows happen to be least-dissimilar —
+    /// callers should treat this as "meaningfully similar or nothing," not
+    /// "the N closest regardless of how close."
+    pub fn search_similar(&self, query: &str, limit: usize) -> anyhow::Result<Vec<HistoryEntry>> {
+        let embedding_literal = embedding::to_sql_literal(&embedding::embed(query));
+        let mut rows = self.rt.block_on(self.conn.query(
+            "SELECT url, domain, title, first_visited_at, visited_at, visit_count, \
+                    vector_distance_cos(embedding, vector32(?1)) AS distance \
+             FROM history \
+             WHERE embedding IS NOT NULL AND distance < 0.9 \
+             ORDER BY distance ASC LIMIT ?2",
+            libsql::params![embedding_literal, limit as i64],
+        ))?;
+        collect_entries(&self.rt, &mut rows)
+    }
+}
+
+/// Shared by `search`/`search_similar`: both select the same six columns in
+/// the same order (an extra trailing `distance` column from
+/// `search_similar`'s query is simply never read here).
+fn collect_entries(rt: &tokio::runtime::Runtime, rows: &mut libsql::Rows) -> anyhow::Result<Vec<HistoryEntry>> {
+    let mut entries = Vec::new();
+    while let Some(row) = rt.block_on(rows.next())? {
+        entries.push(HistoryEntry {
+            url: row.get(0)?,
+            domain: row.get(1)?,
+            title: row.get(2)?,
+            first_visited_at: row.get(3)?,
+            visited_at: row.get(4)?,
+            visit_count: row.get(5)?,
+        });
+    }
+    Ok(entries)
+}
+
+/// Best-effort migration for a database created before the `embedding`
+/// column existed — `CREATE TABLE IF NOT EXISTS` silently no-ops against an
+/// existing table with an older shape, so a fresh `open`/`open_encrypted`
+/// call on a profile used before this feature landed would otherwise be
+/// missing the column entirely. Ignores the error `ALTER TABLE` raises when
+/// the column already exists (the normal case, once every profile has been
+/// opened at least once after this migration was added) — there's no
+/// portable way to check for a column's existence up front that's simpler
+/// than just trying to add it.
+fn migrate_add_embedding_column(conn: &libsql::Connection, rt: &tokio::runtime::Runtime) {
+    let _ = rt.block_on(conn.execute("ALTER TABLE history ADD COLUMN embedding BLOB", ()));
 }
 
 fn now_unix() -> i64 {
@@ -245,6 +298,92 @@ mod tests {
     fn empty_store_returns_no_results_without_erroring() {
         let store = temp_store("empty");
         assert_eq!(store.search("anything", 10).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn search_similar_finds_lexically_related_titles_not_matched_by_substring_search() {
+        let store = temp_store("similar");
+        store.record_visit("https://rust-lang.org/tutorial", "Rust Programming Language Tutorial").unwrap();
+        store.record_visit("https://example.com/bread", "Baking Sourdough Bread At Home").unwrap();
+
+        // A query sharing most of its vocabulary with the Rust entry (but no
+        // literal substring in common — "guide" appears nowhere in either
+        // stored title/URL) shouldn't match via `search`, but should via
+        // `search_similar`.
+        assert_eq!(store.search("rust programming language guide", 10).unwrap(), vec![]);
+
+        let similar = store.search_similar("Rust Programming Language Guide", 10).unwrap();
+        assert_eq!(similar.len(), 1, "only the vocabulary-sharing entry should be similar enough to return");
+        assert_eq!(similar[0].url, "https://rust-lang.org/tutorial");
+    }
+
+    #[test]
+    fn search_similar_returns_nothing_for_an_unrelated_query() {
+        let store = temp_store("similar-empty");
+        store.record_visit("https://example.com/bread", "Baking Sourdough Bread At Home").unwrap();
+
+        let results = store.search_similar("Quantum Computing Research Papers", 10).unwrap();
+        assert_eq!(results, vec![], "a query sharing no vocabulary with anything in history should return nothing, not the least-bad match");
+    }
+
+    #[test]
+    fn search_similar_on_an_empty_store_returns_no_results_without_erroring() {
+        let store = temp_store("similar-on-empty");
+        assert_eq!(store.search_similar("anything", 10).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn opening_a_database_created_before_the_embedding_column_existed_still_works() {
+        // Simulates a real profile's history.db from before this feature
+        // landed: the pre-migration schema, with a row already in it, and no
+        // `embedding` column at all. `HistoryStore::open_at`'s
+        // `migrate_add_embedding_column` step needs to add the column
+        // without disturbing the existing row, and old rows (embedding
+        // still NULL, since nothing backfills it retroactively) should be
+        // silently excluded from `search_similar` rather than erroring.
+        let path = std::env::temp_dir()
+            .join(format!("claude-browser-test-history-pre-migration-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let db = rt.block_on(libsql::Builder::new_local(&path).build()).unwrap();
+            let conn = db.connect().unwrap();
+            rt.block_on(conn.execute_batch(
+                "CREATE TABLE history (
+                    url TEXT PRIMARY KEY,
+                    domain TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    first_visited_at INTEGER NOT NULL,
+                    visited_at INTEGER NOT NULL,
+                    visit_count INTEGER NOT NULL DEFAULT 1
+                );",
+            ))
+            .unwrap();
+            rt.block_on(conn.execute(
+                "INSERT INTO history (url, domain, title, first_visited_at, visited_at, visit_count) \
+                 VALUES ('https://example.com/old', 'example.com', 'Old Entry', 100, 100, 1)",
+                (),
+            ))
+            .unwrap();
+        }
+
+        let store = HistoryStore::open_at(&path).expect("opening a pre-migration database should succeed, not error");
+        let results = store.search("old entry", 10).expect("substring search over a pre-existing row should still work");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://example.com/old");
+
+        // The old row's embedding is NULL (nothing backfills it
+        // retroactively), so it should never surface via search_similar.
+        assert_eq!(store.search_similar("old entry", 10).unwrap(), vec![]);
+
+        // A freshly recorded visit after the migration should get a real
+        // embedding and be findable via search_similar as usual.
+        store.record_visit("https://example.com/new", "Rust Programming Language Tutorial").unwrap();
+        let similar = store.search_similar("Rust Programming Language Guide", 10).unwrap();
+        assert_eq!(similar.len(), 1);
+        assert_eq!(similar[0].url, "https://example.com/new");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

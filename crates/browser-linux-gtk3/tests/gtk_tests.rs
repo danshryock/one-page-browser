@@ -733,6 +733,33 @@ fn switcher_grid_shows_bookmark_matches_not_currently_open() {
 }
 
 #[test]
+fn switcher_grid_shows_lexically_similar_history_matches() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("grid-similar");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        // Recorded directly (not opened as a real page — the fixture
+        // pages' titles are single words, not enough vocabulary for a
+        // meaningful similarity comparison) with a title sharing most of
+        // its vocabulary with the query below but no literal substring in
+        // common ("guide" replaces "tutorial") — isolates the
+        // similar-tile path from the (already-covered) plain history-tile
+        // substring-match path.
+        app.record_history_visit_for_test("https://rust-lang.org/tutorial", "Rust Programming Language Tutorial")
+            .expect("record_history_visit_for_test should succeed");
+
+        app.open_switcher();
+        app.set_address_bar_text("rust programming language guide");
+        assert!(
+            wait_until(|| app.switcher_grid_has_tile_with_class("similar-tile")),
+            "searching for a lexically similar (but not substring-matching) query should show a similar-history tile"
+        );
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
 fn screenshot_saves_a_real_png_file() {
     run_on_gtk_thread(|| {
         let profile = test_profile("screenshot");

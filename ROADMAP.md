@@ -76,6 +76,13 @@ build/run instructions.
   extraction heuristic (favors `<article>`/`<main>`, else the highest-scoring `<div>`/`<section>` by
   paragraph count) injected via JS — not a vendored Readability.js (no network access here to fetch one).
   See `summaries/reader-mode.md`.
+- Vector search for the switcher grid's history search (`browser-core` + `browser-linux-gtk3`), using
+  libsql's native `vector32`/`vector_distance_cos` — needs no new Cargo feature, unlike encryption, since
+  they're in libsql-ffi's base bundled SQLite. Embeddings are a deterministic, dependency-free local
+  "hashing trick" (lexical/shared-vocabulary similarity, not semantic — no local model or network API
+  available here, and picking between those is a real decision, not something to guess at), so this finds
+  entries sharing vocabulary with a query regardless of word order/exact substring, shown as a third
+  `.similar-tile` category in the switcher grid. See `summaries/vector-search.md`.
 
 ## Next
 
@@ -101,11 +108,5 @@ Nothing specifically queued — pick the next item from the backlog below.
   above), never actually run; once it can be run on real Windows, expect a real debugging pass (custom
   title bar drag, the `WM_KEYDOWN` HWND-subclass keybinding capture, `WebView2` control behavior, etc. are
   all unverified at runtime).
-- Add vector search to the page/history search using libsql's native vector search — investigated, not
-  implemented: libsql's vector functions (`vector32`, `vector_distance_cos`, etc.) are real and already
-  present in the bundled SQLite build, so the SQL side is straightforward. The actual blocker is that vector
-  search is meaningless without real semantic embeddings of page titles/content, and generating those needs
-  either a local embedding model (a real dependency-size/complexity decision) or a network-based embedding
-  API (a cost/network-access/API-key decision) — picking between those isn't something to guess at
-  unsupervised. A naive local pseudo-embedding (e.g. hashing/n-grams) wouldn't add genuine value over the
-  substring search already in place, so wasn't built just to check the box.
+- A real semantic embedding for vector search (swapping in a local ML model or a network embedding API in
+  place of the current lexical hashing-trick embedding) — see `summaries/vector-search.md`'s "Scope notes."

@@ -783,6 +783,16 @@ impl AppState {
         }
     }
 
+    /// Records a history visit directly, without needing to open it as a
+    /// real page first — test helper for exercising the similar-history-
+    /// match path in `rebuild_switcher_grid` with a controlled, rich-enough
+    /// title to test lexical similarity against (the fixture pages' own
+    /// titles are single words, not enough vocabulary for a meaningful
+    /// similarity comparison).
+    pub fn record_history_visit_for_test(&self, url: &str, title: &str) -> anyhow::Result<()> {
+        self.history.record_visit(url, title)
+    }
+
     /// Number of rows currently shown in the keybindings editor (folded into
     /// the settings overlay — see `open_settings`'s doc comment) — test/
     /// inspection helper confirming it's actually populated when settings
@@ -1120,6 +1130,35 @@ impl AppState {
                 });
                 self.flowbox.insert(&flow_child, -1);
             }
+
+            // Lexically-similar history matches — entries whose *title*
+            // shares vocabulary with the query without necessarily
+            // containing it as a literal substring (see
+            // `HistoryStore::search_similar`'s doc comment for exactly what
+            // kind of "similar" this is). Deliberately last and still
+            // deduped against `shown_urls`, so an entry already shown via
+            // exact substring match or as a bookmark doesn't also show up
+            // here.
+            let similar_matches = self.history.search_similar(&query, 5).unwrap_or_else(|err| {
+                eprintln!("history similarity search failed: {err}");
+                Vec::new()
+            });
+            for entry in similar_matches {
+                if shown_urls.contains(&entry.url) {
+                    continue;
+                }
+                shown_urls.push(entry.url.clone());
+
+                let title_text = if entry.title.is_empty() { "New Page".to_string() } else { entry.title.clone() };
+                let url = entry.url.clone();
+                let flow_child = self.build_search_result_tile("similar-tile", &title_text, &entry.domain, move |app| {
+                    if let Err(err) = app.add_page(&url) {
+                        eprintln!("failed to open history entry: {err}");
+                    }
+                    app.close_switcher();
+                });
+                self.flowbox.insert(&flow_child, -1);
+            }
         }
     }
 
@@ -1379,6 +1418,9 @@ fn theme_css(theme: Theme) -> &'static str {
              .bookmark-tile { background-image: none; background-color: rgba(212, 175, 55, 0.18); \
                border: 1px dashed rgba(212, 175, 55, 0.5); box-shadow: none; border-radius: 10px; \
                color: #fff; opacity: 0.85; } \
+             .similar-tile { background-image: none; background-color: rgba(90, 200, 180, 0.16); \
+               border: 1px dashed rgba(90, 200, 180, 0.5); box-shadow: none; border-radius: 10px; \
+               color: #fff; opacity: 0.8; } \
              .settings-box label:not(.settings-title) { color: rgba(255, 255, 255, 0.92); } \
              .settings-box button.flat, .settings-box button.flat:hover { \
                background-image: none; background-color: transparent; } \
@@ -1392,6 +1434,9 @@ fn theme_css(theme: Theme) -> &'static str {
                color: #1a1a1a; opacity: 0.85; } \
              .bookmark-tile { background-image: none; background-color: rgba(180, 140, 20, 0.14); \
                border: 1px dashed rgba(180, 140, 20, 0.45); box-shadow: none; border-radius: 10px; \
+               color: #1a1a1a; opacity: 0.9; } \
+             .similar-tile { background-image: none; background-color: rgba(20, 140, 120, 0.12); \
+               border: 1px dashed rgba(20, 140, 120, 0.4); box-shadow: none; border-radius: 10px; \
                color: #1a1a1a; opacity: 0.9; } \
              .settings-box label:not(.settings-title) { color: rgba(0, 0, 0, 0.82); } \
              .settings-box button.flat, .settings-box button.flat:hover { \

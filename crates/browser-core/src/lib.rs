@@ -12,6 +12,7 @@ use std::time::Instant;
 use render_engine::RenderEngine;
 
 mod bookmarks;
+mod embedding;
 mod history;
 mod keybindings;
 mod profile;
