@@ -19,6 +19,18 @@ windows = { version = "0.62", features = [
     "Win32_System_Com",
     "Win32_System_WinRT",
     "Win32_System_LibraryLoader",
+    # For subclassing the top-level HWND (SetWindowSubclass/DefSubclassProc)
+    # to handle keyboard shortcuts and window-close — this crate's bindings
+    # have no working way to subscribe to Window::Closed or any KeyDown
+    # event at all (see src/lib.rs's module doc comment), so those go
+    # through the raw HWND instead, the same technique already used in
+    # browser-wx/src/titlebar/windows.rs.
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 windows-core = "0.62"
-winio-winui3 = { version = "0.4", features = ["UI_Composition", "UI_Xaml_Controls_Primitives"] }
+# "native" exposes `winui3::IWindowNative`, needed to get the raw HWND out of
+# a `Microsoft.UI.Xaml.Window` for the subclassing above. "UI_Xaml_Media" adds
+# `SolidColorBrush`, used for tile/scrim backgrounds.
+winio-winui3 = { version = "0.4", features = ["UI_Composition", "UI_Xaml_Controls_Primitives", "UI_Windowing", "native"] }

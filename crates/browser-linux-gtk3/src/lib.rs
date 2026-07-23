@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use browser_core::{domain_of, resolve_address_input, PageManager, Profile, Settings};
+use browser_core::{domain_of, resolve_address_input, HistoryStore, PageManager, Profile, Settings};
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
 
@@ -21,13 +21,24 @@ pub struct AppState {
     switcher_panel: gtk::Widget,
     search_entry: gtk::SearchEntry,
     flowbox: gtk::FlowBox,
+    /// The settings overlay's root widget — an in-window overlay rather than
+    /// a modal `gtk::Dialog` (matching `browser-windows-winui`'s settings
+    /// surface, which led with this pattern since it needed to avoid
+    /// `ContentDialog`'s async `ShowAsync`; gtk3 had no such constraint, this
+    /// is purely for consistency between the two front ends).
+    settings_panel: gtk::Widget,
+    start_page_entry: gtk::Entry,
+    engine_combo: gtk::ComboBoxText,
+    unlimited_check: gtk::CheckButton,
+    limit_spin: gtk::SpinButton,
     core: RefCell<PageManager<WryEngine>>,
     /// GTK `Stack` children, keyed by page id — `browser_core::Page` doesn't
     /// hold these since they're a GTK-only concept.
     containers: RefCell<HashMap<String, gtk::Box>>,
     settings: RefCell<Settings>,
+    history: HistoryStore,
     /// Resolved once at startup (from `--profile`, defaulting to
-    /// `"default"`) — kept around so the settings dialog's Save action can
+    /// `"default"`) — kept around so the settings overlay's Save action can
     /// re-save to the same place `Settings::load` read from, without
     /// re-parsing `std::env::args()`.
     profile: Profile,
@@ -81,9 +92,11 @@ impl AppState {
         let title = Rc::new(RefCell::new(String::new()));
         let title_for_cb = Rc::clone(&title);
         let app_weak = Rc::downgrade(self);
+        let id_for_cb = id.clone();
         let engine = WryEngine::new(&container, url, move |new_title| {
             *title_for_cb.borrow_mut() = new_title;
             if let Some(app) = app_weak.upgrade() {
+                app.record_visit(&id_for_cb);
                 app.rebuild_switcher_grid();
             }
         })?;
@@ -94,6 +107,22 @@ impl AppState {
         self.set_active(&id);
         self.rebuild_switcher_grid();
         Ok(())
+    }
+
+    /// Records a history visit for page `id`'s current URL/title — called
+    /// from the `on_title_changed` callback (`add_page`/`ensure_engine_loaded`),
+    /// the one place both are available together. Best-effort: logs rather
+    /// than propagating, matching this codebase's existing error-handling
+    /// style throughout (a failed history write shouldn't interrupt browsing).
+    fn record_visit(&self, id: &str) {
+        let core = self.core.borrow();
+        let Some(page) = core.page(id) else { return };
+        let url = page.current_url();
+        let title = page.title.borrow().clone();
+        drop(core);
+        if let Err(err) = self.history.record_visit(&url, &title) {
+            eprintln!("failed to record history visit: {err}");
+        }
     }
 
     /// Actually tears down the engines for pages `PageManager` just flipped
@@ -131,9 +160,11 @@ impl AppState {
 
         let title_for_cb = Rc::clone(&title);
         let app_weak = Rc::downgrade(self);
+        let id_for_cb = id.to_string();
         match WryEngine::new(&container, &url, move |new_title| {
             *title_for_cb.borrow_mut() = new_title;
             if let Some(app) = app_weak.upgrade() {
+                app.record_visit(&id_for_cb);
                 app.rebuild_switcher_grid();
             }
         }) {
@@ -159,8 +190,13 @@ impl AppState {
     /// the grid-button toggle as well as the F1 / Ctrl+T / Ctrl+L shortcuts.
     /// The page stack is made insensitive so the background webview can't
     /// steal keyboard focus (or process key/pointer input at all) while the
-    /// grid is up.
+    /// grid is up. Closes the settings overlay first if it's open — the
+    /// header bar's switcher/settings buttons are both reachable regardless
+    /// of which overlay (if any) is currently shown, so both `open_*`
+    /// methods defensively close the other rather than ever showing both at
+    /// once.
     pub fn open_switcher(self: &Rc<Self>) {
+        self.close_settings();
         self.search_entry.set_text("");
         self.rebuild_switcher_grid();
         self.stack.set_sensitive(false);
@@ -174,6 +210,68 @@ impl AppState {
     pub fn close_switcher(&self) {
         self.switcher_panel.hide();
         self.stack.set_sensitive(true);
+    }
+
+    /// Shows the settings overlay, populated from the current `Settings`.
+    /// See `open_switcher`'s doc comment for why it closes the switcher grid
+    /// first.
+    pub fn open_settings(self: &Rc<Self>) {
+        self.close_switcher();
+        let settings = self.settings.borrow();
+        self.start_page_entry.set_text(&settings.start_page);
+        self.engine_combo.set_active_id(Some(&settings.default_search_engine));
+        match settings.max_loaded_pages {
+            Some(n) => {
+                self.unlimited_check.set_active(false);
+                self.limit_spin.set_value(n as f64);
+                self.limit_spin.set_sensitive(true);
+            }
+            None => {
+                self.unlimited_check.set_active(true);
+                self.limit_spin.set_sensitive(false);
+            }
+        }
+        drop(settings);
+        self.stack.set_sensitive(false);
+        self.settings_panel.show();
+    }
+
+    /// Hides the settings overlay without saving — used by Cancel, the
+    /// scrim, and Escape. Always use this (rather than hiding
+    /// `settings_panel` directly) so the stack never gets left insensitive.
+    pub fn close_settings(&self) {
+        self.settings_panel.hide();
+        self.stack.set_sensitive(true);
+    }
+
+    /// Reads the overlay's fields back into `Settings`, applies the loaded-
+    /// pages limit immediately (via `set_max_loaded_pages`, same as before),
+    /// saves to disk, and closes the overlay — the settings overlay's Save
+    /// action.
+    pub fn save_settings(self: &Rc<Self>) {
+        {
+            let mut settings = self.settings.borrow_mut();
+            settings.start_page = self.start_page_entry.text().to_string();
+            if let Some(id) = self.engine_combo.active_id() {
+                settings.default_search_engine = id.to_string();
+            }
+        }
+        let new_limit = if self.unlimited_check.is_active() {
+            None
+        } else {
+            Some(self.limit_spin.value_as_int().max(1) as usize)
+        };
+        self.set_max_loaded_pages(new_limit);
+        if let Err(err) = self.settings().save(&self.profile) {
+            eprintln!("failed to save settings: {err}");
+        }
+        self.close_settings();
+    }
+
+    /// Whether the settings overlay is currently shown — test/inspection
+    /// helper.
+    pub fn is_settings_open(&self) -> bool {
+        self.settings_panel.is_visible()
     }
 
     /// Ids of pages matching `query` (case-insensitive substring of title or
@@ -216,14 +314,28 @@ impl AppState {
         self.rebuild_switcher_grid();
     }
 
+    /// Rebuilds every tile from scratch — open pages matching the search
+    /// box's current text (or all of them, if empty — `matching_ids` already
+    /// handles that), plus, when there's a query, matching history entries
+    /// not already open. Does its own filtering here (rather than GTK's
+    /// separate `set_filter_func`/`invalidate_filter` mechanism, used until
+    /// this history integration) since folding in a second, differently-
+    /// sourced set of results (history, queried fresh each time) doesn't fit
+    /// a filter predicate over already-built children.
     fn rebuild_switcher_grid(self: &Rc<Self>) {
         for child in self.flowbox.children() {
             self.flowbox.remove(&child);
         }
 
+        let query = self.search_entry.text().to_string();
+        let open_matches = self.core.borrow().matching_ids(&query);
+
         {
             let core = self.core.borrow();
             for page in core.pages() {
+                if !open_matches.contains(&page.id) {
+                    continue;
+                }
                 let id = page.id.clone();
                 let title_text = {
                     let t = page.title.borrow();
@@ -331,6 +443,57 @@ impl AppState {
         add_child.add(&add_tile);
         add_child.show_all();
         self.flowbox.insert(&add_child, -1);
+
+        // History matches — only once there's a query to narrow by (an empty
+        // query would otherwise dump the entire history into the grid).
+        // Skips any entry whose URL is already an open page's, so nothing
+        // shows up twice.
+        if !query.trim().is_empty() {
+            let open_urls: Vec<String> = self.core.borrow().pages().iter().map(|p| p.current_url()).collect();
+            let history_matches = self.history.search(&query, 8).unwrap_or_else(|err| {
+                eprintln!("history search failed: {err}");
+                Vec::new()
+            });
+            for entry in history_matches {
+                if open_urls.contains(&entry.url) {
+                    continue;
+                }
+
+                let tile = gtk::Button::new();
+                tile.style_context().add_class("page-tile");
+                tile.style_context().add_class("history-tile");
+                tile.set_size_request(150, 110);
+                tile.set_can_focus(false);
+
+                let inner = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                inner.set_margin(10);
+                inner.set_valign(gtk::Align::End);
+                let title_text = if entry.title.is_empty() { "New Page".to_string() } else { entry.title.clone() };
+                let title_label = gtk::Label::new(Some(&title_text));
+                title_label.set_halign(gtk::Align::Start);
+                title_label.style_context().add_class("tile-title");
+                let domain_label = gtk::Label::new(Some(&entry.domain));
+                domain_label.set_halign(gtk::Align::Start);
+                domain_label.style_context().add_class("tile-subtitle");
+                inner.pack_start(&title_label, false, false, 0);
+                inner.pack_start(&domain_label, false, false, 0);
+                tile.add(&inner);
+
+                let app_clone = Rc::clone(self);
+                let url = entry.url.clone();
+                tile.connect_clicked(move |_| {
+                    if let Err(err) = app_clone.add_page(&url) {
+                        eprintln!("failed to open history entry: {err}");
+                    }
+                    app_clone.close_switcher();
+                });
+
+                let flow_child = gtk::FlowBoxChild::new();
+                flow_child.add(&tile);
+                flow_child.show_all();
+                self.flowbox.insert(&flow_child, -1);
+            }
+        }
     }
 
     /// Page ids in creation order — test/inspection helper.
@@ -405,90 +568,20 @@ impl AppState {
         self.address_bar.set_text(text);
         self.address_bar.emit_activate();
     }
-}
 
-/// Shows a modal "Settings" dialog for editing `AppState.settings` (start
-/// page, default search engine, loaded-pages limit). Scoped to picking the
-/// default search engine from the existing seeded list, not adding/editing
-/// entries — that's a fuller list-editor UI, left for later.
-fn show_settings_dialog(app: &Rc<AppState>, parent: &gtk::Window) {
-    let dialog = gtk::Dialog::new();
-    dialog.set_title("Settings");
-    dialog.set_transient_for(Some(parent));
-    dialog.set_modal(true);
-    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
-    dialog.add_button("Save", gtk::ResponseType::Ok);
-
-    let content = dialog.content_area();
-    content.set_margin(12);
-    content.set_spacing(8);
-
-    let (current_start_page, current_engine, current_limit) = {
-        let settings = app.settings();
-        (settings.start_page.clone(), settings.default_search_engine.clone(), settings.max_loaded_pages)
-    };
-
-    let start_page_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    start_page_row.pack_start(&gtk::Label::new(Some("Start page")), false, false, 0);
-    let start_page_entry = gtk::Entry::new();
-    start_page_entry.set_text(&current_start_page);
-    start_page_entry.set_hexpand(true);
-    start_page_row.pack_start(&start_page_entry, true, true, 0);
-    content.pack_start(&start_page_row, false, false, 0);
-
-    let engine_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    engine_row.pack_start(&gtk::Label::new(Some("Search engine")), false, false, 0);
-    let engine_combo = gtk::ComboBoxText::new();
-    for engine in &app.settings().search_engines {
-        engine_combo.append(Some(&engine.name), &engine.name);
+    /// The settings overlay's start-page field, as currently shown — test
+    /// helper for confirming `open_settings` pre-populates it from the
+    /// current `Settings` rather than leaving it stale from a previous open.
+    pub fn settings_start_page_entry_text(&self) -> String {
+        self.start_page_entry.text().to_string()
     }
-    engine_combo.set_active_id(Some(&current_engine));
-    engine_row.pack_start(&engine_combo, true, true, 0);
-    content.pack_start(&engine_row, false, false, 0);
 
-    let limit_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    limit_row.pack_start(&gtk::Label::new(Some("Loaded pages limit")), false, false, 0);
-    let unlimited_check = gtk::CheckButton::new();
-    unlimited_check.set_label("Unlimited");
-    let limit_spin = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
-    match current_limit {
-        Some(n) => {
-            unlimited_check.set_active(false);
-            limit_spin.set_value(n as f64);
-        }
-        None => {
-            unlimited_check.set_active(true);
-            limit_spin.set_sensitive(false);
-        }
+    /// Types into the settings overlay's start-page field — test helper for
+    /// driving an edit before calling `save_settings`, the same way
+    /// `address_bar_activate`/`search_activate` drive their own widgets.
+    pub fn set_settings_start_page(&self, text: &str) {
+        self.start_page_entry.set_text(text);
     }
-    {
-        let limit_spin = limit_spin.clone();
-        unlimited_check.connect_toggled(move |check| {
-            limit_spin.set_sensitive(!check.is_active());
-        });
-    }
-    limit_row.pack_start(&unlimited_check, false, false, 0);
-    limit_row.pack_start(&limit_spin, false, false, 0);
-    content.pack_start(&limit_row, false, false, 0);
-
-    dialog.show_all();
-    let response = dialog.run();
-    if response == gtk::ResponseType::Ok {
-        {
-            let mut settings = app.settings.borrow_mut();
-            settings.start_page = start_page_entry.text().to_string();
-            if let Some(id) = engine_combo.active_id() {
-                settings.default_search_engine = id.to_string();
-            }
-        }
-        let new_limit =
-            if unlimited_check.is_active() { None } else { Some(limit_spin.value_as_int().max(1) as usize) };
-        app.set_max_loaded_pages(new_limit);
-        if let Err(err) = app.settings().save(&app.profile) {
-            eprintln!("failed to save settings: {err}");
-        }
-    }
-    dialog.close();
 }
 
 /// Builds the full window + chrome (header bar, page stack, switcher overlay)
@@ -517,7 +610,12 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
               .tile-close-label { color: #ffffff; } \
               .switcher-hint { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
               .switcher-profile-label { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
-              .page-tile-unloaded { opacity: 0.5; }",
+              .page-tile-unloaded { opacity: 0.5; } \
+              .settings-box { background-color: #2e2e2c; border-radius: 10px; padding: 16px; } \
+              .settings-title { color: #ffffff; font-weight: 600; font-size: 14px; } \
+              .history-tile { background-image: none; background-color: rgba(255, 255, 255, 0.12); \
+                border: 1px dashed rgba(255, 255, 255, 0.3); box-shadow: none; border-radius: 10px; \
+                color: #fff; opacity: 0.75; }",
         );
         gtk::StyleContext::add_provider_for_screen(&screen, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
@@ -647,16 +745,84 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     switcher_overlay.add_overlay(&grid_content);
     switcher_overlay.add_overlay(&profile_label);
 
+    // --- Settings overlay: an in-window overlay (like the switcher grid
+    // above), not a modal `gtk::Dialog` — see `AppState::settings_panel`'s
+    // doc comment for why. Scoped to picking the default search engine from
+    // the existing seeded list, not adding/editing entries — that's a
+    // fuller list-editor UI, left for later.
+    let settings_scrim = gtk::EventBox::new();
+    settings_scrim.style_context().add_class("switcher-scrim");
+    settings_scrim
+        .style_context()
+        .add_provider(&scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+    let settings_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    settings_box.set_halign(gtk::Align::Center);
+    settings_box.set_valign(gtk::Align::Center);
+    settings_box.style_context().add_class("settings-box");
+    settings_box.set_margin(24);
+
+    let settings_title = gtk::Label::new(Some("Settings"));
+    settings_title.style_context().add_class("settings-title");
+    settings_title.set_halign(gtk::Align::Start);
+    settings_box.pack_start(&settings_title, false, false, 0);
+
+    let start_page_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    start_page_row.pack_start(&gtk::Label::new(Some("Start page")), false, false, 0);
+    let start_page_entry = gtk::Entry::new();
+    start_page_entry.set_hexpand(true);
+    start_page_row.pack_start(&start_page_entry, true, true, 0);
+    settings_box.pack_start(&start_page_row, false, false, 0);
+
+    let engine_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    engine_row.pack_start(&gtk::Label::new(Some("Search engine")), false, false, 0);
+    let engine_combo = gtk::ComboBoxText::new();
+    for engine in &Settings::default().search_engines {
+        engine_combo.append(Some(&engine.name), &engine.name);
+    }
+    engine_row.pack_start(&engine_combo, true, true, 0);
+    settings_box.pack_start(&engine_row, false, false, 0);
+
+    let limit_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    limit_row.pack_start(&gtk::Label::new(Some("Loaded pages limit")), false, false, 0);
+    let unlimited_check = gtk::CheckButton::new();
+    unlimited_check.set_label("Unlimited");
+    let limit_spin = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
+    {
+        let limit_spin = limit_spin.clone();
+        unlimited_check.connect_toggled(move |check| {
+            limit_spin.set_sensitive(!check.is_active());
+        });
+    }
+    limit_row.pack_start(&unlimited_check, false, false, 0);
+    limit_row.pack_start(&limit_spin, false, false, 0);
+    settings_box.pack_start(&limit_row, false, false, 0);
+
+    let settings_buttons_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    settings_buttons_row.set_halign(gtk::Align::End);
+    let settings_cancel_button = gtk::Button::with_label("Cancel");
+    let settings_save_button = gtk::Button::with_label("Save");
+    settings_buttons_row.pack_start(&settings_cancel_button, false, false, 0);
+    settings_buttons_row.pack_start(&settings_save_button, false, false, 0);
+    settings_box.pack_start(&settings_buttons_row, false, false, 0);
+
+    let settings_overlay = gtk::Overlay::new();
+    settings_overlay.add(&settings_scrim);
+    settings_overlay.add_overlay(&settings_box);
+
     let root_overlay = gtk::Overlay::new();
     root_overlay.add(&stack);
     root_overlay.add_overlay(&switcher_overlay);
+    root_overlay.add_overlay(&settings_overlay);
 
     window.add(&root_overlay);
     window.show_all();
     switcher_overlay.hide();
+    settings_overlay.hide();
     window.set_title("claude-browser");
 
     let settings = Settings::load(&profile);
+    let history = HistoryStore::open(&profile)?;
     let core = PageManager::new(settings.max_loaded_pages);
     let app = Rc::new(AppState {
         address_bar: address_bar.clone(),
@@ -664,30 +830,22 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         switcher_panel: switcher_overlay.clone().upcast::<gtk::Widget>(),
         search_entry: search_entry.clone(),
         flowbox: flowbox.clone(),
+        settings_panel: settings_overlay.clone().upcast::<gtk::Widget>(),
+        start_page_entry: start_page_entry.clone(),
+        engine_combo: engine_combo.clone(),
+        unlimited_check: unlimited_check.clone(),
+        limit_spin: limit_spin.clone(),
         core: RefCell::new(core),
         containers: RefCell::new(HashMap::new()),
         settings: RefCell::new(settings),
+        history,
         profile,
     });
 
-    let app_weak = Rc::downgrade(&app);
-    flowbox.set_filter_func(Some(Box::new(move |child: &gtk::FlowBoxChild| {
-        let Some(app) = app_weak.upgrade() else {
-            return true;
-        };
-        let name = child.widget_name();
-        if name.as_str() == "__add__" {
-            return true;
-        }
-        let text = app.search_entry.text().to_string();
-        let matches = app.core.borrow().matching_ids(&text);
-        matches.iter().any(|m| m == name.as_str())
-    })));
-
     {
-        let flowbox = flowbox.clone();
+        let app = Rc::clone(&app);
         search_entry.connect_changed(move |_| {
-            flowbox.invalidate_filter();
+            app.rebuild_switcher_grid();
         });
     }
     {
@@ -700,11 +858,25 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
             }
             match app.matching_page_ids(trimmed).as_slice() {
                 [] => {
-                    let url = resolve_address_input(trimmed, &app.settings());
-                    if let Err(err) = app.add_page(&url) {
-                        eprintln!("failed to open new page: {err}");
+                    // No open page matches — check history before treating
+                    // the typed text as a fresh URL/search: exactly one
+                    // history match opens that entry's real URL instead.
+                    match app.history.search(trimmed, 2) {
+                        Ok(matches) if matches.len() == 1 => {
+                            let url = matches[0].url.clone();
+                            if let Err(err) = app.add_page(&url) {
+                                eprintln!("failed to open history entry: {err}");
+                            }
+                            app.close_switcher();
+                        }
+                        _ => {
+                            let url = resolve_address_input(trimmed, &app.settings());
+                            if let Err(err) = app.add_page(&url) {
+                                eprintln!("failed to open new page: {err}");
+                            }
+                            app.close_switcher();
+                        }
                     }
-                    app.close_switcher();
                 }
                 [only] => app.switch_to(only),
                 _ => {}
@@ -791,9 +963,8 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     }
     {
         let app = Rc::clone(&app);
-        let window = window.clone();
         settings_button.connect_clicked(move |_| {
-            show_settings_dialog(&app, &window);
+            app.open_settings();
         });
     }
     {
@@ -801,6 +972,25 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         scrim.connect_button_press_event(move |_, _| {
             app.close_switcher();
             gtk::glib::Propagation::Stop
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        settings_scrim.connect_button_press_event(move |_, _| {
+            app.close_settings();
+            gtk::glib::Propagation::Stop
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        settings_cancel_button.connect_clicked(move |_| {
+            app.close_settings();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        settings_save_button.connect_clicked(move |_| {
+            app.save_settings();
         });
     }
     {
@@ -819,6 +1009,9 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
                 gtk::glib::Propagation::Stop
             } else if is_escape && app.is_switcher_open() {
                 app.close_switcher();
+                gtk::glib::Propagation::Stop
+            } else if is_escape && app.is_settings_open() {
+                app.close_settings();
                 gtk::glib::Propagation::Stop
             } else if ctrl && is_w {
                 app.close_page(&app.active_id());

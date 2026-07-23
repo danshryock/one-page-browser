@@ -11,8 +11,10 @@ use std::time::Instant;
 
 use render_engine::RenderEngine;
 
+mod history;
 mod profile;
 mod settings;
+pub use history::{HistoryEntry, HistoryStore};
 pub use profile::{resolve_profile_name, Profile};
 pub use settings::{SearchEngine, Settings};
 

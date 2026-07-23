@@ -5,11 +5,23 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
-wry = "0.55"
 anyhow = "1"
+
+# Only linux.rs and windows.rs (the gnu-target Win32 backend) use wry — the
+# msvc-target WinUI 3 backend (winui.rs) wraps the native
+# Microsoft.UI.Xaml.Controls.WebView2 control directly, no wry involved.
+# Excluding wry there keeps that target's dependency tree free of
+# wry/webview2-com, which it never needs.
+[target.'cfg(any(target_os = "linux", all(target_os = "windows", target_env = "gnu")))'.dependencies]
+wry = "0.55"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
 
-[target.'cfg(target_os = "windows")'.dependencies]
+[target.'cfg(all(target_os = "windows", target_env = "gnu"))'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation"] }
+
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation"] }
+windows-core = "0.62"
+winio-winui3 = { version = "0.4", features = ["UI_Composition", "UI_Xaml_Controls_Primitives", "Web_WebView2_Core"] }

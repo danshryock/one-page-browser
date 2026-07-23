@@ -272,6 +272,32 @@ fn main() -> anyhow::Result<()> {
     });
     all_ok &= check("toolbar address bar resolves multi-word input via the search engine", resolved_search_url);
 
+    // Settings overlay: shows/hides in place of a modal dialog, is mutually
+    // exclusive with the switcher grid (both are reachable from the header
+    // bar regardless of which, if either, is currently open), pre-populates
+    // from the current Settings, and Save actually persists an edit.
+    app.open_settings();
+    all_ok &= check("open_settings shows the settings overlay", app.is_settings_open());
+    all_ok &= check(
+        "open_settings pre-populates the start-page field from current settings",
+        app.settings_start_page_entry_text() == app.settings().start_page,
+    );
+
+    app.open_switcher();
+    all_ok &= check("opening the switcher while settings is open closes settings", !app.is_settings_open());
+    all_ok &= check("opening the switcher while settings is open still opens the switcher", app.is_switcher_open());
+    app.close_switcher();
+
+    app.open_settings();
+    app.open_settings(); // re-opening while already open should stay open, not toggle closed
+    all_ok &= check("opening settings while already open leaves it open", app.is_settings_open());
+
+    let edited_start_page = "https://edited-start-page.example";
+    app.set_settings_start_page(edited_start_page);
+    app.save_settings();
+    all_ok &= check("Save persists an edited start page into Settings", app.settings().start_page == edited_start_page);
+    all_ok &= check("Save closes the settings overlay", !app.is_settings_open());
+
     // Close down to zero: shouldn't panic, and should land on some fallback page.
     for id in app.page_ids() {
         app.close_page(&id);

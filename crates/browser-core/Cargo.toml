@@ -12,3 +12,8 @@ serde_json = "1"
 directories = "6"
 percent-encoding = "2"
 libsql = { version = "0.9", default-features = false, features = ["core"] }
+# libsql's Connection::execute/query are async fns; already resolved
+# transitively via libsql itself (see Cargo.lock), so this adds no new crate
+# to the build — just enough (`rt`) for HistoryStore's single-threaded
+# `Builder::new_current_thread()` to block_on each call synchronously.
+tokio = { version = "1", default-features = false, features = ["rt"] }

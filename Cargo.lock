@@ -183,6 +183,7 @@ dependencies = [
  "render-engine",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -2163,6 +2164,8 @@ dependencies = [
  "anyhow",
  "gtk",
  "windows 0.62.2",
+ "windows-core 0.62.2",
+ "winio-winui3",
  "wry",
 ]
 

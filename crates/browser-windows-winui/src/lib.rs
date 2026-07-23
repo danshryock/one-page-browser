@@ -1,92 +1,890 @@
-//! WinUI 3 (Microsoft.UI.Xaml) native chrome experiment — the fifth front
-//! end tried this session, deliberately scoped down from the other four:
-//! the goal here is only getting it to *cross-compile* from Linux, not to
-//! run it. WinUI 3 needs the real Windows App SDK runtime installed, which
-//! isn't available under Wine, so unlike `browser-wx`/`browser-windows-win32`/
-//! `browser-windows-nwg` this one has never been run at all.
+//! WinUI 3 (Microsoft.UI.Xaml) native chrome — the fifth front end this
+//! codebase has tried, and (per the user) the one going forward:
+//! `browser-wx`/`browser-windows-win32`/`browser-windows-nwg` stay in the
+//! repo but are no longer being developed. Built out to match
+//! `browser-linux-gtk3`'s feature set (multi-page browsing, a switcher grid,
+//! settings, keyboard shortcuts, profile support), using the native
+//! `Microsoft.UI.Xaml.Controls.WebView2` control (`render_engine::WebView2Engine`)
+//! rather than wry — see that module's doc comment for why.
 //!
-//! Gated on `target_env = "msvc"`, not just `target_os = "windows"` like the
-//! other Windows front ends: WinRT/COM interop (which WinUI 3 is built
-//! entirely on) needs MSVC specifically, so this crate's dependencies (see
-//! Cargo.toml) are only resolved for `x86_64-pc-windows-msvc`, not the
-//! `x86_64-pc-windows-gnu` target `browser-windows-win32`/
-//! `browser-windows-nwg` use. Gating just on `target_os` here would try to
-//! compile real code against those unresolved dependencies whenever the
-//! workspace is built for the gnu target, breaking that existing, working
-//! workflow — compiling to an empty no-op everywhere else (including
-//! windows-gnu) is what keeps a bare `cargo build`/`cross build`/`cargo build
-//! --target x86_64-pc-windows-gnu` across the whole workspace working
-//! unchanged.
+//! Gated on `target_env = "msvc"`, not just `target_os = "windows"` — see
+//! `Cargo.toml`'s comment; WinRT/COM interop needs MSVC specifically, so this
+//! crate compiles to an empty no-op everywhere else, including the
+//! `x86_64-pc-windows-gnu` target `browser-windows-win32`/`browser-windows-nwg`
+//! use.
+//!
+//! # A real gap in `winio-winui3`'s bindings: no working `KeyDown` or
+//! `Window::Closed`
+//!
+//! Checked systematically (`grep -rn "pub fn new<$"` across the whole crate
+//! to find every constructible delegate): only `RoutedEventHandler`,
+//! `TextChangedEventHandler`, `SelectionChangedEventHandler`, and a handful of
+//! others are actually implemented. `Window`'s `Closed`/`Activated`/
+//! `SizeChanged`/`VisibilityChanged` and `UIElement`'s `KeyDown`/`KeyUp` all
+//! need dedicated delegate types (`WindowEventHandler`, `KeyEventHandler`,
+//! etc.) that don't exist anywhere in the crate — only their `Remove*`
+//! accessors exist, with no way to ever `add` a handler in the first place.
+//! `KeyboardAccelerator` isn't in this crate's subset either. Button `Click`,
+//! `CheckBox` `Checked`/`Unchecked`, `ComboBox`/`TextBox`
+//! `SelectionChanged`/`TextChanged`, and `GotFocus`/`LostFocus` all *do* work.
+//!
+//! Fix: subclass the top-level `HWND` directly (`SetWindowSubclass`), the
+//! same technique already used in `browser-wx/src/titlebar/windows.rs`. See
+//! `install_hwnd_subclass` below.
 #![cfg(all(target_os = "windows", target_env = "msvc"))]
 
-/// Minimal proof-of-linkage: initializes a WinRT apartment and activates one
-/// real `Microsoft.UI.Xaml.Controls.Button` via `winio-winui3`'s generated
-/// WinRT bindings — not full app content (this crate's whole point this
-/// session is just proving it *cross-compiles*, not running it), but enough
-/// to genuinely exercise real COM/WinRT activation (`RoInitialize`,
-/// `RoActivateInstance`/`RoGetActivationFactory` under the hood), not just a
-/// dependency that happens to resolve but is never actually called.
-///
-/// The `PackageDependency::initialize_version` call below is not optional:
-/// `Microsoft.UI.Xaml.*` types (unlike plain OS-native WinRT namespaces such
-/// as `Windows.Foundation`) aren't in the OS's WinRT catalog at all until the
-/// Windows App SDK's framework package has been located and loaded via its
-/// "Dynamic Dependencies" bootstrap API — skipping this step is exactly what
-/// produces `Class not registered (0x80040154)` (`REGDB_E_CLASSNOTREG`) when
-/// activating `Button` below, since `RoGetActivationFactory` has nowhere to
-/// resolve that runtime class from. The returned `PackageDependency` must
-/// stay alive for as long as any `Microsoft.UI.Xaml` type is in use — its
-/// `Drop` unregisters the dependency.
-///
-/// This also requires the Windows App SDK runtime to actually be installed
-/// on the machine running this (e.g. via `winget install
-/// Microsoft.WindowsAppRuntime.1.7` or the redistributable installer) —
-/// something no amount of cross-compilation from Linux can substitute for,
-/// since it's resolved at genuine runtime, not link time (see this crate's
-/// module doc comment).
-///
-/// `Microsoft.UI.Xaml.Controls.Button` can't be activated as a free-standing
-/// object at all — a plain Win32 process has no XAML thread context until
-/// `Microsoft.UI.Xaml.Application::Start` sets one up (this, not a manually
-/// created `DispatcherQueueController` — that's the separate "XAML
-/// Islands"/`DesktopWindowXamlSource` hosting pattern for embedding XAML in
-/// a non-XAML window, not what a full `Application`/`Window`-based WinUI 3
-/// app uses — is the standard bootstrap `Application::Start` in the
-/// official unpackaged-desktop template does). Constructing anything
-/// `Microsoft.UI.Xaml.*` before or outside that callback is exactly what
-/// produced "The application called an interface that was marshalled for a
-/// different thread" (`RPC_E_WRONG_THREAD`): not a literal cross-thread bug
-/// in this code, but XAML having no valid context on this thread to target
-/// yet. `Start` blocks pumping messages until something calls `Exit()`, so
-/// the callback below does its one-time activation check, stashes the
-/// result, and exits immediately rather than actually running an app.
-pub fn smoke_test() -> anyhow::Result<()> {
-    use std::sync::{Arc, Mutex};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
 
-    winui3::init_apartment(winui3::ApartmentType::SingleThreaded)?;
-    let _dependency = winui3::bootstrap::PackageDependency::initialize_version(
-        winui3::bootstrap::WindowsAppSDKVersion::V2,
-    )?;
+use browser_core::{domain_of, resolve_address_input, HistoryStore, PageManager, Profile, Settings};
+use render_engine::{AssertSend, RenderEngine, WebView2Engine};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_ESCAPE, VK_F1, VK_RETURN};
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+use windows::Win32::UI::WindowsAndMessaging::{WM_DESTROY, WM_KEYDOWN, WM_NCDESTROY};
+use windows_core::HSTRING;
+use winui3::Microsoft::UI::Xaml::Controls::{
+    Button, CheckBox, ColumnDefinition, ComboBox, Grid, Orientation, RowDefinition, StackPanel, TextBlock, TextBox,
+};
+use winui3::Microsoft::UI::Xaml::{GridLength, GridUnitType, HorizontalAlignment, Thickness, VerticalAlignment, Visibility, Window};
+use winui3::IWindowNative;
 
-    let outcome: Arc<Mutex<Option<windows_core::Result<()>>>> = Arc::new(Mutex::new(None));
-    let outcome_in_callback = Arc::clone(&outcome);
+const SUBCLASS_ID: usize = 0x8b40_5757;
+const TILE_WIDTH: i32 = 150;
+const TILE_HEIGHT: i32 = 110;
+const TILE_COLUMNS: i32 = 5;
 
-    winui3::Microsoft::UI::Xaml::Application::Start(
-        &winui3::Microsoft::UI::Xaml::ApplicationInitializationCallback::new(move |_params| {
-            let result = (|| -> windows_core::Result<()> {
-                let _app = winui3::Microsoft::UI::Xaml::Application::new()?;
-                let _button = winui3::Microsoft::UI::Xaml::Controls::Button::new()?;
+pub struct AppState {
+    window: Window,
+    address_bar: TextBox,
+    address_bar_focused: Cell<bool>,
+    content_grid: Grid,
+    switcher_overlay: Grid,
+    search_box: TextBox,
+    search_box_focused: Cell<bool>,
+    tile_grid: Grid,
+    settings_overlay: Grid,
+    start_page_box: TextBox,
+    engine_combo: ComboBox,
+    unlimited_check: CheckBox,
+    limit_box: TextBox,
+    core: RefCell<PageManager<WebView2Engine>>,
+    /// Per-page container, keyed by page id — `browser_core::Page` doesn't
+    /// hold these since they're a WinUI3-only concept. Each is a plain
+    /// `Grid` (a concrete panel type, unlike the possibly-abstract base
+    /// `Panel`) hosting exactly one `WebView2Engine`, `Visibility` toggled to
+    /// show only the active page — this crate's equivalent of gtk3's `Stack`
+    /// (nothing called "Stack" exists in this bindings subset).
+    containers: RefCell<HashMap<String, Grid>>,
+    settings: RefCell<Settings>,
+    history: HistoryStore,
+    profile: Profile,
+}
+
+impl AppState {
+    pub fn settings(&self) -> std::cell::Ref<'_, Settings> {
+        self.settings.borrow()
+    }
+
+    pub fn set_max_loaded_pages(self: &Rc<Self>, limit: Option<usize>) {
+        self.settings.borrow_mut().max_loaded_pages = limit;
+        let evicted = self.core.borrow_mut().set_max_loaded_pages(limit);
+        self.unload_engines(&evicted);
+        self.rebuild_switcher_grid();
+    }
+
+    pub fn is_page_loaded(&self, id: &str) -> bool {
+        self.core.borrow().is_page_loaded(id)
+    }
+
+    /// Shows the window — called once from `main.rs` after the first page
+    /// is opened, mirroring gtk3's `window.show_all()`.
+    pub fn activate(&self) -> anyhow::Result<()> {
+        self.window.Activate()?;
+        Ok(())
+    }
+}
+
+impl AppState {
+    fn with_active<F: FnOnce(&WebView2Engine) -> anyhow::Result<()>>(&self, f: F) {
+        let core = self.core.borrow();
+        if let Some(page) = core.active() {
+            if let Some(engine) = &page.engine {
+                if let Err(err) = f(engine) {
+                    eprintln!("action failed: {err}");
+                }
+            }
+        }
+    }
+
+    pub fn add_page(self: &Rc<Self>, url: &str) -> anyhow::Result<()> {
+        let id = self.core.borrow_mut().allocate_id();
+
+        let container = Grid::new()?;
+        container.SetVisibility(Visibility::Collapsed)?;
+        self.content_grid.Children()?.Append(&container)?;
+        self.containers.borrow_mut().insert(id.clone(), container.clone());
+
+        let title = Rc::new(RefCell::new(String::new()));
+        let title_for_cb = Rc::clone(&title);
+        let app_weak = Rc::downgrade(self);
+        let id_for_cb = id.clone();
+        let engine = WebView2Engine::new(&container, url, move |new_title| {
+            *title_for_cb.borrow_mut() = new_title;
+            if let Some(app) = app_weak.upgrade() {
+                app.record_visit(&id_for_cb);
+                app.rebuild_switcher_grid();
+            }
+        })?;
+
+        let evicted = self.core.borrow_mut().insert(id.clone(), engine, title);
+        self.unload_engines(&evicted);
+
+        self.set_active(&id);
+        self.rebuild_switcher_grid();
+        Ok(())
+    }
+
+    /// Records a history visit for page `id`'s current URL/title — called
+    /// from the `on_title_changed` callback (`add_page`/`ensure_engine_loaded`),
+    /// the one place both are available together. Best-effort: logs rather
+    /// than propagating.
+    fn record_visit(&self, id: &str) {
+        let core = self.core.borrow();
+        let Some(page) = core.page(id) else { return };
+        let url = page.current_url();
+        let title = page.title.borrow().clone();
+        drop(core);
+        if let Err(err) = self.history.record_visit(&url, &title) {
+            eprintln!("failed to record history visit: {err}");
+        }
+    }
+
+    /// Tears down the engines for pages `PageManager` just flipped to
+    /// unloaded. Unlike `WryEngine` (dropped, which destroys its widget via
+    /// wry's own `Drop`), `WebView2Engine` needs an explicit `close()` call —
+    /// see that type's doc comment.
+    fn unload_engines(&self, ids: &[String]) {
+        let mut core = self.core.borrow_mut();
+        let containers = self.containers.borrow();
+        for id in ids {
+            if let Some(page) = core.page_mut(id) {
+                if let Some(engine) = page.engine.take() {
+                    page.last_url = engine.current_url().unwrap_or_else(|_| page.last_url.clone());
+                    if let Some(container) = containers.get(id) {
+                        if let Err(err) = engine.close(container) {
+                            eprintln!("failed to close unloaded page's WebView2: {err}");
+                        }
+                    }
+                    drop(engine);
+                }
+            }
+        }
+    }
+
+    fn ensure_engine_loaded(self: &Rc<Self>, id: &str) {
+        let needs_engine = self.core.borrow().page(id).map(|p| p.engine.is_none()).unwrap_or(false);
+        if !needs_engine {
+            return;
+        }
+        let Some(container) = self.containers.borrow().get(id).cloned() else { return };
+        let (url, title) = {
+            let core = self.core.borrow();
+            let Some(page) = core.page(id) else { return };
+            (page.last_url.clone(), Rc::clone(&page.title))
+        };
+
+        let title_for_cb = Rc::clone(&title);
+        let app_weak = Rc::downgrade(self);
+        let id_for_cb = id.to_string();
+        match WebView2Engine::new(&container, &url, move |new_title| {
+            *title_for_cb.borrow_mut() = new_title;
+            if let Some(app) = app_weak.upgrade() {
+                app.record_visit(&id_for_cb);
+                app.rebuild_switcher_grid();
+            }
+        }) {
+            Ok(engine) => self.core.borrow_mut().install_engine(id, engine),
+            Err(err) => eprintln!("failed to reload unloaded page: {err}"),
+        }
+    }
+
+    fn set_active(self: &Rc<Self>, id: &str) {
+        self.ensure_engine_loaded(id);
+        self.core.borrow_mut().set_active(id);
+        for (other_id, container) in self.containers.borrow().iter() {
+            let _ = container.SetVisibility(if other_id == id { Visibility::Visible } else { Visibility::Collapsed });
+        }
+        if let Some(page) = self.core.borrow().page(id) {
+            let _ = self.address_bar.SetText(&HSTRING::from(page.current_url()));
+        }
+    }
+
+    pub fn open_switcher(self: &Rc<Self>) {
+        let _ = self.search_box.SetText(&HSTRING::new());
+        self.rebuild_switcher_grid();
+        let _ = self.content_grid.SetIsHitTestVisible(false);
+        let _ = self.switcher_overlay.SetVisibility(Visibility::Visible);
+    }
+
+    pub fn close_switcher(&self) {
+        let _ = self.switcher_overlay.SetVisibility(Visibility::Collapsed);
+        let _ = self.content_grid.SetIsHitTestVisible(true);
+    }
+
+    pub fn open_settings(self: &Rc<Self>) {
+        let settings = self.settings.borrow();
+        let _ = self.start_page_box.SetText(&HSTRING::from(&settings.start_page));
+        for (index, engine) in settings.search_engines.iter().enumerate() {
+            if engine.name == settings.default_search_engine {
+                let _ = self.engine_combo.SetSelectedIndex(index as i32);
+            }
+        }
+        match settings.max_loaded_pages {
+            Some(n) => {
+                if let Ok(v) = boxed_bool(false) {
+                    let _ = self.unlimited_check.SetIsChecked(&v);
+                }
+                let _ = self.limit_box.SetText(&HSTRING::from(n.to_string()));
+                let _ = self.limit_box.SetIsHitTestVisible(true);
+            }
+            None => {
+                if let Ok(v) = boxed_bool(true) {
+                    let _ = self.unlimited_check.SetIsChecked(&v);
+                }
+                let _ = self.limit_box.SetIsHitTestVisible(false);
+            }
+        }
+        drop(settings);
+        let _ = self.content_grid.SetIsHitTestVisible(false);
+        let _ = self.settings_overlay.SetVisibility(Visibility::Visible);
+    }
+
+    pub fn close_settings(&self) {
+        let _ = self.settings_overlay.SetVisibility(Visibility::Collapsed);
+        let _ = self.content_grid.SetIsHitTestVisible(true);
+    }
+
+    pub fn save_settings(self: &Rc<Self>) {
+        let unlimited = self.unlimited_check.IsChecked().ok().and_then(|r| r.Value().ok()).unwrap_or(false);
+        let new_limit = if unlimited {
+            None
+        } else {
+            self.limit_box
+                .Text()
+                .ok()
+                .and_then(|t| t.to_string().parse::<usize>().ok())
+                .map(|n| n.max(1))
+        };
+
+        {
+            let mut settings = self.settings.borrow_mut();
+            if let Ok(text) = self.start_page_box.Text() {
+                settings.start_page = text.to_string();
+            }
+            if let Ok(index) = self.engine_combo.SelectedIndex() {
+                if index >= 0 {
+                    if let Some(engine) = settings.search_engines.get(index as usize) {
+                        settings.default_search_engine = engine.name.clone();
+                    }
+                }
+            }
+        }
+        self.set_max_loaded_pages(new_limit);
+        if let Err(err) = self.settings().save(&self.profile) {
+            eprintln!("failed to save settings: {err}");
+        }
+        self.close_settings();
+    }
+
+    fn matching_page_ids(&self, query: &str) -> Vec<String> {
+        self.core.borrow().matching_ids(query)
+    }
+
+    pub fn switch_to(self: &Rc<Self>, id: &str) {
+        self.set_active(id);
+        self.close_switcher();
+    }
+
+    pub fn close_page(self: &Rc<Self>, id: &str) {
+        let was_active = self.core.borrow().active_id() == id;
+
+        self.core.borrow_mut().remove(id);
+        if let Some(container) = self.containers.borrow_mut().remove(id) {
+            let _ = self.content_grid.Children().and_then(|c| {
+                let mut index = 0u32;
+                if c.IndexOf(&container, &mut index)? {
+                    c.RemoveAt(index)?;
+                }
                 Ok(())
-            })();
-            *outcome_in_callback.lock().unwrap() = Some(result);
-            winui3::Microsoft::UI::Xaml::Application::Current()?.Exit()
-        }),
-    )?;
+            });
+        }
 
-    outcome
-        .lock()
-        .unwrap()
-        .take()
-        .expect("Application::Start callback never ran")?;
+        if was_active {
+            let next_id = self.core.borrow().pages().first().map(|p| p.id.clone());
+            match next_id {
+                Some(nid) => self.set_active(&nid),
+                None => {
+                    let start_page = self.settings.borrow().start_page.clone();
+                    if let Err(err) = self.add_page(&start_page) {
+                        eprintln!("failed to open replacement page: {err}");
+                    }
+                }
+            }
+        }
+        self.rebuild_switcher_grid();
+    }
+
+    /// Rebuilds the switcher's tile grid from scratch — open pages matching
+    /// the search box's current text (or all of them, if empty —
+    /// `matching_ids` already handles that; this filtering is itself new,
+    /// fixing a real gap where typing previously did nothing to the visible
+    /// tiles here, unlike gtk3's `FlowBox` filtering), plus, when there's a
+    /// query, matching history entries not already open. No `WrapPanel`/
+    /// `GridView` binding exists in this crate's subset, so tiles are laid
+    /// out by hand into a fixed `TILE_COLUMNS`-wide grid — and since
+    /// `FrameworkElement::SizeChanged` has no working `add` accessor either
+    /// (see this module's doc comment), the column count can't react to the
+    /// actual window width the way gtk3's `FlowBox` does; it's a fixed
+    /// constant instead. A known, honest simplification, not an oversight.
+    fn rebuild_switcher_grid(self: &Rc<Self>) {
+        let Ok(children) = self.tile_grid.Children() else { return };
+        let _ = children.Clear();
+        let Ok(row_defs) = self.tile_grid.RowDefinitions() else { return };
+        let _ = row_defs.Clear();
+
+        let query = self.search_box.Text().map(|t| t.to_string()).unwrap_or_default();
+        let open_matches = self.core.borrow().matching_ids(&query);
+
+        // History matches — only once there's a query to narrow by (an
+        // empty query would otherwise dump the entire history into the
+        // grid). Skips any entry whose URL is already an open page's.
+        let history_matches: Vec<browser_core::HistoryEntry> = if query.trim().is_empty() {
+            Vec::new()
+        } else {
+            let open_urls: Vec<String> = self.core.borrow().pages().iter().map(|p| p.current_url()).collect();
+            self.history
+                .search(&query, 8)
+                .unwrap_or_else(|err| {
+                    eprintln!("history search failed: {err}");
+                    Vec::new()
+                })
+                .into_iter()
+                .filter(|entry| !open_urls.contains(&entry.url))
+                .collect()
+        };
+
+        let tile_count = open_matches.len() + 1 + history_matches.len(); // +1 for the trailing add-tile
+        let row_count = ((tile_count as i32) + TILE_COLUMNS - 1) / TILE_COLUMNS;
+        for _ in 0..row_count.max(1) {
+            if let Ok(row) = RowDefinition::new() {
+                let _ = row.SetHeight(GridLength { Value: TILE_HEIGHT as f64, GridUnitType: GridUnitType::Pixel });
+                let _ = row_defs.Append(&row);
+            }
+        }
+
+        let mut index = 0i32;
+        {
+            let core = self.core.borrow();
+            for page in core.pages() {
+                if !open_matches.contains(&page.id) {
+                    continue;
+                }
+                let id = page.id.clone();
+                let title_text = {
+                    let t = page.title.borrow();
+                    if t.is_empty() { "New Page".to_string() } else { t.clone() }
+                };
+                let url = page.current_url();
+                let domain = domain_of(&url);
+                let domain_text = if page.loaded { domain } else { format!("{domain} \u{b7} unloaded") };
+
+                if let Ok(tile) = build_tile(&title_text, &domain_text) {
+                    let _ = Grid::SetRow(&tile, index / TILE_COLUMNS);
+                    let _ = Grid::SetColumn(&tile, index % TILE_COLUMNS);
+                    let _ = children.Append(&tile);
+
+                    let app_clone = Rc::clone(self);
+                    let id_clone = id.clone();
+                    let state = AssertSend((app_clone, id_clone));
+                    let _ = tile.Click(&winui3::Microsoft::UI::Xaml::RoutedEventHandler::new(move |_, _| {
+                        let state = &state;
+                        let (app, id) = &state.0;
+                        app.switch_to(id);
+                        Ok(())
+                    }));
+                }
+                index += 1;
+            }
+        }
+
+        if let Ok(add_tile) = build_add_tile() {
+            let _ = Grid::SetRow(&add_tile, index / TILE_COLUMNS);
+            let _ = Grid::SetColumn(&add_tile, index % TILE_COLUMNS);
+            let _ = children.Append(&add_tile);
+
+            let app_clone = Rc::clone(self);
+            let state = AssertSend(app_clone);
+            let _ = add_tile.Click(&winui3::Microsoft::UI::Xaml::RoutedEventHandler::new(move |_, _| {
+                let state = &state;
+                let app = &state.0;
+                let start_page = app.settings.borrow().start_page.clone();
+                if let Err(err) = app.add_page(&start_page) {
+                    eprintln!("failed to open new page: {err}");
+                }
+                app.close_switcher();
+                Ok(())
+            }));
+        }
+        index += 1;
+
+        for entry in history_matches {
+            let title_text = if entry.title.is_empty() { "New Page".to_string() } else { entry.title.clone() };
+            let domain_text = format!("{} \u{b7} history", entry.domain);
+            if let Ok(tile) = build_tile(&title_text, &domain_text) {
+                let _ = Grid::SetRow(&tile, index / TILE_COLUMNS);
+                let _ = Grid::SetColumn(&tile, index % TILE_COLUMNS);
+                let _ = children.Append(&tile);
+
+                let app_clone = Rc::clone(self);
+                let url = entry.url.clone();
+                let state = AssertSend((app_clone, url));
+                let _ = tile.Click(&winui3::Microsoft::UI::Xaml::RoutedEventHandler::new(move |_, _| {
+                    let state = &state;
+                    let (app, url) = &state.0;
+                    if let Err(err) = app.add_page(url) {
+                        eprintln!("failed to open history entry: {err}");
+                    }
+                    app.close_switcher();
+                    Ok(())
+                }));
+            }
+            index += 1;
+        }
+    }
+}
+
+/// One switcher tile: a title/domain label pair, as a `Button` (`Click`
+/// works via the implemented `RoutedEventHandler` delegate — a plain `Grid`
+/// with `Tapped` doesn't, see this module's doc comment). Unlike gtk3's
+/// tile, this doesn't render `page.color` as a flat background: this
+/// crate's bindings have no `SolidColorBrush` at all (not feature-gated,
+/// genuinely absent from `Microsoft.UI.Xaml.Media` here) and no other brush
+/// type suits a flat per-page color, so per-page color-coding is dropped for
+/// this pass rather than faked. Also no close ("×") button on the tile
+/// itself — Ctrl+W closes the active page instead.
+fn build_tile(title: &str, domain: &str) -> anyhow::Result<Button> {
+    let tile = Button::new()?;
+    tile.SetWidth(TILE_WIDTH as f64)?;
+    tile.SetHeight(TILE_HEIGHT as f64)?;
+
+    let inner = StackPanel::new()?;
+    inner.SetOrientation(Orientation::Vertical)?;
+    inner.SetVerticalAlignment(VerticalAlignment::Bottom)?;
+    inner.SetMargin(Thickness { Left: 10.0, Top: 10.0, Right: 10.0, Bottom: 10.0 })?;
+
+    let title_label = TextBlock::new()?;
+    title_label.SetText(&HSTRING::from(title))?;
+    inner.Children()?.Append(&title_label)?;
+
+    let domain_label = TextBlock::new()?;
+    domain_label.SetText(&HSTRING::from(domain))?;
+    inner.Children()?.Append(&domain_label)?;
+
+    tile.SetContent(&inner)?;
+    Ok(tile)
+}
+
+fn build_add_tile() -> anyhow::Result<Button> {
+    let button = Button::new()?;
+    button.SetWidth(TILE_WIDTH as f64)?;
+    button.SetHeight(TILE_HEIGHT as f64)?;
+    let label = TextBlock::new()?;
+    label.SetText(&HSTRING::from("+"))?;
+    label.SetHorizontalTextAlignment(winui3::Microsoft::UI::Xaml::TextAlignment::Center)?;
+    button.SetContent(&label)?;
+    Ok(button)
+}
+
+/// `CheckBox::SetIsChecked` takes a boxed, nullable `IReference<bool>` (WinRT
+/// has no plain non-nullable-bool setter for it), not a plain `bool`.
+fn boxed_bool(value: bool) -> anyhow::Result<windows::Foundation::IReference<bool>> {
+    let boxed = windows::Foundation::PropertyValue::CreateBoolean(value)?;
+    Ok(windows_core::Interface::cast(&boxed)?)
+}
+
+
+fn icon_button(label: &str) -> anyhow::Result<Button> {
+    let button = Button::new()?;
+    let text = TextBlock::new()?;
+    text.SetText(&HSTRING::from(label))?;
+    button.SetContent(&text)?;
+    Ok(button)
+}
+
+/// Builds the full window + chrome (custom title bar, page host, switcher and
+/// settings overlays) and wires up all handlers. Does not create any page —
+/// call `app.add_page(&app.settings().start_page.clone())` afterward.
+pub fn build_window_and_app(profile: Profile) -> anyhow::Result<Rc<AppState>> {
+    let window = Window::new()?;
+    window.SetTitle(&HSTRING::from("claude-browser"))?;
+    if let Ok(app_window) = window.AppWindow() {
+        let _ = app_window.Resize(windows::Graphics::SizeInt32 { Width: 1024, Height: 768 });
+    }
+
+    let root_grid = Grid::new()?;
+    let row_defs = root_grid.RowDefinitions()?;
+    let toolbar_row = RowDefinition::new()?;
+    toolbar_row.SetHeight(GridLength { Value: 0.0, GridUnitType: GridUnitType::Auto })?;
+    row_defs.Append(&toolbar_row)?;
+    let content_row = RowDefinition::new()?;
+    content_row.SetHeight(GridLength { Value: 0.0, GridUnitType: GridUnitType::Star })?;
+    row_defs.Append(&content_row)?;
+
+    // --- Toolbar row (also the custom title bar's draggable surface) ---
+    let toolbar = StackPanel::new()?;
+    toolbar.SetOrientation(Orientation::Horizontal)?;
+    toolbar.SetHeight(40.0)?;
+    Grid::SetRow(&toolbar, 0)?;
+
+    let back_button = icon_button("\u{25c0}")?;
+    let forward_button = icon_button("\u{25b6}")?;
+    let reload_button = icon_button("\u{27f3}")?;
+    let switcher_toggle = icon_button("\u{229e}")?;
+    let settings_button = icon_button("\u{2699}")?;
+
+    let address_bar = TextBox::new()?;
+    address_bar.SetWidth(500.0)?;
+    address_bar.SetHorizontalAlignment(HorizontalAlignment::Stretch)?;
+
+    toolbar.Children()?.Append(&back_button)?;
+    toolbar.Children()?.Append(&forward_button)?;
+    toolbar.Children()?.Append(&reload_button)?;
+    toolbar.Children()?.Append(&address_bar)?;
+    toolbar.Children()?.Append(&switcher_toggle)?;
+    toolbar.Children()?.Append(&settings_button)?;
+    root_grid.Children()?.Append(&toolbar)?;
+
+    // --- Content row: page host + switcher overlay + settings overlay ---
+    let content_grid = Grid::new()?;
+    Grid::SetRow(&content_grid, 1)?;
+    root_grid.Children()?.Append(&content_grid)?;
+
+    // No dimming scrim behind this overlay (unlike gtk3's): this crate's
+    // bindings have no `SolidColorBrush`/other constructible flat-color
+    // brush at all, so there's nothing to set `Background` to (see
+    // `build_tile`'s doc comment for the same gap).
+    let switcher_overlay = Grid::new()?;
+    Grid::SetRow(&switcher_overlay, 1)?;
+    switcher_overlay.SetVisibility(Visibility::Collapsed)?;
+    root_grid.Children()?.Append(&switcher_overlay)?;
+
+    let switcher_content = StackPanel::new()?;
+    switcher_content.SetOrientation(Orientation::Vertical)?;
+    switcher_content.SetHorizontalAlignment(HorizontalAlignment::Center)?;
+    switcher_content.SetMargin(Thickness { Left: 0.0, Top: 40.0, Right: 0.0, Bottom: 0.0 })?;
+    switcher_overlay.Children()?.Append(&switcher_content)?;
+
+    let search_box = TextBox::new()?;
+    search_box.SetWidth(400.0)?;
+    search_box.SetPlaceholderText(&HSTRING::from("Type to filter open pages\u{2026}"))?;
+    switcher_content.Children()?.Append(&search_box)?;
+
+    let tile_grid = Grid::new()?;
+    let tile_columns = tile_grid.ColumnDefinitions()?;
+    for _ in 0..TILE_COLUMNS {
+        let col = ColumnDefinition::new()?;
+        col.SetWidth(GridLength { Value: 1.0, GridUnitType: GridUnitType::Star })?;
+        tile_columns.Append(&col)?;
+    }
+    tile_grid.SetMargin(Thickness { Left: 24.0, Top: 16.0, Right: 24.0, Bottom: 16.0 })?;
+    switcher_content.Children()?.Append(&tile_grid)?;
+
+    let profile_label = TextBlock::new()?;
+    profile_label.SetText(&HSTRING::from(&profile.name))?;
+    profile_label.SetHorizontalAlignment(HorizontalAlignment::Right)?;
+    Grid::SetRow(&profile_label, 1)?;
+    root_grid.Children()?.Append(&profile_label)?;
+
+    // --- Settings overlay ---
+    let settings_overlay = Grid::new()?;
+    Grid::SetRow(&settings_overlay, 1)?;
+    settings_overlay.SetVisibility(Visibility::Collapsed)?;
+    root_grid.Children()?.Append(&settings_overlay)?;
+
+    let settings_panel = StackPanel::new()?;
+    settings_panel.SetOrientation(Orientation::Vertical)?;
+    settings_panel.SetHorizontalAlignment(HorizontalAlignment::Center)?;
+    settings_panel.SetVerticalAlignment(VerticalAlignment::Center)?;
+    settings_panel.SetWidth(360.0)?;
+    settings_overlay.Children()?.Append(&settings_panel)?;
+
+    let start_page_label = TextBlock::new()?;
+    start_page_label.SetText(&HSTRING::from("Start page"))?;
+    settings_panel.Children()?.Append(&start_page_label)?;
+    let start_page_box = TextBox::new()?;
+    settings_panel.Children()?.Append(&start_page_box)?;
+
+    let engine_label = TextBlock::new()?;
+    engine_label.SetText(&HSTRING::from("Search engine"))?;
+    settings_panel.Children()?.Append(&engine_label)?;
+    let engine_combo = ComboBox::new()?;
+    for engine in &Settings::default().search_engines {
+        let item = winui3::Microsoft::UI::Xaml::Controls::ComboBoxItem::new()?;
+        let label = TextBlock::new()?;
+        label.SetText(&HSTRING::from(&engine.name))?;
+        item.SetContent(&label)?;
+        engine_combo.Items()?.Append(&item)?;
+    }
+    settings_panel.Children()?.Append(&engine_combo)?;
+
+    let unlimited_check = CheckBox::new()?;
+    let unlimited_label = TextBlock::new()?;
+    unlimited_label.SetText(&HSTRING::from("Unlimited loaded pages"))?;
+    unlimited_check.SetContent(&unlimited_label)?;
+    settings_panel.Children()?.Append(&unlimited_check)?;
+
+    let limit_label = TextBlock::new()?;
+    limit_label.SetText(&HSTRING::from("Loaded pages limit"))?;
+    settings_panel.Children()?.Append(&limit_label)?;
+    let limit_box = TextBox::new()?;
+    settings_panel.Children()?.Append(&limit_box)?;
+
+    let buttons_row = StackPanel::new()?;
+    buttons_row.SetOrientation(Orientation::Horizontal)?;
+    buttons_row.SetHorizontalAlignment(HorizontalAlignment::Right)?;
+    let cancel_button = icon_button("Cancel")?;
+    let save_button = icon_button("Save")?;
+    buttons_row.Children()?.Append(&cancel_button)?;
+    buttons_row.Children()?.Append(&save_button)?;
+    settings_panel.Children()?.Append(&buttons_row)?;
+
+    window.SetContent(&root_grid)?;
+    window.SetExtendsContentIntoTitleBar(true)?;
+    window.SetTitleBar(&toolbar)?;
+
+    let settings = Settings::load(&profile);
+    let history = HistoryStore::open(&profile)?;
+    let core = PageManager::new(settings.max_loaded_pages);
+    let app = Rc::new(AppState {
+        window: window.clone(),
+        address_bar: address_bar.clone(),
+        address_bar_focused: Cell::new(false),
+        content_grid,
+        switcher_overlay,
+        search_box: search_box.clone(),
+        search_box_focused: Cell::new(false),
+        tile_grid,
+        settings_overlay,
+        start_page_box,
+        engine_combo,
+        unlimited_check,
+        limit_box,
+        core: RefCell::new(core),
+        containers: RefCell::new(HashMap::new()),
+        settings: RefCell::new(settings),
+        history,
+        profile,
+    });
+
+    wire_events(&app, &back_button, &forward_button, &reload_button, &address_bar, &switcher_toggle, &settings_button, &search_box, &cancel_button, &save_button)?;
+    install_hwnd_subclass(&app, &window)?;
+
+    Ok(app)
+}
+
+// One-off wiring call with one widget per parameter (mirrors gtk3's
+// `build_window_and_app`, which wires each widget inline instead) — a
+// bundling struct would only be constructed here, once, so it wouldn't
+// pay for itself.
+#[allow(clippy::too_many_arguments)]
+fn wire_events(
+    app: &Rc<AppState>,
+    back_button: &Button,
+    forward_button: &Button,
+    reload_button: &Button,
+    address_bar: &TextBox,
+    switcher_toggle: &Button,
+    settings_button: &Button,
+    search_box: &TextBox,
+    cancel_button: &Button,
+    save_button: &Button,
+) -> anyhow::Result<()> {
+    use winui3::Microsoft::UI::Xaml::RoutedEventHandler;
+
+    macro_rules! on_click {
+        ($button:expr, $app:ident, $body:expr) => {{
+            let state = AssertSend(Rc::clone(app));
+            $button.Click(&RoutedEventHandler::new(move |_, _| {
+                let state = &state;
+                let $app = &state.0;
+                $body;
+                Ok(())
+            }))?;
+        }};
+    }
+
+    on_click!(back_button, app, app.with_active(|p| p.go_back()));
+    on_click!(forward_button, app, app.with_active(|p| p.go_forward()));
+    on_click!(reload_button, app, app.with_active(|p| p.reload()));
+    on_click!(switcher_toggle, app, {
+        if app.switcher_overlay.Visibility()? == Visibility::Visible {
+            app.close_switcher();
+        } else {
+            app.open_switcher();
+        }
+    });
+    on_click!(settings_button, app, app.open_settings());
+    on_click!(cancel_button, app, app.close_settings());
+    on_click!(save_button, app, app.save_settings());
+
+    {
+        let state = AssertSend(Rc::clone(app));
+        address_bar.GotFocus(&RoutedEventHandler::new(move |_, _| {
+            let state = &state;
+            state.0.address_bar_focused.set(true);
+            Ok(())
+        }))?;
+    }
+    {
+        let state = AssertSend(Rc::clone(app));
+        address_bar.LostFocus(&RoutedEventHandler::new(move |_, _| {
+            let state = &state;
+            state.0.address_bar_focused.set(false);
+            Ok(())
+        }))?;
+    }
+    {
+        let state = AssertSend(Rc::clone(app));
+        search_box.GotFocus(&RoutedEventHandler::new(move |_, _| {
+            let state = &state;
+            state.0.search_box_focused.set(true);
+            Ok(())
+        }))?;
+    }
+    {
+        let state = AssertSend(Rc::clone(app));
+        search_box.LostFocus(&RoutedEventHandler::new(move |_, _| {
+            let state = &state;
+            state.0.search_box_focused.set(false);
+            Ok(())
+        }))?;
+    }
+    {
+        let state = AssertSend(Rc::clone(app));
+        search_box.TextChanged(&winui3::Microsoft::UI::Xaml::Controls::TextChangedEventHandler::new(move |_, _| {
+            let state = &state;
+            state.0.rebuild_switcher_grid();
+            Ok(())
+        }))?;
+    }
+
     Ok(())
+}
+
+/// See this module's doc comment: `Window` has no working `Closed` event and
+/// `UIElement` has no working `KeyDown` event in this crate's bindings, so
+/// both go through a raw `HWND` subclass instead — the same technique
+/// already used in `browser-wx/src/titlebar/windows.rs`. Handles:
+/// - `WM_KEYDOWN`: F1 / Ctrl+T / Ctrl+L / Ctrl+W / Escape shortcuts, and
+///   Enter navigating the address bar or activating the switcher's search
+///   box (via the `*_focused` flags kept up to date by `GotFocus`/`LostFocus`,
+///   which *do* work).
+/// - `WM_DESTROY`: calls `Application::Current()?.Exit()`, replacing the
+///   unusable `Window::Closed` as the app-quit trigger.
+/// - `WM_NCDESTROY`: removes the subclass (standard teardown discipline).
+fn install_hwnd_subclass(app: &Rc<AppState>, window: &Window) -> anyhow::Result<()> {
+    let native = windows_core::Interface::cast::<IWindowNative>(window)?;
+    let hwnd = unsafe { native.WindowHandle()? };
+
+    let state = Box::new(Rc::clone(app));
+    let ref_data = Box::into_raw(state) as usize;
+    unsafe {
+        let _ = SetWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID, ref_data);
+    }
+    Ok(())
+}
+
+unsafe extern "system" fn subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    ref_data: usize,
+) -> LRESULT {
+    let app = unsafe { &*(ref_data as *const Rc<AppState>) };
+
+    match msg {
+        WM_KEYDOWN => {
+            let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+            let vk = wparam.0 as u16;
+            if vk == VK_F1.0 || (ctrl && vk == b'T' as u16) || (ctrl && vk == b'L' as u16) {
+                app.open_switcher();
+            } else if vk == VK_ESCAPE.0 {
+                if app.switcher_overlay.Visibility().ok() == Some(Visibility::Visible) {
+                    app.close_switcher();
+                } else if app.settings_overlay.Visibility().ok() == Some(Visibility::Visible) {
+                    app.close_settings();
+                }
+            } else if ctrl && vk == b'W' as u16 {
+                let id = app.core.borrow().active_id().to_string();
+                app.close_page(&id);
+            } else if vk == VK_RETURN.0 {
+                if app.address_bar_focused.get() {
+                    if let Ok(text) = app.address_bar.Text() {
+                        let url = resolve_address_input(&text.to_string(), &app.settings());
+                        app.with_active(|p| p.navigate(&url));
+                    }
+                } else if app.search_box_focused.get() {
+                    if let Ok(text) = app.search_box.Text() {
+                        let trimmed = text.to_string();
+                        let trimmed = trimmed.trim();
+                        if !trimmed.is_empty() {
+                            match app.matching_page_ids(trimmed).as_slice() {
+                                [] => {
+                                    // No open page matches — check history
+                                    // before treating the typed text as a
+                                    // fresh URL/search: exactly one history
+                                    // match opens that entry's real URL
+                                    // instead.
+                                    match app.history.search(trimmed, 2) {
+                                        Ok(matches) if matches.len() == 1 => {
+                                            if let Err(err) = app.add_page(&matches[0].url) {
+                                                eprintln!("failed to open history entry: {err}");
+                                            }
+                                            app.close_switcher();
+                                        }
+                                        _ => {
+                                            let url = resolve_address_input(trimmed, &app.settings());
+                                            if let Err(err) = app.add_page(&url) {
+                                                eprintln!("failed to open new page: {err}");
+                                            }
+                                            app.close_switcher();
+                                        }
+                                    }
+                                }
+                                [only] => app.switch_to(only),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+        WM_DESTROY => {
+            let _ = winui3::Microsoft::UI::Xaml::Application::Current().and_then(|a| a.Exit());
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+        WM_NCDESTROY => {
+            // Reclaim the leaked `Box<Rc<AppState>>` before removing the
+            // subclass, mirroring `SetWindowSubclass`'s standard teardown.
+            let _ = unsafe { Box::from_raw(ref_data as *mut Rc<AppState>) };
+            let _ = unsafe { RemoveWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID) };
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+        _ => unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) },
+    }
 }

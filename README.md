@@ -27,6 +27,22 @@ with `browser-linux-gtk3` (switcher grid, settings dialog, profile label, keyboa
 cross-compiled and running under Wine, chrome and real WebView2 content both — see "browser-wx: building
 and running" below for the (different, `zig`-based) cross-compile path this one needs.
 
+A fifth front end, `crates/browser-windows-winui`, uses WinUI 3 (`Microsoft.UI.Xaml`) — the modern
+Fluent-design Windows toolkit, via the [`winio-winui3`](https://github.com/compio-rs/winio3-rs) bindings
+crate. Unlike every other Windows front end here, it doesn't use `render-engine`'s wry-based `WryEngine` at
+all — it wraps WinUI 3's own native `Microsoft.UI.Xaml.Controls.WebView2` XAML control directly
+(`render-engine`'s `WebView2Engine`, gated to the `x86_64-pc-windows-msvc` target), since it's a real XAML
+`FrameworkElement` that participates in ordinary Grid/StackPanel layout with no manual resize plumbing
+needed. At feature parity with `browser-linux-gtk3` (multi-page browsing, a switcher grid, settings,
+keyboard shortcuts, profile support), with two notable, binding-driven simplifications: the settings surface
+is an in-window overlay rather than a modal dialog (avoids `ContentDialog`'s async `ShowAsync`, since this
+app is deliberately synchronous throughout), and per-page tile color-coding is dropped (this crate's WinUI 3
+bindings have no constructible flat-color brush type at all). It's cross-compile-only — see
+"browser-windows-winui: building" below — the Windows App SDK runtime it needs isn't available under Wine,
+so unlike every other frontend here, it's never actually been run, only cross-compiled, cross-linked, and
+inspected. `browser-wx`/`browser-windows-win32`/`browser-windows-nwg` remain in the repo but are no longer
+under active development — `browser-windows-winui` is the Windows front end going forward.
+
 ## Installing dependencies
 
 ### Rust
@@ -257,6 +273,27 @@ external plugin as `cargo-<name> <name> <rest>` — so even though `cargo-zigbui
 ```sh
 .cargo/run-wx-wine.sh
 ```
+
+### browser-windows-winui: building
+
+This one is cross-compile-only — it's never been run, even under Wine, since WinUI 3 needs the real Windows
+App SDK runtime installed. Cross-compiling to `x86_64-pc-windows-msvc` needs
+[`cargo-xwin`](https://github.com/rust-cross/cargo-xwin) (which downloads and caches the Windows SDK + MSVC
+CRT via [`xwin`](https://github.com/Jake-Shadle/xwin) on first use) plus a system `clang`/`lld`/`llvm-lib`
+install (`cargo-xwin` doesn't bundle its own compiler toolchain the way `cargo-zigbuild` does) — on Ubuntu,
+the `clang-21`/`lld-21`/`llvm-21` packages provide these, just not symlinked under their plain,
+unversioned names by default.
+
+```sh
+cargo install cargo-xwin
+rustup target add x86_64-pc-windows-msvc
+
+cargo build-windows-winui   # alias for: cargo xwin build --target x86_64-pc-windows-msvc -p browser-windows-winui
+```
+
+The `.cargo/config.toml`'s `[env]` section pins `CC`/`AR` for this target to absolute paths under
+`/usr/lib/llvm-21/bin/` so this works from any terminal without needing `clang`/`llvm-lib` on `PATH`
+manually — if your system's LLVM install lives elsewhere, update those paths.
 
 ## Testing
 

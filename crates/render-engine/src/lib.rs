@@ -15,7 +15,12 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::WryEngine;
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", target_env = "gnu"))]
 mod windows;
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", target_env = "gnu"))]
 pub use windows::WryEngine;
+
+#[cfg(all(target_os = "windows", target_env = "msvc"))]
+mod winui;
+#[cfg(all(target_os = "windows", target_env = "msvc"))]
+pub use winui::{AssertSend, WebView2Engine};
