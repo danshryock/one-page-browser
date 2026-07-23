@@ -113,6 +113,16 @@ cargo run-win32  # same as `cargo run --target x86_64-pc-windows-gnu -p browser-
 cargo run-nwg    # same as `cargo run --target x86_64-pc-windows-gnu -p browser-windows-nwg`
 ```
 
+### Launching with a URL
+
+`browser-linux-gtk3`/`browser-windows-winui` both accept a bare URL argument (the shape a real OS-level
+"open with"/default-browser handoff would use, e.g. `browser-linux-gtk3 https://example.com`) — instead of
+opening the normal window straight away, this shows a small standalone chooser first: the URL, a profile
+field pre-filled from `--profile` (or `"default"`), and Open/Cancel. Picking a profile and clicking Open
+opens the real browser window scoped to that profile with the URL as its first page. Handing the URL off to
+an already-running instance of the browser, and a separate "choose which installed browser to use at all"
+picker, are both later work, not implemented yet.
+
 ### Cross-compiling and running the Windows crates from Linux
 
 Useful for testing the native window/chrome/message-loop code without a Windows machine — WebView2 itself

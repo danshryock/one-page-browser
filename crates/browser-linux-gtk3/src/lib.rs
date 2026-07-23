@@ -7,11 +7,11 @@
 //! `target_os = "windows"`.
 #![cfg(target_os = "linux")]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use browser_core::{domain_of, resolve_address_input, HistoryStore, PageManager, Profile, Settings};
+use browser_core::{domain_of, list_profile_names, resolve_address_input, HistoryStore, PageManager, Profile, Settings};
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
 
@@ -1023,4 +1023,100 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     }
 
     Ok((window, app))
+}
+
+/// Shows a small standalone window for launching with a URL argument (e.g.
+/// from the OS's "open with"/default-browser handoff) — lets the user
+/// confirm/pick which profile to open it in before the real browser window
+/// appears. `default_profile` pre-fills the field (whatever `--profile`
+/// resolved to, or `"default"`).
+///
+/// Assumes `gtk::init()` has already been called, and that the caller will
+/// still call `gtk::main()` afterward regardless of which path (this or
+/// `build_window_and_app`) ends up running — this only ever shows a window,
+/// never drives its own event loop.
+pub fn show_external_link_chooser(url: String, default_profile: String) -> anyhow::Result<()> {
+    let window = gtk::Window::new(gtk::WindowType::Toplevel);
+    window.set_title("Open link");
+    window.set_default_size(480, 200);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin(16);
+
+    let url_label = gtk::Label::new(Some(&url));
+    url_label.set_line_wrap(true);
+    url_label.set_halign(gtk::Align::Start);
+    url_label.set_selectable(true);
+    content.pack_start(&url_label, false, false, 0);
+
+    let profile_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    profile_row.pack_start(&gtk::Label::new(Some("Open in profile")), false, false, 0);
+    let profile_combo = gtk::ComboBoxText::with_entry();
+    for name in list_profile_names() {
+        profile_combo.append_text(&name);
+    }
+    if let Some(entry) = profile_combo.child().and_then(|w| w.downcast::<gtk::Entry>().ok()) {
+        entry.set_text(&default_profile);
+    }
+    profile_row.pack_start(&profile_combo, true, true, 0);
+    content.pack_start(&profile_row, false, false, 0);
+
+    let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    button_row.set_halign(gtk::Align::End);
+    let cancel_button = gtk::Button::with_label("Cancel");
+    let open_button = gtk::Button::with_label("Open");
+    button_row.pack_start(&cancel_button, false, false, 0);
+    button_row.pack_start(&open_button, false, false, 0);
+    content.pack_start(&button_row, false, false, 0);
+
+    window.add(&content);
+    window.show_all();
+
+    // Closing this window (native close button, or Cancel) should quit the
+    // app — but successfully opening the main window and closing this one
+    // as part of that handoff must not also quit. `transitioning` tells
+    // `delete-event` which case it is.
+    let transitioning = Rc::new(Cell::new(false));
+
+    {
+        let transitioning = Rc::clone(&transitioning);
+        window.connect_delete_event(move |_, _| {
+            if !transitioning.get() {
+                gtk::main_quit();
+            }
+            gtk::glib::Propagation::Proceed
+        });
+    }
+    {
+        let window = window.clone();
+        cancel_button.connect_clicked(move |_| {
+            window.close();
+        });
+    }
+    {
+        let transitioning = Rc::clone(&transitioning);
+        let window = window.clone();
+        open_button.connect_clicked(move |_| {
+            let profile_name = profile_combo
+                .child()
+                .and_then(|w| w.downcast::<gtk::Entry>().ok())
+                .map(|entry| entry.text().to_string())
+                .unwrap_or_default();
+            let profile = Profile::new(profile_name);
+
+            transitioning.set(true);
+            window.close();
+
+            match build_window_and_app(profile) {
+                Ok((_main_window, app)) => {
+                    if let Err(err) = app.add_page(&url) {
+                        eprintln!("failed to open the launch URL: {err}");
+                    }
+                }
+                Err(err) => eprintln!("failed to open the browser window: {err}"),
+            }
+        });
+    }
+
+    Ok(())
 }

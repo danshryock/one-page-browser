@@ -37,7 +37,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use browser_core::{domain_of, resolve_address_input, HistoryStore, PageManager, Profile, Settings};
+use browser_core::{domain_of, list_profile_names, resolve_address_input, HistoryStore, PageManager, Profile, Settings};
 use render_engine::{AssertSend, RenderEngine, WebView2Engine};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_ESCAPE, VK_F1, VK_RETURN};
@@ -51,6 +51,7 @@ use winui3::Microsoft::UI::Xaml::{GridLength, GridUnitType, HorizontalAlignment,
 use winui3::IWindowNative;
 
 const SUBCLASS_ID: usize = 0x8b40_5757;
+const CHOOSER_SUBCLASS_ID: usize = 0x8b40_5758;
 const TILE_WIDTH: i32 = 150;
 const TILE_HEIGHT: i32 = 110;
 const TILE_COLUMNS: i32 = 5;
@@ -883,6 +884,165 @@ unsafe extern "system" fn subclass_proc(
             // subclass, mirroring `SetWindowSubclass`'s standard teardown.
             let _ = unsafe { Box::from_raw(ref_data as *mut Rc<AppState>) };
             let _ = unsafe { RemoveWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID) };
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+        _ => unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Shows a small standalone window for launching with a URL argument (e.g.
+/// from the OS's "open with"/default-browser handoff) — lets the user
+/// confirm/pick which profile to open it in before the real browser window
+/// appears. `default_profile` pre-fills the field (whatever `--profile`
+/// resolved to, or `"default"`).
+///
+/// Runs inside the same `Application::Start` callback/message pump as the
+/// normal path — this only ever builds and activates a window, it doesn't
+/// drive its own event loop.
+pub fn show_external_link_chooser(url: String, default_profile: String) -> anyhow::Result<()> {
+    let window = Window::new()?;
+    window.SetTitle(&HSTRING::from("Open link"))?;
+    if let Ok(app_window) = window.AppWindow() {
+        let _ = app_window.Resize(windows::Graphics::SizeInt32 { Width: 480, Height: 240 });
+    }
+
+    let root = StackPanel::new()?;
+    root.SetOrientation(Orientation::Vertical)?;
+    root.SetMargin(Thickness { Left: 16.0, Top: 16.0, Right: 16.0, Bottom: 16.0 })?;
+
+    let url_label = TextBlock::new()?;
+    url_label.SetText(&HSTRING::from(&url))?;
+    root.Children()?.Append(&url_label)?;
+
+    let profile_label = TextBlock::new()?;
+    profile_label.SetText(&HSTRING::from("Open in profile"))?;
+    root.Children()?.Append(&profile_label)?;
+
+    let profile_box = TextBox::new()?;
+    profile_box.SetText(&HSTRING::from(&default_profile))?;
+    root.Children()?.Append(&profile_box)?;
+
+    // Existing profiles as one-click suggestions — not an editable ComboBox
+    // (its `IsEditable`/`TextSubmitted` do check out as real, working
+    // bindings here, but given how many *other* supposedly-standard events
+    // in this crate have turned out to be silently broken, this sticks to
+    // the plainest already-proven controls instead of leaning on one more
+    // not-yet-exercised event path for a chooser this simple).
+    let suggestions_row = StackPanel::new()?;
+    suggestions_row.SetOrientation(Orientation::Horizontal)?;
+    for name in list_profile_names() {
+        let button = Button::new()?;
+        let label = TextBlock::new()?;
+        label.SetText(&HSTRING::from(&name))?;
+        button.SetContent(&label)?;
+
+        let profile_box = profile_box.clone();
+        button.Click(&winui3::Microsoft::UI::Xaml::RoutedEventHandler::new(move |_, _| {
+            let _ = profile_box.SetText(&HSTRING::from(&name));
+            Ok(())
+        }))?;
+        suggestions_row.Children()?.Append(&button)?;
+    }
+    root.Children()?.Append(&suggestions_row)?;
+
+    let button_row = StackPanel::new()?;
+    button_row.SetOrientation(Orientation::Horizontal)?;
+    button_row.SetHorizontalAlignment(HorizontalAlignment::Right)?;
+    let cancel_button = Button::new()?;
+    let cancel_label = TextBlock::new()?;
+    cancel_label.SetText(&HSTRING::from("Cancel"))?;
+    cancel_button.SetContent(&cancel_label)?;
+    let open_button = Button::new()?;
+    let open_label = TextBlock::new()?;
+    open_label.SetText(&HSTRING::from("Open"))?;
+    open_button.SetContent(&open_label)?;
+    button_row.Children()?.Append(&cancel_button)?;
+    button_row.Children()?.Append(&open_button)?;
+    root.Children()?.Append(&button_row)?;
+
+    window.SetContent(&root)?;
+
+    // Closing this window (native close button, or Cancel) should quit the
+    // app — but successfully opening the main window and closing this one
+    // as part of that handoff must not also quit. `transitioning` tells the
+    // WM_DESTROY handler below which case it is (same `Window::Closed`-gap
+    // workaround as the main window's own `install_hwnd_subclass`).
+    let transitioning = Rc::new(Cell::new(false));
+    install_chooser_hwnd_subclass(&window, Rc::clone(&transitioning))?;
+
+    {
+        let window = window.clone();
+        cancel_button.Click(&winui3::Microsoft::UI::Xaml::RoutedEventHandler::new(move |_, _| {
+            let _ = window.Close();
+            Ok(())
+        }))?;
+    }
+    {
+        let window = window.clone();
+        let profile_box = profile_box.clone();
+        let state = AssertSend(transitioning);
+        open_button.Click(&winui3::Microsoft::UI::Xaml::RoutedEventHandler::new(move |_, _| {
+            let state = &state;
+            let profile_name = profile_box.Text().map(|t| t.to_string()).unwrap_or_default();
+            let profile = Profile::new(profile_name);
+
+            state.0.set(true);
+            let _ = window.Close();
+
+            match build_window_and_app(profile) {
+                Ok(app) => {
+                    if let Err(err) = app.add_page(&url) {
+                        eprintln!("failed to open the launch URL: {err}");
+                    }
+                    if let Err(err) = app.activate() {
+                        eprintln!("failed to activate the browser window: {err}");
+                    }
+                }
+                Err(err) => eprintln!("failed to open the browser window: {err}"),
+            }
+            Ok(())
+        }))?;
+    }
+
+    window.Activate()?;
+    Ok(())
+}
+
+/// Same technique as `install_hwnd_subclass`, for the chooser window: only
+/// handles `WM_DESTROY` (checking `transitioning` before deciding whether to
+/// quit) and `WM_NCDESTROY` (teardown) — the chooser has no keyboard
+/// shortcuts or address bar of its own to route through `WM_KEYDOWN`.
+fn install_chooser_hwnd_subclass(window: &Window, transitioning: Rc<Cell<bool>>) -> anyhow::Result<()> {
+    let native = windows_core::Interface::cast::<IWindowNative>(window)?;
+    let hwnd = unsafe { native.WindowHandle()? };
+
+    let state = Box::new(transitioning);
+    let ref_data = Box::into_raw(state) as usize;
+    unsafe {
+        let _ = SetWindowSubclass(hwnd, Some(chooser_subclass_proc), CHOOSER_SUBCLASS_ID, ref_data);
+    }
+    Ok(())
+}
+
+unsafe extern "system" fn chooser_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    ref_data: usize,
+) -> LRESULT {
+    match msg {
+        WM_DESTROY => {
+            let transitioning = unsafe { &*(ref_data as *const Rc<Cell<bool>>) };
+            if !transitioning.get() {
+                let _ = winui3::Microsoft::UI::Xaml::Application::Current().and_then(|a| a.Exit());
+            }
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+        WM_NCDESTROY => {
+            let _ = unsafe { Box::from_raw(ref_data as *mut Rc<Cell<bool>>) };
+            let _ = unsafe { RemoveWindowSubclass(hwnd, Some(chooser_subclass_proc), CHOOSER_SUBCLASS_ID) };
             unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
         }
         _ => unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) },

@@ -4,7 +4,7 @@
 //! subdirectory rather than special-casing a legacy top-level path — there's
 //! no shipped install with existing unscoped data to stay compatible with.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
@@ -64,6 +64,61 @@ pub fn resolve_profile_name<I: IntoIterator<Item = String>>(args: I) -> String {
         }
     }
     "default".to_string()
+}
+
+/// Pulls the first positional (non-flag) argument out — used for launching
+/// with a URL (e.g. from the OS's "open with"/default-browser handoff):
+/// `browser-linux-gtk3 https://example.com`. Skips `argv[0]` and
+/// `--profile`'s consumed value so a launch like `program --profile work
+/// https://example.com` still finds the URL, not `"work"`. Any other `--foo`
+/// flag is skipped generically (not enumerated by name) so this doesn't need
+/// updating every time a new flag is added elsewhere. Returns the raw token
+/// unchanged — unlike `resolve_address_input`, this isn't run through
+/// bare-domain/search-query resolution: a real external-link launch always
+/// hands over a fully-qualified URL, and resolving one would need a
+/// profile's `Settings` before a profile has even been picked.
+pub fn resolve_url_argument<I: IntoIterator<Item = String>>(args: I) -> Option<String> {
+    let mut args = args.into_iter().skip(1); // skip argv[0]
+    while let Some(arg) = args.next() {
+        if arg == "--profile" {
+            args.next(); // consume its value too, not the URL
+            continue;
+        }
+        if arg.starts_with("--") {
+            continue;
+        }
+        return Some(arg);
+    }
+    None
+}
+
+/// Names of every profile that has ever been used (existing subdirectories
+/// under the config directory each profile's `settings_path` is scoped
+/// under), plus `"default"` even on a fresh install where it doesn't exist
+/// on disk yet. Used to populate the external-link chooser's profile picker.
+pub fn list_profile_names() -> Vec<String> {
+    match directories::ProjectDirs::from("", "", "claude-browser") {
+        Some(dirs) => list_profile_names_in(dirs.config_dir()),
+        None => vec!["default".to_string()],
+    }
+}
+
+/// Split out from `list_profile_names` so tests can scan a throwaway
+/// directory instead of the real user config directory — same reasoning as
+/// `Settings::load`/`load_from` and `HistoryStore::open`/`open_at`.
+fn list_profile_names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    if !names.iter().any(|n| n == "default") {
+        names.push("default".to_string());
+    }
+    names.sort();
+    names
 }
 
 #[cfg(test)]
@@ -133,5 +188,70 @@ mod tests {
     #[test]
     fn default_profile_is_named_default() {
         assert_eq!(Profile::default().name, "default");
+    }
+
+    #[test]
+    fn resolve_url_argument_finds_a_bare_positional_argument() {
+        assert_eq!(resolve_url_argument(args(&["program", "https://example.com"])), Some("https://example.com".to_string()));
+    }
+
+    #[test]
+    fn resolve_url_argument_returns_none_when_absent() {
+        assert_eq!(resolve_url_argument(args(&["program"])), None);
+        assert_eq!(resolve_url_argument(args(&["program", "--profile", "work"])), None);
+        assert_eq!(resolve_url_argument(args(&[])), None);
+    }
+
+    #[test]
+    fn resolve_url_argument_skips_the_profile_flags_value() {
+        assert_eq!(
+            resolve_url_argument(args(&["program", "--profile", "work", "https://example.com"])),
+            Some("https://example.com".to_string()),
+            "the URL, not the --profile flag's value, should be returned"
+        );
+        assert_eq!(
+            resolve_url_argument(args(&["program", "--profile=work", "https://example.com"])),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_url_argument_skips_other_flags_generically() {
+        assert_eq!(
+            resolve_url_argument(args(&["program", "--verbose", "https://example.com"])),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    fn make_dir(root: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(root.join(name)).unwrap();
+    }
+
+    #[test]
+    fn list_profile_names_in_always_includes_default() {
+        let root = std::env::temp_dir().join(format!("claude-browser-test-profiles-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        make_dir(&root, ""); // just the root itself, no profile subdirs yet
+        assert_eq!(list_profile_names_in(&root), vec!["default".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_profile_names_in_finds_existing_profile_directories() {
+        let root = std::env::temp_dir().join(format!("claude-browser-test-profiles-existing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        make_dir(&root, "work");
+        make_dir(&root, "personal");
+        assert_eq!(list_profile_names_in(&root), vec!["default".to_string(), "personal".to_string(), "work".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_profile_names_in_does_not_duplicate_an_existing_default_directory() {
+        let root = std::env::temp_dir().join(format!("claude-browser-test-profiles-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        make_dir(&root, "default");
+        assert_eq!(list_profile_names_in(&root), vec!["default".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

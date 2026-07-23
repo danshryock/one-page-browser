@@ -27,19 +27,24 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
 fn run() -> anyhow::Result<()> {
-    use browser_core::{resolve_profile_name, Profile};
-    use browser_windows_winui::build_window_and_app;
+    use browser_core::{resolve_profile_name, resolve_url_argument, Profile};
+    use browser_windows_winui::{build_window_and_app, show_external_link_chooser};
 
     // Establishes the WinRT `Microsoft.UI.Xaml.Application` singleton for
     // this thread — required before any `Microsoft.UI.Xaml` object (the
     // window, its controls) can be activated.
     let _app_instance = winui3::Microsoft::UI::Xaml::Application::new()?;
 
-    let profile = Profile::new(resolve_profile_name(std::env::args()));
-    let app = build_window_and_app(profile)?;
-    let start_page = app.settings().start_page.clone();
-    app.add_page(&start_page)?;
-    app.activate()?;
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(url) = resolve_url_argument(args.clone()) {
+        show_external_link_chooser(url, resolve_profile_name(args))?;
+    } else {
+        let profile = Profile::new(resolve_profile_name(args));
+        let app = build_window_and_app(profile)?;
+        let start_page = app.settings().start_page.clone();
+        app.add_page(&start_page)?;
+        app.activate()?;
+    }
     Ok(())
 }
 
