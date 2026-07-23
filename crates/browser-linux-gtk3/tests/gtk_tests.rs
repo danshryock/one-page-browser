@@ -678,3 +678,27 @@ fn search_engine_management_add_and_remove() {
         cleanup_test_profile(&profile);
     });
 }
+
+#[test]
+fn switcher_grid_shows_bookmark_matches_not_currently_open() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("grid-bookmarks");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        // Bookmarked directly rather than opened as a real page, so it can
+        // never pick up a history entry (which would make the search match
+        // via the history-tile path instead — already covered by its own
+        // existing test) — isolates the bookmark-tile path specifically.
+        app.bookmark_url_for_test("https://bookmarked-not-open.example", "Bookmarked Not Open");
+        assert!(app.bookmarked_urls().contains(&"https://bookmarked-not-open.example".to_string()));
+
+        app.open_switcher();
+        app.set_address_bar_text("bookmarked not open");
+        assert!(
+            wait_until(|| app.switcher_grid_has_tile_with_class("bookmark-tile")),
+            "searching for a bookmarked page should show it as a bookmark tile in the grid"
+        );
+
+        cleanup_test_profile(&profile);
+    });
+}

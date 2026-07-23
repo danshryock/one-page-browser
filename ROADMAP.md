@@ -54,6 +54,9 @@ build/run instructions.
 - Search engine management (`browser-core` + `browser-linux-gtk3`): add/remove custom search engines from the
   settings overlay, plus a fix for the default-engine dropdown always showing a fixed list instead of the
   live per-profile `Settings::search_engines`. See `summaries/search-engine-management.md`.
+- The switcher grid now shows matching bookmarks (not just open pages/history) when searching, with a
+  distinct `.bookmark-tile` style — deduped against open-page and history matches for the same URL. See
+  `summaries/show-bookmarks-in-switcher-grid.md`.
 
 ## Next
 
@@ -78,4 +81,3 @@ Nothing specifically queued — pick the next item from the backlog below.
   native vector search
 - Add passphrase support to profiles, use native encryption
   features of libsql if available.
-- Show bookmarks when searching the grid

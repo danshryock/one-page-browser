@@ -674,6 +674,19 @@ impl AppState {
         self.bookmarks.borrow().all().iter().map(|b| b.url.clone()).collect()
     }
 
+    /// Bookmarks a URL directly, without needing to open it as a real page
+    /// first — test helper for exercising the bookmark-match path in
+    /// `rebuild_switcher_grid` in isolation from the history-match path:
+    /// opening a page normally also ends up recording a history visit once
+    /// its title loads, which would make a search match via history
+    /// instead (already covered by its own existing test).
+    pub fn bookmark_url_for_test(&self, url: &str, title: &str) {
+        self.bookmarks.borrow_mut().add(url, title, now_unix());
+        if let Err(err) = self.bookmarks.borrow().save(&self.profile) {
+            eprintln!("failed to save bookmarks: {err}");
+        }
+    }
+
     /// Number of rows currently shown in the keybindings editor (folded into
     /// the settings overlay — see `open_settings`'s doc comment) — test/
     /// inspection helper confirming it's actually populated when settings
@@ -956,61 +969,130 @@ impl AppState {
         add_child.show_all();
         self.flowbox.insert(&add_child, -1);
 
-        // History matches — only once there's a query to narrow by (an empty
-        // query would otherwise dump the entire history into the grid).
-        // Skips any entry whose URL is already an open page's, so nothing
-        // shows up twice.
+        // History and bookmark matches — only once there's a query to narrow
+        // by (an empty query would otherwise dump the entire history/every
+        // bookmark into the grid). Skips any URL already shown as an open
+        // page's tile, or already shown as a history tile (a bookmarked page
+        // that's also in history would otherwise appear twice) — `shown_urls`
+        // accumulates across both loops for this.
         if !query.trim().is_empty() {
             let open_urls: Vec<String> = self.core.borrow().pages().iter().map(|p| p.current_url()).collect();
+            let mut shown_urls = open_urls.clone();
+
             let history_matches = self.history.search(&query, 8).unwrap_or_else(|err| {
                 eprintln!("history search failed: {err}");
                 Vec::new()
             });
             for entry in history_matches {
-                if open_urls.contains(&entry.url) {
+                if shown_urls.contains(&entry.url) {
                     continue;
                 }
+                shown_urls.push(entry.url.clone());
 
-                let tile = gtk::Button::new();
-                tile.style_context().add_class("page-tile");
-                tile.style_context().add_class("history-tile");
-                tile.set_size_request(150, 110);
-                tile.set_can_focus(false);
-
-                let inner = gtk::Box::new(gtk::Orientation::Vertical, 2);
-                inner.set_margin(10);
-                inner.set_valign(gtk::Align::End);
                 let title_text = if entry.title.is_empty() { "New Page".to_string() } else { entry.title.clone() };
-                let title_label = gtk::Label::new(Some(&title_text));
-                title_label.set_halign(gtk::Align::Start);
-                title_label.style_context().add_class("tile-title");
-                let domain_label = gtk::Label::new(Some(&entry.domain));
-                domain_label.set_halign(gtk::Align::Start);
-                domain_label.style_context().add_class("tile-subtitle");
-                inner.pack_start(&title_label, false, false, 0);
-                inner.pack_start(&domain_label, false, false, 0);
-                tile.add(&inner);
-
-                let app_clone = Rc::clone(self);
                 let url = entry.url.clone();
-                tile.connect_clicked(move |_| {
-                    if let Err(err) = app_clone.add_page(&url) {
+                let flow_child = self.build_search_result_tile("history-tile", &title_text, &entry.domain, move |app| {
+                    if let Err(err) = app.add_page(&url) {
                         eprintln!("failed to open history entry: {err}");
                     }
-                    app_clone.close_switcher();
+                    app.close_switcher();
                 });
+                self.flowbox.insert(&flow_child, -1);
+            }
 
-                let flow_child = gtk::FlowBoxChild::new();
-                flow_child.add(&tile);
-                flow_child.show_all();
+            let bookmark_matches: Vec<(String, String, String)> = self
+                .bookmarks
+                .borrow()
+                .search(&query)
+                .into_iter()
+                .take(8)
+                .map(|b| (b.url.clone(), b.title.clone(), b.domain.clone()))
+                .collect();
+            for (url, title, domain) in bookmark_matches {
+                if shown_urls.contains(&url) {
+                    continue;
+                }
+                shown_urls.push(url.clone());
+
+                let title_text = if title.is_empty() { "New Page".to_string() } else { title };
+                let flow_child = self.build_search_result_tile("bookmark-tile", &title_text, &domain, move |app| {
+                    if let Err(err) = app.add_page(&url) {
+                        eprintln!("failed to open bookmark: {err}");
+                    }
+                    app.close_switcher();
+                });
                 self.flowbox.insert(&flow_child, -1);
             }
         }
     }
 
+    /// Builds one switcher-grid tile for a history or bookmark search
+    /// result — same shape as an open-page tile but without a close button,
+    /// tagged with `extra_css_class` (`"history-tile"`/`"bookmark-tile"`) so
+    /// the two read as visually distinct from open pages and each other.
+    /// `on_click` runs when the tile is clicked (open the entry and close
+    /// the switcher).
+    fn build_search_result_tile(
+        self: &Rc<Self>,
+        extra_css_class: &str,
+        title_text: &str,
+        domain: &str,
+        on_click: impl Fn(&Rc<Self>) + 'static,
+    ) -> gtk::FlowBoxChild {
+        let tile = gtk::Button::new();
+        tile.style_context().add_class("page-tile");
+        tile.style_context().add_class(extra_css_class);
+        tile.set_size_request(150, 110);
+        tile.set_can_focus(false);
+
+        let inner = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        inner.set_margin(10);
+        inner.set_valign(gtk::Align::End);
+        let title_label = gtk::Label::new(Some(title_text));
+        title_label.set_halign(gtk::Align::Start);
+        title_label.style_context().add_class("tile-title");
+        let domain_label = gtk::Label::new(Some(domain));
+        domain_label.set_halign(gtk::Align::Start);
+        domain_label.style_context().add_class("tile-subtitle");
+        inner.pack_start(&title_label, false, false, 0);
+        inner.pack_start(&domain_label, false, false, 0);
+        tile.add(&inner);
+
+        let app_clone = Rc::clone(self);
+        tile.connect_clicked(move |_| on_click(&app_clone));
+
+        let flow_child = gtk::FlowBoxChild::new();
+        flow_child.add(&tile);
+        flow_child.show_all();
+        flow_child
+    }
+
     /// Page ids in creation order — test/inspection helper.
     pub fn page_ids(&self) -> Vec<String> {
         self.core.borrow().page_ids()
+    }
+
+    /// Number of tiles currently shown in the switcher grid (open pages +
+    /// the "+" add-tile + any history/bookmark search-result tiles) — test/
+    /// inspection helper.
+    pub fn switcher_grid_tile_count(&self) -> usize {
+        self.flowbox.children().len()
+    }
+
+    /// Whether any tile currently in the switcher grid carries
+    /// `css_class` (e.g. `"bookmark-tile"`/`"history-tile"`) — test/
+    /// inspection helper for confirming a specific *kind* of tile is
+    /// present, since the aggregate tile count alone can't distinguish
+    /// "a bookmark tile appeared" from "an open-page tile that used to
+    /// match the empty query no longer matches this one and dropped out".
+    pub fn switcher_grid_has_tile_with_class(&self, css_class: &str) -> bool {
+        self.flowbox.children().iter().any(|child| {
+            child
+                .downcast_ref::<gtk::FlowBoxChild>()
+                .and_then(|fbc| fbc.child())
+                .map(|widget| widget.style_context().has_class(css_class))
+                .unwrap_or(false)
+        })
     }
 
     /// Currently active page id — test/inspection helper.
@@ -1237,6 +1319,9 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
               .history-tile { background-image: none; background-color: rgba(255, 255, 255, 0.12); \
                 border: 1px dashed rgba(255, 255, 255, 0.3); box-shadow: none; border-radius: 10px; \
                 color: #fff; opacity: 0.75; } \
+              .bookmark-tile { background-image: none; background-color: rgba(212, 175, 55, 0.18); \
+                border: 1px dashed rgba(212, 175, 55, 0.5); box-shadow: none; border-radius: 10px; \
+                color: #fff; opacity: 0.85; } \
               .settings-box label:not(.settings-title) { color: rgba(255, 255, 255, 0.92); } \
               .settings-box button.flat, .settings-box button.flat:hover { \
                 background-image: none; background-color: transparent; } \
