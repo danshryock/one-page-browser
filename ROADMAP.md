@@ -23,6 +23,16 @@ build/run instructions.
   test harness spawning a fresh thread per `#[test]` even under `--test-threads=1`. Fixed with a single
   persistent worker thread that owns GTK for the whole process; each test sends its body there and blocks for
   the result.
+- Unified search/URL bar (`browser-core` + `browser-linux-gtk3`) — the switcher grid's separate search box is
+  gone; the toolbar address bar now doubles as the switcher's search box while it's open (cleared/focused on
+  open, filters the grid on every keystroke, Enter does the switcher's search-activate behavior), and is
+  restored to the active page's URL on close without a selection. `browser-windows-winui` untouched (was
+  never scoped to it).
+- Bookmarks (`browser_core::Bookmarks`, a small per-profile JSON file — deliberately not `HistoryStore`'s
+  SQLite treatment, since bookmarks stay small and are edited rarely) + a `browser-linux-gtk3` toolbar
+  star-toggle button and a bookmarks overlay (same overlay pattern as settings/switcher/profile-picker/
+  keybindings), with a new `ToggleBookmark`/`OpenBookmarks` pair of keybindable actions.
+  `browser-windows-winui` untouched (was never scoped to it).
 
 ## Next
 
@@ -31,11 +41,10 @@ Nothing specifically queued — pick the next item from the backlog below.
 ## Backlog (not yet started, roughly in the order raised)
 
 - macOS: native chrome via AppKit, following the same `RenderEngine`-trait pattern as the other front ends.
-- Unified search/URL bar — fold the switcher grid's separate search box into the toolbar address bar
-  instead of keeping two.
 - Ctrl+Enter to force-open a new page even when the typed text matches an existing open page/history entry
   (today, a single match always switches to it instead).
-- Bookmarks.
+- `browser-windows-winui`: unified search/URL bar and bookmarks, matching what `browser-linux-gtk3` now has
+  (both landed there only, per scope — see "Done" above).
 - Private/incognito/guest profile.
 - Page screenshotting.
 - Reader mode.

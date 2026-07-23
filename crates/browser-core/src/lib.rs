@@ -11,10 +11,12 @@ use std::time::Instant;
 
 use render_engine::RenderEngine;
 
+mod bookmarks;
 mod history;
 mod keybindings;
 mod profile;
 mod settings;
+pub use bookmarks::{Bookmark, Bookmarks};
 pub use history::{HistoryEntry, HistoryStore};
 pub use keybindings::{Action, KeyChord, Keybindings};
 pub use profile::{launch_new_profile_process, list_profile_names, resolve_profile_name, resolve_url_argument, Profile};

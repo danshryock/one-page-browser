@@ -159,7 +159,7 @@ fn test_profile(name: &str) -> Profile {
 /// — both need removing, or `HistoryStore::open`'s `history.db` is left
 /// behind under the data dir even after the config-dir side is cleaned up.
 fn cleanup_test_profile(profile: &Profile) {
-    for path in [profile.settings_path(), profile.history_db_path()].into_iter().flatten() {
+    for path in [profile.settings_path(), profile.history_db_path(), profile.bookmarks_path()].into_iter().flatten() {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
@@ -461,6 +461,78 @@ fn closing_every_page_leaves_one_fallback() {
             app.close_page(&id);
         }
         assert_eq!(app.page_ids().len(), 1, "closing every page should leave exactly one fallback page instead of zero");
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn unified_address_bar_clears_on_open_and_restores_on_close() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("unified-address-bar");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        let url_a = fixture_url("page_a.html");
+        app.add_page(&url_a).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())));
+
+        // The address bar doubles as the switcher's search box: opening the
+        // switcher should clear it (ready for a filter), not still show the
+        // active page's URL.
+        app.open_switcher();
+        assert_eq!(app.address_bar_text(), "", "open_switcher should clear the address bar for filtering");
+
+        // Typing a filter and then closing WITHOUT selecting anything (e.g.
+        // Escape) should put the active page's URL back — otherwise the
+        // toolbar would be left showing a stale filter string instead of
+        // where the user actually is.
+        app.set_address_bar_text("some filter text");
+        app.close_switcher();
+        assert_eq!(
+            app.address_bar_text(),
+            url_a,
+            "closing the switcher without a selection should restore the active page's URL"
+        );
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn bookmarks_toggle_and_overlay() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("bookmarks");
+        let url_a = fixture_url("page_a.html");
+        let url_b = fixture_url("page_b.html");
+
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&url_a).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())));
+        assert!(!app.is_active_bookmarked(), "a freshly opened page shouldn't start bookmarked");
+
+        app.toggle_bookmark_for_active();
+        assert!(app.is_active_bookmarked(), "toggling should bookmark the active page");
+        assert_eq!(app.bookmarked_urls(), vec![url_a.clone()]);
+
+        app.toggle_bookmark_for_active();
+        assert!(!app.is_active_bookmarked(), "toggling again should un-bookmark it");
+        assert!(app.bookmarked_urls().is_empty());
+
+        app.toggle_bookmark_for_active();
+        app.add_page(&url_b).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url_b.as_str())));
+        assert!(!app.is_active_bookmarked(), "switching to a different, unbookmarked page shouldn't show it as bookmarked");
+
+        // The bookmarks overlay is mutually exclusive with the others, same
+        // as settings/profile-picker/keybindings.
+        app.open_settings();
+        app.open_bookmarks();
+        assert!(!app.is_settings_open(), "opening bookmarks while settings is open should close settings");
+        assert!(app.is_bookmarks_open(), "open_bookmarks should show the bookmarks overlay");
+        assert!(!app.is_background_page_interactive(), "open_bookmarks should make the background page stack insensitive");
+
+        app.close_bookmarks();
+        assert!(!app.is_bookmarks_open());
+        assert!(app.is_background_page_interactive(), "closing bookmarks should restore background page interactivity");
 
         cleanup_test_profile(&profile);
     });

@@ -10,19 +10,26 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use browser_core::{
-    domain_of, list_profile_names, resolve_address_input, Action, HistoryStore, KeyChord, Keybindings, PageManager, Profile,
-    Settings,
+    domain_of, list_profile_names, resolve_address_input, Action, Bookmarks, HistoryStore, KeyChord, Keybindings, PageManager,
+    Profile, Settings,
 };
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
 
 pub struct AppState {
+    /// Doubles as the switcher grid's search box: while the switcher is
+    /// open, typing here filters the tile grid (open pages + history)
+    /// instead of doing anything to the active page, and Enter does the
+    /// switcher's search-activate behavior instead of navigating — see
+    /// `open_switcher`/`close_switcher` and the `connect_changed`/
+    /// `connect_activate` wiring in `build_window_and_app`. One widget for
+    /// both roles, not two, per the "unified search/URL bar" design.
     address_bar: gtk::Entry,
     stack: gtk::Stack,
     switcher_panel: gtk::Widget,
-    search_entry: gtk::SearchEntry,
     flowbox: gtk::FlowBox,
     /// The settings overlay's root widget — an in-window overlay rather than
     /// a modal `gtk::Dialog` (matching `browser-windows-winui`'s settings
@@ -52,6 +59,16 @@ pub struct AppState {
     /// to become that action's new binding — checked first, ahead of normal
     /// shortcut dispatch, by the window's `key-press-event` handler.
     listening_for: Cell<Option<Action>>,
+    /// The bookmarks overlay's root widget — same in-window-overlay pattern
+    /// as the other four.
+    bookmarks_panel: gtk::Widget,
+    /// Rebuilt from `Bookmarks::all()` each time the overlay opens and after
+    /// every add/remove.
+    bookmarks_list_box: gtk::Box,
+    /// The toolbar star-toggle button, so its icon can be refreshed whenever
+    /// the active page changes or a bookmark is added/removed for it.
+    bookmark_toggle_button: gtk::Button,
+    bookmarks: RefCell<Bookmarks>,
     core: RefCell<PageManager<WryEngine>>,
     /// GTK `Stack` children, keyed by page id — `browser_core::Page` doesn't
     /// hold these since they're a GTK-only concept.
@@ -205,6 +222,7 @@ impl AppState {
         if let Some(page) = self.core.borrow().page(id) {
             self.address_bar.set_text(&page.current_url());
         }
+        self.refresh_bookmark_toggle_button();
     }
 
     /// Opens the switcher grid with a cleared, focused search box — used by
@@ -220,19 +238,29 @@ impl AppState {
         self.close_settings();
         self.close_profile_picker();
         self.close_keybindings();
-        self.search_entry.set_text("");
+        self.close_bookmarks();
+        self.address_bar.set_text("");
+        self.address_bar.set_placeholder_text(Some("Type to filter open pages…"));
         self.rebuild_switcher_grid();
         self.stack.set_sensitive(false);
         self.switcher_panel.show();
-        self.search_entry.grab_focus();
+        self.address_bar.grab_focus();
     }
 
-    /// Hides the switcher grid and restores the page stack's sensitivity.
-    /// Always use this (rather than hiding `switcher_panel` directly) so the
-    /// stack never gets left insensitive.
+    /// Hides the switcher grid and restores the page stack's sensitivity, as
+    /// well as the address bar's text/placeholder — since the address bar
+    /// doubles as the switcher's search box while it's open (see the field
+    /// doc on `AppState::address_bar`), closing without having made a
+    /// selection (e.g. pressing Escape after typing a filter) needs to put
+    /// the active page's URL back, the same way `set_active` does when a
+    /// selection *is* made.
     pub fn close_switcher(&self) {
         self.switcher_panel.hide();
         self.stack.set_sensitive(true);
+        self.address_bar.set_placeholder_text(None);
+        if let Some(page) = self.core.borrow().active() {
+            self.address_bar.set_text(&page.current_url());
+        }
     }
 
     /// Shows the settings overlay, populated from the current `Settings`.
@@ -242,6 +270,7 @@ impl AppState {
         self.close_switcher();
         self.close_profile_picker();
         self.close_keybindings();
+        self.close_bookmarks();
         let settings = self.settings.borrow();
         self.start_page_entry.set_text(&settings.start_page);
         self.engine_combo.set_active_id(Some(&settings.default_search_engine));
@@ -307,6 +336,7 @@ impl AppState {
         self.close_switcher();
         self.close_settings();
         self.close_keybindings();
+        self.close_bookmarks();
         self.new_profile_entry.set_text("");
         self.rebuild_profile_list();
         self.stack.set_sensitive(false);
@@ -385,6 +415,7 @@ impl AppState {
         self.close_switcher();
         self.close_settings();
         self.close_profile_picker();
+        self.close_bookmarks();
         self.listening_for.set(None);
         self.rebuild_keybindings_list();
         self.stack.set_sensitive(false);
@@ -405,6 +436,136 @@ impl AppState {
     /// helper.
     pub fn is_keybindings_open(&self) -> bool {
         self.keybindings_panel.is_visible()
+    }
+
+    /// Shows the bookmarks overlay, rebuilt from the current `Bookmarks`
+    /// each time — see `open_switcher`'s doc comment for why it closes the
+    /// other overlays first.
+    pub fn open_bookmarks(self: &Rc<Self>) {
+        self.close_switcher();
+        self.close_settings();
+        self.close_profile_picker();
+        self.close_keybindings();
+        self.rebuild_bookmarks_list();
+        self.stack.set_sensitive(false);
+        self.bookmarks_panel.show();
+    }
+
+    /// Hides the bookmarks overlay. Always use this (rather than hiding
+    /// `bookmarks_panel` directly) so the stack never gets left insensitive.
+    pub fn close_bookmarks(&self) {
+        self.bookmarks_panel.hide();
+        self.stack.set_sensitive(true);
+    }
+
+    /// Whether the bookmarks overlay is currently shown — test/inspection
+    /// helper.
+    pub fn is_bookmarks_open(&self) -> bool {
+        self.bookmarks_panel.is_visible()
+    }
+
+    /// Rebuilds the bookmarks overlay's list of rows from scratch, most-
+    /// recently-added first (`Bookmarks::all()`'s order). Each row opens the
+    /// bookmark as a new page when clicked; the "×" removes it without
+    /// opening anything.
+    fn rebuild_bookmarks_list(self: &Rc<Self>) {
+        for child in self.bookmarks_list_box.children() {
+            self.bookmarks_list_box.remove(&child);
+        }
+
+        let bookmarks = self.bookmarks.borrow();
+        let all = bookmarks.all();
+        if all.is_empty() {
+            let empty_label = gtk::Label::new(Some("No bookmarks yet"));
+            empty_label.set_halign(gtk::Align::Start);
+            self.bookmarks_list_box.pack_start(&empty_label, false, false, 0);
+        }
+        for bookmark in all {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+
+            let open_button = gtk::Button::new();
+            open_button.set_hexpand(true);
+            open_button.style_context().add_class("flat");
+            let label_text = if bookmark.title.is_empty() { bookmark.url.clone() } else { format!("{} — {}", bookmark.title, bookmark.domain) };
+            let label = gtk::Label::new(Some(&label_text));
+            label.set_halign(gtk::Align::Start);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            open_button.add(&label);
+
+            let app_clone = Rc::clone(self);
+            let url = bookmark.url.clone();
+            open_button.connect_clicked(move |_| {
+                if let Err(err) = app_clone.add_page(&url) {
+                    eprintln!("failed to open bookmark: {err}");
+                }
+                app_clone.close_bookmarks();
+            });
+            row.pack_start(&open_button, true, true, 0);
+
+            let remove_button = gtk::Button::with_label("\u{d7}");
+            let app_clone = Rc::clone(self);
+            let url = bookmark.url.clone();
+            remove_button.connect_clicked(move |_| {
+                app_clone.bookmarks.borrow_mut().remove(&url);
+                if let Err(err) = app_clone.bookmarks.borrow().save(&app_clone.profile) {
+                    eprintln!("failed to save bookmarks: {err}");
+                }
+                app_clone.rebuild_bookmarks_list();
+                app_clone.refresh_bookmark_toggle_button();
+            });
+            row.pack_start(&remove_button, false, false, 0);
+
+            self.bookmarks_list_box.pack_start(&row, false, false, 0);
+        }
+        self.bookmarks_list_box.show_all();
+    }
+
+    /// Adds or removes a bookmark for the active page — the toolbar star
+    /// button's toggle action, and the `ToggleBookmark` keybinding.
+    pub fn toggle_bookmark_for_active(self: &Rc<Self>) {
+        let (url, title) = {
+            let core = self.core.borrow();
+            let Some(page) = core.active() else { return };
+            let title = page.title.borrow().clone();
+            (page.current_url(), title)
+        };
+        self.bookmarks.borrow_mut().toggle(&url, &title, now_unix());
+        if let Err(err) = self.bookmarks.borrow().save(&self.profile) {
+            eprintln!("failed to save bookmarks: {err}");
+        }
+        self.refresh_bookmark_toggle_button();
+    }
+
+    /// Updates the toolbar star button's icon/tooltip to reflect whether the
+    /// active page is currently bookmarked — called whenever the active page
+    /// changes or a bookmark is toggled, so it never shows stale state.
+    fn refresh_bookmark_toggle_button(&self) {
+        let is_bookmarked = self
+            .core
+            .borrow()
+            .active()
+            .map(|p| self.bookmarks.borrow().is_bookmarked(&p.current_url()))
+            .unwrap_or(false);
+        let icon_name = if is_bookmarked { "starred-symbolic" } else { "non-starred-symbolic" };
+        self.bookmark_toggle_button
+            .set_image(Some(&gtk::Image::from_icon_name(Some(icon_name), gtk::IconSize::Button)));
+        self.bookmark_toggle_button
+            .set_tooltip_text(Some(if is_bookmarked { "Remove bookmark" } else { "Bookmark this page" }));
+    }
+
+    /// Whether the active page is currently bookmarked — test/inspection
+    /// helper.
+    pub fn is_active_bookmarked(&self) -> bool {
+        self.core
+            .borrow()
+            .active()
+            .map(|p| self.bookmarks.borrow().is_bookmarked(&p.current_url()))
+            .unwrap_or(false)
+    }
+
+    /// Bookmarked URLs, most-recently-added first — test/inspection helper.
+    pub fn bookmarked_urls(&self) -> Vec<String> {
+        self.bookmarks.borrow().all().iter().map(|b| b.url.clone()).collect()
     }
 
     /// Called from the window's `key-press-event` handler when
@@ -487,6 +648,8 @@ impl AppState {
             Action::GoForward => self.with_active(|p| p.go_forward()),
             Action::OpenSettings => self.open_settings(),
             Action::OpenProfilePicker => self.open_profile_picker(),
+            Action::ToggleBookmark => self.toggle_bookmark_for_active(),
+            Action::OpenBookmarks => self.open_bookmarks(),
         }
     }
 
@@ -543,7 +706,7 @@ impl AppState {
             self.flowbox.remove(&child);
         }
 
-        let query = self.search_entry.text().to_string();
+        let query = self.address_bar.text().to_string();
         let open_matches = self.core.borrow().matching_ids(&query);
 
         {
@@ -767,22 +930,39 @@ impl AppState {
         self.stack.is_sensitive()
     }
 
-    /// Types `text` into the switcher's search box and simulates pressing
-    /// Enter — test helper for the "open a new page if nothing matches"
-    /// behavior, exercising the same `connect_activate` handler a real
-    /// keypress would trigger.
+    /// Types `text` into the address bar (which doubles as the switcher's
+    /// search box while the switcher is open — see the field doc on
+    /// `AppState::address_bar`) and simulates pressing Enter — test helper
+    /// for the "open a new page if nothing matches" behavior, exercising the
+    /// same `connect_activate` handler a real keypress would trigger. Caller
+    /// must have already called `open_switcher()` for this to hit the
+    /// switcher-search branch rather than plain navigation.
     pub fn search_activate(&self, text: &str) {
-        self.search_entry.set_text(text);
-        self.search_entry.emit_activate();
+        self.address_bar.set_text(text);
+        self.address_bar.emit_activate();
     }
 
     /// Types `text` into the toolbar address bar and simulates pressing
     /// Enter — test helper exercising the real `connect_activate` handler
-    /// (and so the real `resolve_address_input` integration), the same way
-    /// `search_activate` does for the switcher's search box.
+    /// (and so the real `resolve_address_input` integration). Caller must
+    /// ensure the switcher is closed for this to hit the plain-navigation
+    /// branch rather than switcher-search.
     pub fn address_bar_activate(&self, text: &str) {
         self.address_bar.set_text(text);
         self.address_bar.emit_activate();
+    }
+
+    /// The address bar's current text, without simulating Enter — test
+    /// helper for confirming what `open_switcher`/`close_switcher` leave it
+    /// showing.
+    pub fn address_bar_text(&self) -> String {
+        self.address_bar.text().to_string()
+    }
+
+    /// Types into the address bar without simulating Enter — test helper for
+    /// setting up the "typed a filter, then closed without selecting" case.
+    pub fn set_address_bar_text(&self, text: &str) {
+        self.address_bar.set_text(text);
     }
 
     /// The settings overlay's start-page field, as currently shown — test
@@ -798,6 +978,13 @@ impl AppState {
     pub fn set_settings_start_page(&self, text: &str) {
         self.start_page_entry.set_text(text);
     }
+}
+
+/// Current time as Unix seconds — used as a bookmark's `created_at` when
+/// added, same precision `HistoryStore` uses internally for its own
+/// timestamps.
+fn now_unix() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 /// Normalizes a real GTK keydown event into a `KeyChord`, or `None` if the
@@ -918,6 +1105,20 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         Some("input-keyboard-symbolic"),
         gtk::IconSize::Button,
     )));
+    // Starts unbookmarked/non-starred — `refresh_bookmark_toggle_button`
+    // (called once below, after `app` exists, and on every active-page
+    // change afterward) corrects this immediately if the start page already
+    // happens to be bookmarked.
+    let bookmark_toggle_button = gtk::Button::new();
+    bookmark_toggle_button.set_image(Some(&gtk::Image::from_icon_name(
+        Some("non-starred-symbolic"),
+        gtk::IconSize::Button,
+    )));
+    let bookmarks_button = gtk::Button::new();
+    bookmarks_button.set_image(Some(&gtk::Image::from_icon_name(
+        Some("user-bookmarks-symbolic"),
+        gtk::IconSize::Button,
+    )));
     for button in [
         &back_button,
         &forward_button,
@@ -926,6 +1127,8 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         &settings_button,
         &profile_button,
         &keybindings_button,
+        &bookmark_toggle_button,
+        &bookmarks_button,
     ] {
         button.style_context().add_class("flat");
     }
@@ -952,6 +1155,7 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     let address_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     address_group.pack_start(&spacer_before_address_bar, false, false, 0);
     address_group.pack_start(&address_bar, true, true, 0);
+    address_group.pack_start(&bookmark_toggle_button, false, false, 0);
     address_group.pack_start(&reload_button, false, false, 0);
     address_group.pack_start(&spacer_after_reload, false, false, 0);
     header_bar.set_custom_title(Some(&address_group));
@@ -960,6 +1164,7 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     header_bar.pack_end(&settings_button);
     header_bar.pack_end(&profile_button);
     header_bar.pack_end(&keybindings_button);
+    header_bar.pack_end(&bookmarks_button);
 
     window.set_titlebar(Some(&header_bar));
 
@@ -974,11 +1179,6 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     scrim
         .style_context()
         .add_provider(&scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-
-    let search_entry = gtk::SearchEntry::new();
-    search_entry.set_placeholder_text(Some("Type to filter open pages\u{2026}"));
-    search_entry.set_halign(gtk::Align::Center);
-    search_entry.set_width_chars(40);
 
     let flowbox = gtk::FlowBox::new();
     flowbox.set_valign(gtk::Align::Start);
@@ -1000,7 +1200,6 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     grid_content.set_halign(gtk::Align::Fill);
     grid_content.set_valign(gtk::Align::Start);
     grid_content.set_margin_top(40);
-    grid_content.pack_start(&search_entry, false, false, 0);
     grid_content.pack_start(&flowbox, true, true, 0);
     grid_content.pack_start(&keynav_hint, false, false, 0);
 
@@ -1159,12 +1358,45 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     keybindings_overlay.add(&keybindings_scrim);
     keybindings_overlay.add_overlay(&keybindings_box);
 
+    // --- Bookmarks overlay: same shape again. One row per bookmark, rebuilt
+    // from `Bookmarks::all()` each time it opens and after every add/remove.
+    let bookmarks_scrim = gtk::EventBox::new();
+    bookmarks_scrim.style_context().add_class("switcher-scrim");
+    bookmarks_scrim
+        .style_context()
+        .add_provider(&scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+    let bookmarks_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    bookmarks_box.set_halign(gtk::Align::Center);
+    bookmarks_box.set_valign(gtk::Align::Center);
+    bookmarks_box.style_context().add_class("settings-box");
+    bookmarks_box.set_margin(24);
+
+    let bookmarks_title = gtk::Label::new(Some("Bookmarks"));
+    bookmarks_title.style_context().add_class("settings-title");
+    bookmarks_title.set_halign(gtk::Align::Start);
+    bookmarks_box.pack_start(&bookmarks_title, false, false, 0);
+
+    let bookmarks_list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    bookmarks_box.pack_start(&bookmarks_list_box, false, false, 0);
+
+    let bookmarks_close_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    bookmarks_close_row.set_halign(gtk::Align::End);
+    let bookmarks_close_button = gtk::Button::with_label("Close");
+    bookmarks_close_row.pack_start(&bookmarks_close_button, false, false, 0);
+    bookmarks_box.pack_start(&bookmarks_close_row, false, false, 0);
+
+    let bookmarks_overlay = gtk::Overlay::new();
+    bookmarks_overlay.add(&bookmarks_scrim);
+    bookmarks_overlay.add_overlay(&bookmarks_box);
+
     let root_overlay = gtk::Overlay::new();
     root_overlay.add(&stack);
     root_overlay.add_overlay(&switcher_overlay);
     root_overlay.add_overlay(&settings_overlay);
     root_overlay.add_overlay(&profile_overlay);
     root_overlay.add_overlay(&keybindings_overlay);
+    root_overlay.add_overlay(&bookmarks_overlay);
 
     window.add(&root_overlay);
     window.show_all();
@@ -1172,16 +1404,17 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     settings_overlay.hide();
     profile_overlay.hide();
     keybindings_overlay.hide();
+    bookmarks_overlay.hide();
     window.set_title("claude-browser");
 
     let settings = Settings::load(&profile);
     let history = HistoryStore::open(&profile)?;
+    let bookmarks = Bookmarks::load(&profile);
     let core = PageManager::new(settings.max_loaded_pages);
     let app = Rc::new(AppState {
         address_bar: address_bar.clone(),
         stack,
         switcher_panel: switcher_overlay.clone().upcast::<gtk::Widget>(),
-        search_entry: search_entry.clone(),
         flowbox: flowbox.clone(),
         settings_panel: settings_overlay.clone().upcast::<gtk::Widget>(),
         start_page_entry: start_page_entry.clone(),
@@ -1195,6 +1428,10 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         keybindings_list_box: keybindings_list_box.clone(),
         keybindings: RefCell::new(Keybindings::load(&profile)),
         listening_for: Cell::new(None),
+        bookmarks_panel: bookmarks_overlay.clone().upcast::<gtk::Widget>(),
+        bookmarks_list_box: bookmarks_list_box.clone(),
+        bookmark_toggle_button: bookmark_toggle_button.clone(),
+        bookmarks: RefCell::new(bookmarks),
         core: RefCell::new(core),
         containers: RefCell::new(HashMap::new()),
         settings: RefCell::new(settings),
@@ -1203,55 +1440,15 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     });
 
     {
+        // Only filters the grid while the switcher is actually open — the
+        // address bar keeps getting `connect_changed` events from ordinary
+        // navigation (typing a URL) the rest of the time, which must not
+        // touch the switcher's (hidden, but still live) tile list.
         let app = Rc::clone(&app);
-        search_entry.connect_changed(move |_| {
-            app.rebuild_switcher_grid();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        search_entry.connect_activate(move |entry| {
-            let text = entry.text().to_string();
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                return;
+        address_bar.connect_changed(move |_| {
+            if app.is_switcher_open() {
+                app.rebuild_switcher_grid();
             }
-            match app.matching_page_ids(trimmed).as_slice() {
-                [] => {
-                    // No open page matches — check history before treating
-                    // the typed text as a fresh URL/search: exactly one
-                    // history match opens that entry's real URL instead.
-                    match app.history.search(trimmed, 2) {
-                        Ok(matches) if matches.len() == 1 => {
-                            let url = matches[0].url.clone();
-                            if let Err(err) = app.add_page(&url) {
-                                eprintln!("failed to open history entry: {err}");
-                            }
-                            app.close_switcher();
-                        }
-                        _ => {
-                            let url = resolve_address_input(trimmed, &app.settings());
-                            if let Err(err) = app.add_page(&url) {
-                                eprintln!("failed to open new page: {err}");
-                            }
-                            app.close_switcher();
-                        }
-                    }
-                }
-                [only] => app.switch_to(only),
-                _ => {}
-            }
-        });
-    }
-    {
-        // GtkSearchEntry emits "stop-search" (rather than a plain key-press)
-        // when Escape is pressed while it has focus, which is the common
-        // case since open_switcher() focuses it — handle it here so Escape
-        // reliably closes the switcher regardless of the window-level
-        // key-press-event handler below.
-        let app = Rc::clone(&app);
-        search_entry.connect_stop_search(move |_| {
-            app.close_switcher();
         });
     }
     {
@@ -1304,11 +1501,48 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         reload_button.connect_clicked(move |_| app.with_active(|p| p.reload()));
     }
     {
+        // Contextual: while the switcher is open, the address bar is acting
+        // as its search box (filter open pages/history, Enter opens the sole
+        // match or a fresh page) instead of navigating the active page — see
+        // the field doc on `AppState::address_bar`.
         let app = Rc::clone(&app);
         address_bar.connect_activate(move |entry| {
             let text = entry.text().to_string();
-            let url = resolve_address_input(&text, &app.settings());
-            app.with_active(|p| p.navigate(&url));
+            if app.is_switcher_open() {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    return;
+                }
+                match app.matching_page_ids(trimmed).as_slice() {
+                    [] => {
+                        // No open page matches — check history before
+                        // treating the typed text as a fresh URL/search:
+                        // exactly one history match opens that entry's real
+                        // URL instead.
+                        match app.history.search(trimmed, 2) {
+                            Ok(matches) if matches.len() == 1 => {
+                                let url = matches[0].url.clone();
+                                if let Err(err) = app.add_page(&url) {
+                                    eprintln!("failed to open history entry: {err}");
+                                }
+                                app.close_switcher();
+                            }
+                            _ => {
+                                let url = resolve_address_input(trimmed, &app.settings());
+                                if let Err(err) = app.add_page(&url) {
+                                    eprintln!("failed to open new page: {err}");
+                                }
+                                app.close_switcher();
+                            }
+                        }
+                    }
+                    [only] => app.switch_to(only),
+                    _ => {}
+                }
+            } else {
+                let url = resolve_address_input(&text, &app.settings());
+                app.with_active(|p| p.navigate(&url));
+            }
         });
     }
     {
@@ -1405,6 +1639,31 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     }
     {
         let app = Rc::clone(&app);
+        bookmark_toggle_button.connect_clicked(move |_| {
+            app.toggle_bookmark_for_active();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        bookmarks_button.connect_clicked(move |_| {
+            app.open_bookmarks();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        bookmarks_scrim.connect_button_press_event(move |_, _| {
+            app.close_bookmarks();
+            gtk::glib::Propagation::Stop
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        bookmarks_close_button.connect_clicked(move |_| {
+            app.close_bookmarks();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
         window.connect_key_press_event(move |_, event| {
             let is_escape = event.keyval() == gtk::gdk::keys::Key::from_name("Escape");
             if is_escape && app.is_switcher_open() {
@@ -1418,6 +1677,9 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
                 return gtk::glib::Propagation::Stop;
             } else if is_escape && app.is_keybindings_open() {
                 app.close_keybindings();
+                return gtk::glib::Propagation::Stop;
+            } else if is_escape && app.is_bookmarks_open() {
+                app.close_bookmarks();
                 return gtk::glib::Propagation::Stop;
             }
 

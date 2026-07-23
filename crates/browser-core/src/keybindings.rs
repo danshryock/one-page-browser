@@ -22,6 +22,8 @@ pub enum Action {
     GoForward,
     OpenSettings,
     OpenProfilePicker,
+    ToggleBookmark,
+    OpenBookmarks,
 }
 
 impl Action {
@@ -33,6 +35,8 @@ impl Action {
         Action::GoForward,
         Action::OpenSettings,
         Action::OpenProfilePicker,
+        Action::ToggleBookmark,
+        Action::OpenBookmarks,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -44,6 +48,8 @@ impl Action {
             Action::GoForward => "Go forward",
             Action::OpenSettings => "Open settings",
             Action::OpenProfilePicker => "Open profile picker",
+            Action::ToggleBookmark => "Bookmark this page",
+            Action::OpenBookmarks => "Open bookmarks",
         }
     }
 }
@@ -150,8 +156,9 @@ impl Default for Keybindings {
         map.insert(Action::Reload, vec![KeyChord::new(false, false, false, "F5")]);
         map.insert(Action::GoBack, vec![KeyChord::new(false, true, false, "Left")]);
         map.insert(Action::GoForward, vec![KeyChord::new(false, true, false, "Right")]);
-        // OpenSettings/OpenProfilePicker: unbound by default — toolbar-
-        // button-only, used far less often than the other five.
+        map.insert(Action::ToggleBookmark, vec![KeyChord::new(true, false, false, "D")]);
+        // OpenSettings/OpenProfilePicker/OpenBookmarks: unbound by default —
+        // toolbar-button-only, used far less often than the other six.
         Self(map)
     }
 }
