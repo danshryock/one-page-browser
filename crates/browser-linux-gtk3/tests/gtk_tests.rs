@@ -727,3 +727,38 @@ fn screenshot_saves_a_real_png_file() {
         cleanup_test_profile(&profile);
     });
 }
+
+#[test]
+fn switching_to_light_theme_reloads_the_theme_css() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("light-theme");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        // Dark is the default, so the theme provider should start out with
+        // dark-theme rules (a dark settings-box background) applied at
+        // startup by `apply_theme`. Checking for GTK's own re-serialized
+        // form (`rgb(46,46,44)`, not the literal `#2e2e2c` source text) —
+        // `CssProvider::to_str()` returns the *parsed* stylesheet rendered
+        // back out in its own canonical form, confirmed by inspecting the
+        // actual output while writing this test, not assumed.
+        assert!(
+            app.theme_provider_css().contains("rgb(46,46,44)"),
+            "the theme provider should start with the default dark theme's CSS"
+        );
+
+        app.open_settings();
+        app.select_light_theme_radio();
+        app.save_settings();
+
+        assert!(
+            app.theme_provider_css().contains("rgb(242,242,240)"),
+            "saving with the light theme selected should reload the theme provider with light-theme CSS"
+        );
+        assert!(
+            !app.theme_provider_css().contains("rgb(46,46,44)"),
+            "the old dark-theme CSS shouldn't still be loaded after switching to light"
+        );
+
+        cleanup_test_profile(&profile);
+    });
+}

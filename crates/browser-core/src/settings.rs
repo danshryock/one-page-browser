@@ -11,6 +11,15 @@ pub struct SearchEngine {
     pub query_url_template: String,
 }
 
+/// The native chrome's color theme — each frontend is responsible for
+/// actually applying it (e.g. `browser-linux-gtk3` swaps which of two CSS
+/// blocks is loaded), `Settings` just stores the choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Theme {
+    Light,
+    Dark,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub start_page: String,
@@ -21,6 +30,7 @@ pub struct Settings {
     pub default_search_engine: String,
     /// How many pages may stay loaded at once. `None` means unlimited.
     pub max_loaded_pages: Option<usize>,
+    pub theme: Theme,
 }
 
 impl Settings {
@@ -123,6 +133,10 @@ impl Default for Settings {
             ],
             default_search_engine: "Google".to_string(),
             max_loaded_pages: Some(10),
+            // Dark preserves this app's existing look (every native-chrome
+            // frontend's overlay/tile CSS was written assuming a dark
+            // background) for anyone upgrading from before themes existed.
+            theme: Theme::Dark,
         }
     }
 }
@@ -142,10 +156,12 @@ mod tests {
         let mut settings = Settings::default();
         settings.start_page = "https://example.com".to_string();
         settings.max_loaded_pages = Some(3);
+        settings.theme = Theme::Light;
 
         settings.save_to(&path).expect("save should succeed");
         let loaded = Settings::load_from(&path).expect("load should find and parse the file");
         assert_eq!(loaded, settings);
+        assert_eq!(loaded.theme, Theme::Light);
 
         let _ = std::fs::remove_file(&path);
     }

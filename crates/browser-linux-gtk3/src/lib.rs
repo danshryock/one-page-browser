@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use browser_core::{
     domain_of, list_profile_names, resolve_address_input, Action, Bookmarks, HistoryStore, KeyChord, Keybindings, PageManager,
-    Profile, Settings,
+    Profile, Settings, Theme,
 };
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
@@ -47,6 +47,13 @@ pub struct AppState {
     new_engine_url_entry: gtk::Entry,
     unlimited_check: gtk::CheckButton,
     limit_spin: gtk::SpinButton,
+    light_theme_radio: gtk::RadioButton,
+    dark_theme_radio: gtk::RadioButton,
+    /// Holds only the theme-dependent CSS rules (see `theme_css`'s doc
+    /// comment) — reloaded by `apply_theme` whenever the theme changes,
+    /// unlike the separate, never-reloaded base provider set up once in
+    /// `build_window_and_app`.
+    theme_provider: gtk::CssProvider,
     /// The profile picker overlay's root widget — same in-window-overlay
     /// pattern as `settings_panel`/`switcher_panel`.
     profile_panel: gtk::Widget,
@@ -314,6 +321,10 @@ impl AppState {
                 self.limit_spin.set_sensitive(false);
             }
         }
+        match settings.theme {
+            Theme::Light => self.light_theme_radio.set_active(true),
+            Theme::Dark => self.dark_theme_radio.set_active(true),
+        }
         drop(settings);
         self.refresh_engine_combo();
         self.rebuild_engines_list();
@@ -347,6 +358,7 @@ impl AppState {
             if let Some(id) = self.engine_combo.active_id() {
                 settings.default_search_engine = id.to_string();
             }
+            settings.theme = if self.light_theme_radio.is_active() { Theme::Light } else { Theme::Dark };
         }
         let new_limit = if self.unlimited_check.is_active() {
             None
@@ -357,7 +369,17 @@ impl AppState {
         if let Err(err) = self.settings().save(&self.profile) {
             eprintln!("failed to save settings: {err}");
         }
+        self.apply_theme();
         self.close_settings();
+    }
+
+    /// Reloads `theme_provider` with the current `Settings::theme`'s CSS —
+    /// called once at startup (right after `AppState` is constructed) and
+    /// again every time `save_settings` runs, so a theme change takes
+    /// effect immediately without needing a restart.
+    pub fn apply_theme(&self) {
+        let theme = self.settings.borrow().theme;
+        let _ = self.theme_provider.load_from_data(theme_css(theme).as_bytes());
     }
 
     /// Whether the settings overlay is currently shown — test/inspection
@@ -1268,6 +1290,19 @@ impl AppState {
         self.start_page_entry.set_text(text);
     }
 
+    /// Selects the settings overlay's "Light" theme radio button — test
+    /// helper for driving a theme change before calling `save_settings`.
+    pub fn select_light_theme_radio(&self) {
+        self.light_theme_radio.set_active(true);
+    }
+
+    /// The theme-provider's currently loaded CSS — test helper for
+    /// confirming `apply_theme` actually reloaded it with the right
+    /// theme's rules, not just that `Settings::theme` changed.
+    pub fn theme_provider_css(&self) -> String {
+        self.theme_provider.to_str().to_string()
+    }
+
     /// Names of every search engine currently in `Settings::search_engines`
     /// — test helper for confirming add/remove actually changed the
     /// underlying data (not just the management list widget).
@@ -1304,6 +1339,45 @@ impl AppState {
 /// timestamps.
 fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// CSS for the theme-dependent rules only — everything that has a real
+/// background surface of its own: the settings/profile/keybindings/
+/// bookmarks overlay boxes (all share `.settings-box`) and the switcher
+/// grid's history/bookmark search-result tiles. See the comment where
+/// `theme_provider` is created in `build_window_and_app` for why nothing
+/// else needs to vary by theme.
+fn theme_css(theme: Theme) -> &'static str {
+    match theme {
+        Theme::Dark => {
+            ".settings-box { background-color: #2e2e2c; border-radius: 10px; padding: 16px; } \
+             .settings-title { color: #ffffff; font-weight: 600; font-size: 14px; } \
+             .history-tile { background-image: none; background-color: rgba(255, 255, 255, 0.12); \
+               border: 1px dashed rgba(255, 255, 255, 0.3); box-shadow: none; border-radius: 10px; \
+               color: #fff; opacity: 0.75; } \
+             .bookmark-tile { background-image: none; background-color: rgba(212, 175, 55, 0.18); \
+               border: 1px dashed rgba(212, 175, 55, 0.5); box-shadow: none; border-radius: 10px; \
+               color: #fff; opacity: 0.85; } \
+             .settings-box label:not(.settings-title) { color: rgba(255, 255, 255, 0.92); } \
+             .settings-box button.flat, .settings-box button.flat:hover { \
+               background-image: none; background-color: transparent; } \
+             .settings-box button.flat label { color: rgba(255, 255, 255, 0.92); }"
+        }
+        Theme::Light => {
+            ".settings-box { background-color: #f2f2f0; border-radius: 10px; padding: 16px; } \
+             .settings-title { color: #1a1a1a; font-weight: 600; font-size: 14px; } \
+             .history-tile { background-image: none; background-color: rgba(0, 0, 0, 0.06); \
+               border: 1px dashed rgba(0, 0, 0, 0.25); box-shadow: none; border-radius: 10px; \
+               color: #1a1a1a; opacity: 0.85; } \
+             .bookmark-tile { background-image: none; background-color: rgba(180, 140, 20, 0.14); \
+               border: 1px dashed rgba(180, 140, 20, 0.45); box-shadow: none; border-radius: 10px; \
+               color: #1a1a1a; opacity: 0.9; } \
+             .settings-box label:not(.settings-title) { color: rgba(0, 0, 0, 0.82); } \
+             .settings-box button.flat, .settings-box button.flat:hover { \
+               background-image: none; background-color: transparent; } \
+             .settings-box button.flat label { color: rgba(0, 0, 0, 0.82); }"
+        }
+    }
 }
 
 /// Normalizes a real GTK keydown event into a `KeyChord`, or `None` if the
@@ -1353,9 +1427,20 @@ fn gtk_key_to_chord(event: &gtk::gdk::EventKey) -> Option<KeyChord> {
 ///
 /// Assumes `gtk::init()` has already been called.
 pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
+    let theme_provider = gtk::CssProvider::new();
     if let Some(screen) = gtk::gdk::Screen::default() {
-        let provider = gtk::CssProvider::new();
-        let _ = provider.load_from_data(
+        // Theme-invariant rules: the switcher grid's tiles and hints always
+        // sit over the scrim (a dark, translucent dimmer over the page
+        // behind — see `scrim_css` below), which stays the same dark tone
+        // regardless of the app's own light/dark theme, the same convention
+        // most apps' modal dimmers use. Only surfaces with a real
+        // *background of their own* (the settings/profile/keybindings/
+        // bookmarks overlay boxes, and the history/bookmark search-result
+        // tiles) actually need theme-dependent colors — those live in
+        // `theme_provider`/`theme_css` instead, reloaded by `apply_theme`
+        // whenever the theme changes.
+        let base_provider = gtk::CssProvider::new();
+        let _ = base_provider.load_from_data(
             b".tile-title { color: #ffffff; font-weight: 600; } \
               .tile-subtitle { color: rgba(255, 255, 255, 0.75); } \
               .add-tile-label { color: #ffffff; font-size: 20px; } \
@@ -1367,21 +1452,10 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
               .tile-close-label { color: #ffffff; } \
               .switcher-hint { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
               .switcher-profile-label { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
-              .page-tile-unloaded { opacity: 0.5; } \
-              .settings-box { background-color: #2e2e2c; border-radius: 10px; padding: 16px; } \
-              .settings-title { color: #ffffff; font-weight: 600; font-size: 14px; } \
-              .history-tile { background-image: none; background-color: rgba(255, 255, 255, 0.12); \
-                border: 1px dashed rgba(255, 255, 255, 0.3); box-shadow: none; border-radius: 10px; \
-                color: #fff; opacity: 0.75; } \
-              .bookmark-tile { background-image: none; background-color: rgba(212, 175, 55, 0.18); \
-                border: 1px dashed rgba(212, 175, 55, 0.5); box-shadow: none; border-radius: 10px; \
-                color: #fff; opacity: 0.85; } \
-              .settings-box label:not(.settings-title) { color: rgba(255, 255, 255, 0.92); } \
-              .settings-box button.flat, .settings-box button.flat:hover { \
-                background-image: none; background-color: transparent; } \
-              .settings-box button.flat label { color: rgba(255, 255, 255, 0.92); }",
+              .page-tile-unloaded { opacity: 0.5; }",
         );
-        gtk::StyleContext::add_provider_for_screen(&screen, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        gtk::StyleContext::add_provider_for_screen(&screen, &base_provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        gtk::StyleContext::add_provider_for_screen(&screen, &theme_provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
 
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
@@ -1617,6 +1691,14 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     limit_row.pack_start(&limit_spin, false, false, 0);
     settings_box.pack_start(&limit_row, false, false, 0);
 
+    let theme_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    theme_row.pack_start(&gtk::Label::new(Some("Theme")), false, false, 0);
+    let dark_theme_radio = gtk::RadioButton::with_label("Dark");
+    let light_theme_radio = gtk::RadioButton::with_label_from_widget(&dark_theme_radio, "Light");
+    theme_row.pack_start(&dark_theme_radio, false, false, 0);
+    theme_row.pack_start(&light_theme_radio, false, false, 0);
+    settings_box.pack_start(&theme_row, false, false, 0);
+
     // Keybindings editor, folded into the settings overlay rather than
     // being its own separate destination — one row per `Action::ALL`,
     // rebuilt from the current `Keybindings` each time settings opens and
@@ -1763,6 +1845,9 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         new_engine_url_entry: new_engine_url_entry.clone(),
         unlimited_check: unlimited_check.clone(),
         limit_spin: limit_spin.clone(),
+        light_theme_radio: light_theme_radio.clone(),
+        dark_theme_radio: dark_theme_radio.clone(),
+        theme_provider: theme_provider.clone(),
         profile_panel: profile_overlay.clone().upcast::<gtk::Widget>(),
         profile_list_box: profile_list_box.clone(),
         new_profile_entry: new_profile_entry.clone(),
@@ -1779,6 +1864,7 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         history,
         profile,
     });
+    app.apply_theme();
 
     {
         // Only filters the grid while the switcher is actually open — the

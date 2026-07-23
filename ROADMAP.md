@@ -61,6 +61,11 @@ build/run instructions.
   `render-engine::linux` (WebKitGTK's snapshot → cairo → PNG) and wired to a new toolbar button in
   `browser-linux-gtk3` with a native save dialog. Other `RenderEngine` implementers got a stub to stay
   compiling. See `summaries/page-screenshotting.md`.
+- Color themes (Light/Dark, not yet arbitrary "custom") + overlay backgrounds (`browser-core` +
+  `browser-linux-gtk3`): `Settings::theme`, applied by swapping a dedicated `CssProvider`'s content —
+  covering the settings/profile/keybindings/bookmarks overlays' background and the switcher grid's
+  history/bookmark tiles, the only surfaces with a real theme-dependent background. See
+  `summaries/color-themes.md`.
 
 ## Next
 
@@ -74,8 +79,6 @@ Nothing specifically queued — pick the next item from the backlog below.
 - Reader mode.
 - External password manager integration.
 - Internal password manager.
-- Color themes (light/dark, possibly custom) across the native chrome in each frontend.
-- Overlay backgrounds
 - `browser-windows-winui` debugging — it's been cross-compile/link-verified only all along (see "Done"
   above), never actually run; once it can be run on real Windows, expect a real debugging pass (custom
   title bar drag, the `WM_KEYDOWN` HWND-subclass keybinding capture, `WebView2` control behavior, etc. are
