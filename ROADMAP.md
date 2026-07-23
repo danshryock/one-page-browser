@@ -51,7 +51,18 @@ Nothing specifically queued — pick the next item from the backlog below.
 - External password manager integration.
 - Internal password manager.
 - Color themes (light/dark, possibly custom) across the native chrome in each frontend.
+- Overlay backgrounds
 - `browser-windows-winui` debugging — it's been cross-compile/link-verified only all along (see "Done"
   above), never actually run; once it can be run on real Windows, expect a real debugging pass (custom
   title bar drag, the `WM_KEYDOWN` HWND-subclass keybinding capture, `WebView2` control behavior, etc. are
   all unverified at runtime).
+- users need to be able to edit urls, so we need separate actions
+  for grid/new page and grid/edit url.  Ctrl+L would move to the url box, select all text but not blank it, Ctrl+T and F1 would move to the url box and start with it blank.
+- fix colors in settings/bookmarks overlays
+- Move the keybindings screen into the settings screen
+- Add the search engine management features
+- Add vector search to the page/history search using libsql's
+  native vector search
+- Add passphrase support to profiles, use native encryption
+  features of libsql if available.
+- Show bookmarks when searching the grid
