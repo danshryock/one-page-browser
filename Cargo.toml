@@ -7,6 +7,7 @@ members = [
     "crates/browser-windows-win32",
     "crates/browser-windows-nwg",
     "crates/browser-wx",
+    "crates/browser-windows-winui",
 ]
 
 [workspace.package]

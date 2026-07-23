@@ -221,6 +221,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "browser-windows-winui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "browser-core",
+ "render-engine",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+ "winio-winui3",
+]
+
+[[package]]
 name = "browser-wx"
 version = "0.1.0"
 dependencies = [
@@ -3567,6 +3579,19 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "winio-winui3"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fae2b768a02e48baa68ab29676f997f7a69db4c4a50e5e0327450381366a4115"
+dependencies = [
+ "windows 0.62.2",
+ "windows-collections 0.3.2",
+ "windows-core 0.62.2",
+ "windows-future 0.3.2",
+ "windows-numerics 0.3.1",
+]
 
 [[package]]
 name = "winnow"

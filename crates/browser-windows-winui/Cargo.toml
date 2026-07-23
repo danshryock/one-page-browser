@@ -1,0 +1,24 @@
+[package]
+name = "browser-windows-winui"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+render-engine = { path = "../render-engine" }
+browser-core = { path = "../browser-core" }
+anyhow = "1"
+
+# WinUI 3 (Microsoft.UI.Xaml.*) needs MSVC specifically, not the
+# x86_64-pc-windows-gnu target the other Windows crates in this workspace
+# use — COM/WinRT interop is far better supported on MSVC. Cross-compiled via
+# `cargo xwin` (see README.md), not `cross`/plain `cargo build --target`.
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_WinRT",
+    "Win32_System_LibraryLoader",
+] }
+windows-core = "0.62"
+winio-winui3 = { version = "0.4", features = ["UI_Composition", "UI_Xaml_Controls_Primitives"] }

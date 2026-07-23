@@ -33,3 +33,24 @@ run-wx = "run -p browser-wx"
 # through `cargo <anything>`. Use `.cargo/run-wx-wine.sh` instead, which
 # calls `cargo zigbuild` (the build verb, which *is* reachable this way) and
 # then the wine-runner.sh above directly, in one script.
+
+# browser-windows-winui only needs to cross-*compile* (see
+# crates/browser-windows-winui/src/lib.rs) — it's never run, so unlike
+# browser-wx above there's no "run" verb to route around, and cargo-xwin's
+# own "build" verb *is* reachable directly through [alias] the same way
+# run-win32/run-nwg reach cargo's built-in "run".
+build-windows-winui = "xwin build --target x86_64-pc-windows-msvc -p browser-windows-winui"
+
+# browser-core pulls in libsql, whose libsql-ffi dependency compiles a
+# bundled sqlite3.c via cc-rs for *every* target it's built for, including
+# x86_64-pc-windows-msvc. cargo-xwin sets CC/AR for that target to the bare
+# names "clang-cl"/"llvm-lib" and leaves finding them on PATH to the caller
+# (unlike cargo-zigbuild, which bundles its own self-contained C
+# toolchain) — those tools do exist (Ubuntu's clang-21/lld-21/llvm-21
+# packages), just not symlinked as plain, unversioned names on default PATH.
+# force = true so this wins over cargo-xwin's own "clang-cl"/"llvm-lib"
+# (bare names it puts in the child build's environment), since plain [env]
+# entries only apply when a var isn't already set.
+[env]
+CC_x86_64_pc_windows_msvc = { value = "/usr/lib/llvm-21/bin/clang-cl", force = true }
+AR_x86_64_pc_windows_msvc = { value = "/usr/lib/llvm-21/bin/llvm-lib", force = true }
