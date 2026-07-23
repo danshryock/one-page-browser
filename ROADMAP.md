@@ -41,3 +41,8 @@ Nothing specifically queued — pick the next item from the backlog below.
 - Reader mode.
 - External password manager integration.
 - Internal password manager.
+- Color themes (light/dark, possibly custom) across the native chrome in each frontend.
+- `browser-windows-winui` debugging — it's been cross-compile/link-verified only all along (see "Done"
+  above), never actually run; once it can be run on real Windows, expect a real debugging pass (custom
+  title bar drag, the `WM_KEYDOWN` HWND-subclass keybinding capture, `WebView2` control behavior, etc. are
+  all unverified at runtime).
