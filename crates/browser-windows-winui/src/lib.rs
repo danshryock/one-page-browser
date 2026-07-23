@@ -37,10 +37,15 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use browser_core::{domain_of, list_profile_names, resolve_address_input, HistoryStore, PageManager, Profile, Settings};
+use browser_core::{
+    domain_of, list_profile_names, resolve_address_input, Action, HistoryStore, KeyChord, Keybindings, PageManager, Profile,
+    Settings,
+};
 use render_engine::{AssertSend, RenderEngine, WebView2Engine};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_ESCAPE, VK_F1, VK_RETURN};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F1, VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
+};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{WM_DESTROY, WM_KEYDOWN, WM_NCDESTROY};
 use windows_core::HSTRING;
@@ -86,6 +91,15 @@ pub struct AppState {
     containers: RefCell<HashMap<String, Grid>>,
     settings: RefCell<Settings>,
     history: HistoryStore,
+    keybindings_overlay: Grid,
+    /// Rebuilt from the current `Keybindings` each time the editor opens
+    /// (and after every add/remove) — holds one row per `Action`.
+    keybindings_list_panel: StackPanel,
+    keybindings: RefCell<Keybindings>,
+    /// `Some(action)` while the editor is waiting for the next real keydown
+    /// to become that action's new binding — checked first, ahead of normal
+    /// shortcut dispatch, in `subclass_proc`.
+    listening_for: Cell<Option<Action>>,
     profile: Profile,
 }
 
@@ -231,6 +245,7 @@ impl AppState {
     pub fn open_switcher(self: &Rc<Self>) {
         self.close_settings();
         self.close_profile_picker();
+        self.close_keybindings();
         let _ = self.search_box.SetText(&HSTRING::new());
         self.rebuild_switcher_grid();
         let _ = self.content_grid.SetIsHitTestVisible(false);
@@ -245,6 +260,7 @@ impl AppState {
     pub fn open_settings(self: &Rc<Self>) {
         self.close_switcher();
         self.close_profile_picker();
+        self.close_keybindings();
         let settings = self.settings.borrow();
         let _ = self.start_page_box.SetText(&HSTRING::from(&settings.start_page));
         for (index, engine) in settings.search_engines.iter().enumerate() {
@@ -314,6 +330,7 @@ impl AppState {
     pub fn open_profile_picker(self: &Rc<Self>) {
         self.close_switcher();
         self.close_settings();
+        self.close_keybindings();
         let _ = self.new_profile_box.SetText(&HSTRING::new());
         self.rebuild_profile_list();
         let _ = self.content_grid.SetIsHitTestVisible(false);
@@ -379,6 +396,129 @@ impl AppState {
             eprintln!("failed to launch a new process for profile {name:?}: {err}");
         }
         self.close_profile_picker();
+    }
+
+    /// Shows the keybindings editor, rebuilt from the current `Keybindings`
+    /// each time.
+    pub fn open_keybindings(self: &Rc<Self>) {
+        self.close_switcher();
+        self.close_settings();
+        self.close_profile_picker();
+        self.listening_for.set(None);
+        self.rebuild_keybindings_list();
+        let _ = self.content_grid.SetIsHitTestVisible(false);
+        let _ = self.keybindings_overlay.SetVisibility(Visibility::Visible);
+    }
+
+    /// Hides the keybindings editor, cancelling any in-progress "press
+    /// keys…" capture.
+    pub fn close_keybindings(&self) {
+        self.listening_for.set(None);
+        let _ = self.keybindings_overlay.SetVisibility(Visibility::Collapsed);
+        let _ = self.content_grid.SetIsHitTestVisible(true);
+    }
+
+    /// Called from `subclass_proc`'s `WM_KEYDOWN` handling when
+    /// `listening_for` is set: assigns `chord` as a new binding for that
+    /// action (in addition to any existing ones — "×" on a tag is what
+    /// removes), saves, clears the listening state, and rebuilds the rows.
+    fn assign_listening_binding(self: &Rc<Self>, chord: KeyChord) {
+        let Some(action) = self.listening_for.take() else { return };
+        let mut chords = self.keybindings.borrow().bindings_for(action).to_vec();
+        if !chords.contains(&chord) {
+            chords.push(chord);
+        }
+        self.keybindings.borrow_mut().set_bindings(action, chords);
+        if let Err(err) = self.keybindings.borrow().save(&self.profile) {
+            eprintln!("failed to save keybindings: {err}");
+        }
+        self.rebuild_keybindings_list();
+    }
+
+    /// Rebuilds the keybindings editor's rows from scratch — one per
+    /// `Action::ALL`, each showing its label, its current chords as
+    /// removable tags, and an "Add binding" button (which shows "Press
+    /// keys…" instead while listening for that specific action).
+    fn rebuild_keybindings_list(self: &Rc<Self>) {
+        let Ok(children) = self.keybindings_list_panel.Children() else { return };
+        let _ = children.Clear();
+
+        for &action in Action::ALL {
+            let Ok(row) = StackPanel::new() else { continue };
+            let _ = row.SetOrientation(Orientation::Horizontal);
+
+            if let (Ok(label), Ok(row_children)) = (TextBlock::new(), row.Children()) {
+                let _ = label.SetText(&HSTRING::from(action.label()));
+                let _ = label.SetWidth(180.0);
+                let _ = row_children.Append(&label);
+            }
+
+            let chords: Vec<KeyChord> = self.keybindings.borrow().bindings_for(action).to_vec();
+            for chord in chords {
+                if let Ok(tag) = Button::new() {
+                    if let Ok(tag_label) = TextBlock::new() {
+                        let _ = tag_label.SetText(&HSTRING::from(format!("{chord} \u{d7}")));
+                        let _ = tag.SetContent(&tag_label);
+                    }
+                    let app_clone = Rc::clone(self);
+                    let state = AssertSend((app_clone, action, chord));
+                    let _ = tag.Click(&winui3::Microsoft::UI::Xaml::RoutedEventHandler::new(move |_, _| {
+                        let state = &state;
+                        let (app, action, chord) = &state.0;
+                        let mut remaining = app.keybindings.borrow().bindings_for(*action).to_vec();
+                        remaining.retain(|c| c != chord);
+                        app.keybindings.borrow_mut().set_bindings(*action, remaining);
+                        if let Err(err) = app.keybindings.borrow().save(&app.profile) {
+                            eprintln!("failed to save keybindings: {err}");
+                        }
+                        app.rebuild_keybindings_list();
+                        Ok(())
+                    }));
+                    if let Ok(row_children) = row.Children() {
+                        let _ = row_children.Append(&tag);
+                    }
+                }
+            }
+
+            let listening = self.listening_for.get() == Some(action);
+            if let Ok(add_button) = Button::new() {
+                if let Ok(add_label) = TextBlock::new() {
+                    let _ = add_label.SetText(&HSTRING::from(if listening { "Press keys\u{2026}" } else { "Add binding" }));
+                    let _ = add_button.SetContent(&add_label);
+                }
+                let app_clone = Rc::clone(self);
+                let state = AssertSend((app_clone, action));
+                let _ = add_button.Click(&winui3::Microsoft::UI::Xaml::RoutedEventHandler::new(move |_, _| {
+                    let state = &state;
+                    let (app, action) = &state.0;
+                    app.listening_for.set(Some(*action));
+                    app.rebuild_keybindings_list();
+                    Ok(())
+                }));
+                if let Ok(row_children) = row.Children() {
+                    let _ = row_children.Append(&add_button);
+                }
+            }
+
+            let _ = children.Append(&row);
+        }
+    }
+
+    /// Runs whatever `action` means — the shared target of normal keydown
+    /// dispatch in `subclass_proc`.
+    fn dispatch_action(self: &Rc<Self>, action: Action) {
+        match action {
+            Action::OpenSwitcher => self.open_switcher(),
+            Action::ClosePage => {
+                let id = self.core.borrow().active_id().to_string();
+                self.close_page(&id);
+            }
+            Action::Reload => self.with_active(|p| p.reload()),
+            Action::GoBack => self.with_active(|p| p.go_back()),
+            Action::GoForward => self.with_active(|p| p.go_forward()),
+            Action::OpenSettings => self.open_settings(),
+            Action::OpenProfilePicker => self.open_profile_picker(),
+        }
     }
 
     fn matching_page_ids(&self, query: &str) -> Vec<String> {
@@ -637,6 +777,7 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<Rc<AppState>> {
     let switcher_toggle = icon_button("\u{229e}")?;
     let settings_button = icon_button("\u{2699}")?;
     let profile_button = icon_button("\u{1f464}")?;
+    let keybindings_button = icon_button("\u{2328}")?;
 
     let address_bar = TextBox::new()?;
     address_bar.SetWidth(500.0)?;
@@ -649,6 +790,7 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<Rc<AppState>> {
     toolbar.Children()?.Append(&switcher_toggle)?;
     toolbar.Children()?.Append(&settings_button)?;
     toolbar.Children()?.Append(&profile_button)?;
+    toolbar.Children()?.Append(&keybindings_button)?;
     root_grid.Children()?.Append(&toolbar)?;
 
     // --- Content row: page host + switcher overlay + settings overlay ---
@@ -784,6 +926,36 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<Rc<AppState>> {
     profile_buttons_row.Children()?.Append(&create_profile_button)?;
     profile_panel.Children()?.Append(&profile_buttons_row)?;
 
+    // --- Keybindings editor overlay: same shape again. One row per
+    // `Action::ALL`, rebuilt from the current `Keybindings` each time it
+    // opens and after every add/remove.
+    let keybindings_overlay = Grid::new()?;
+    Grid::SetRow(&keybindings_overlay, 1)?;
+    keybindings_overlay.SetVisibility(Visibility::Collapsed)?;
+    root_grid.Children()?.Append(&keybindings_overlay)?;
+
+    let keybindings_panel = StackPanel::new()?;
+    keybindings_panel.SetOrientation(Orientation::Vertical)?;
+    keybindings_panel.SetHorizontalAlignment(HorizontalAlignment::Center)?;
+    keybindings_panel.SetVerticalAlignment(VerticalAlignment::Center)?;
+    keybindings_panel.SetWidth(420.0)?;
+    keybindings_overlay.Children()?.Append(&keybindings_panel)?;
+
+    let keybindings_title = TextBlock::new()?;
+    keybindings_title.SetText(&HSTRING::from("Keybindings"))?;
+    keybindings_panel.Children()?.Append(&keybindings_title)?;
+
+    let keybindings_list_panel = StackPanel::new()?;
+    keybindings_list_panel.SetOrientation(Orientation::Vertical)?;
+    keybindings_panel.Children()?.Append(&keybindings_list_panel)?;
+
+    let keybindings_close_row = StackPanel::new()?;
+    keybindings_close_row.SetOrientation(Orientation::Horizontal)?;
+    keybindings_close_row.SetHorizontalAlignment(HorizontalAlignment::Right)?;
+    let keybindings_close_button = icon_button("Close")?;
+    keybindings_close_row.Children()?.Append(&keybindings_close_button)?;
+    keybindings_panel.Children()?.Append(&keybindings_close_row)?;
+
     window.SetContent(&root_grid)?;
     window.SetExtendsContentIntoTitleBar(true)?;
     window.SetTitleBar(&toolbar)?;
@@ -813,11 +985,16 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<Rc<AppState>> {
         containers: RefCell::new(HashMap::new()),
         settings: RefCell::new(settings),
         history,
+        keybindings_overlay,
+        keybindings_list_panel,
+        keybindings: RefCell::new(Keybindings::load(&profile)),
+        listening_for: Cell::new(None),
         profile,
     });
 
     wire_events(&app, &back_button, &forward_button, &reload_button, &address_bar, &switcher_toggle, &settings_button, &search_box, &cancel_button, &save_button)?;
     wire_profile_picker_events(&app, &profile_button, &profile_cancel_button, &create_profile_button, &new_profile_box)?;
+    wire_keybindings_events(&app, &keybindings_button, &keybindings_close_button)?;
     install_hwnd_subclass(&app, &window)?;
 
     Ok(app)
@@ -961,14 +1138,71 @@ fn wire_profile_picker_events(
     Ok(())
 }
 
+fn wire_keybindings_events(app: &Rc<AppState>, keybindings_button: &Button, keybindings_close_button: &Button) -> anyhow::Result<()> {
+    use winui3::Microsoft::UI::Xaml::RoutedEventHandler;
+
+    macro_rules! on_click {
+        ($button:expr, $app:ident, $body:expr) => {{
+            let state = AssertSend(Rc::clone(app));
+            $button.Click(&RoutedEventHandler::new(move |_, _| {
+                let state = &state;
+                let $app = &state.0;
+                $body;
+                Ok(())
+            }))?;
+        }};
+    }
+
+    on_click!(keybindings_button, app, app.open_keybindings());
+    on_click!(keybindings_close_button, app, app.close_keybindings());
+
+    Ok(())
+}
+
+/// Normalizes a real Win32 keydown (`WM_KEYDOWN`'s virtual-key code plus the
+/// three modifier states) into a `KeyChord`, or `None` if the key itself is
+/// a bare modifier press (Ctrl/Alt/Shift alone) or one this crate doesn't
+/// know how to name — used both for normal shortcut dispatch and for the
+/// keybindings editor's "press keys…" capture, so a binding can never end up
+/// as just "Ctrl" with no actual key. Letters/digits map directly (Win32's
+/// `VK_A`..`VK_Z`/`VK_0`..`VK_9` are already the ASCII codes); everything
+/// else this app's default bindings actually use (F-keys, arrows, Escape) is
+/// named explicitly.
+fn winui_vk_to_chord(vk: u16, ctrl: bool, alt: bool, shift: bool) -> Option<KeyChord> {
+    if vk == VK_CONTROL.0 || vk == VK_SHIFT.0 || vk == VK_MENU.0 {
+        return None;
+    }
+    let key = if (b'A' as u16..=b'Z' as u16).contains(&vk) || (b'0' as u16..=b'9' as u16).contains(&vk) {
+        (vk as u8 as char).to_string()
+    } else if (VK_F1.0..=VK_F1.0 + 11).contains(&vk) {
+        format!("F{}", vk - VK_F1.0 + 1)
+    } else if vk == VK_ESCAPE.0 {
+        "Escape".to_string()
+    } else if vk == VK_LEFT.0 {
+        "Left".to_string()
+    } else if vk == VK_RIGHT.0 {
+        "Right".to_string()
+    } else if vk == VK_UP.0 {
+        "Up".to_string()
+    } else if vk == VK_DOWN.0 {
+        "Down".to_string()
+    } else {
+        return None;
+    };
+    Some(KeyChord::new(ctrl, alt, shift, key))
+}
+
 /// See this module's doc comment: `Window` has no working `Closed` event and
 /// `UIElement` has no working `KeyDown` event in this crate's bindings, so
 /// both go through a raw `HWND` subclass instead — the same technique
 /// already used in `browser-wx/src/titlebar/windows.rs`. Handles:
-/// - `WM_KEYDOWN`: F1 / Ctrl+T / Ctrl+L / Ctrl+W / Escape shortcuts, and
-///   Enter navigating the address bar or activating the switcher's search
-///   box (via the `*_focused` flags kept up to date by `GotFocus`/`LostFocus`,
-///   which *do* work).
+/// - `WM_KEYDOWN`: dispatches through `Keybindings::action_for` (or, while
+///   the keybindings editor is capturing a new binding, assigns it instead),
+///   plus Escape closing whichever overlay is open and Enter navigating the
+///   address bar/activating the switcher's search box/submitting the
+///   new-profile field (via the `*_focused` flags kept up to date by
+///   `GotFocus`/`LostFocus`, which *do* work) — none of those three are part
+///   of the configurable action set, see this module's doc comment.
 /// - `WM_DESTROY`: calls `Application::Current()?.Exit()`, replacing the
 ///   unusable `Window::Closed` as the app-quit trigger.
 /// - `WM_NCDESTROY`: removes the subclass (standard teardown discipline).
@@ -997,61 +1231,70 @@ unsafe extern "system" fn subclass_proc(
     match msg {
         WM_KEYDOWN => {
             let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+            let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
+            let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
             let vk = wparam.0 as u16;
-            if vk == VK_F1.0 || (ctrl && vk == b'T' as u16) || (ctrl && vk == b'L' as u16) {
-                app.open_switcher();
-            } else if vk == VK_ESCAPE.0 {
+
+            if vk == VK_ESCAPE.0 {
                 if app.switcher_overlay.Visibility().ok() == Some(Visibility::Visible) {
                     app.close_switcher();
                 } else if app.settings_overlay.Visibility().ok() == Some(Visibility::Visible) {
                     app.close_settings();
                 } else if app.profile_overlay.Visibility().ok() == Some(Visibility::Visible) {
                     app.close_profile_picker();
+                } else if app.keybindings_overlay.Visibility().ok() == Some(Visibility::Visible) {
+                    app.close_keybindings();
                 }
-            } else if ctrl && vk == b'W' as u16 {
-                let id = app.core.borrow().active_id().to_string();
-                app.close_page(&id);
-            } else if vk == VK_RETURN.0 {
-                if app.address_bar_focused.get() {
-                    if let Ok(text) = app.address_bar.Text() {
-                        let url = resolve_address_input(&text.to_string(), &app.settings());
-                        app.with_active(|p| p.navigate(&url));
-                    }
-                } else if app.new_profile_box_focused.get() {
-                    app.create_and_open_profile();
-                } else if app.search_box_focused.get() {
-                    if let Ok(text) = app.search_box.Text() {
-                        let trimmed = text.to_string();
-                        let trimmed = trimmed.trim();
-                        if !trimmed.is_empty() {
-                            match app.matching_page_ids(trimmed).as_slice() {
-                                [] => {
-                                    // No open page matches — check history
-                                    // before treating the typed text as a
-                                    // fresh URL/search: exactly one history
-                                    // match opens that entry's real URL
-                                    // instead.
-                                    match app.history.search(trimmed, 2) {
-                                        Ok(matches) if matches.len() == 1 => {
-                                            if let Err(err) = app.add_page(&matches[0].url) {
-                                                eprintln!("failed to open history entry: {err}");
-                                            }
-                                            app.close_switcher();
+            } else if app.listening_for.get().is_some() {
+                // The keybindings editor is waiting for the next real
+                // keydown to become the new binding — takes priority over
+                // every other keydown-driven behavior below.
+                if let Some(chord) = winui_vk_to_chord(vk, ctrl, alt, shift) {
+                    app.assign_listening_binding(chord);
+                }
+            } else if vk == VK_RETURN.0 && app.address_bar_focused.get() {
+                if let Ok(text) = app.address_bar.Text() {
+                    let url = resolve_address_input(&text.to_string(), &app.settings());
+                    app.with_active(|p| p.navigate(&url));
+                }
+            } else if vk == VK_RETURN.0 && app.new_profile_box_focused.get() {
+                app.create_and_open_profile();
+            } else if vk == VK_RETURN.0 && app.search_box_focused.get() {
+                if let Ok(text) = app.search_box.Text() {
+                    let trimmed = text.to_string();
+                    let trimmed = trimmed.trim();
+                    if !trimmed.is_empty() {
+                        match app.matching_page_ids(trimmed).as_slice() {
+                            [] => {
+                                // No open page matches — check history
+                                // before treating the typed text as a
+                                // fresh URL/search: exactly one history
+                                // match opens that entry's real URL
+                                // instead.
+                                match app.history.search(trimmed, 2) {
+                                    Ok(matches) if matches.len() == 1 => {
+                                        if let Err(err) = app.add_page(&matches[0].url) {
+                                            eprintln!("failed to open history entry: {err}");
                                         }
-                                        _ => {
-                                            let url = resolve_address_input(trimmed, &app.settings());
-                                            if let Err(err) = app.add_page(&url) {
-                                                eprintln!("failed to open new page: {err}");
-                                            }
-                                            app.close_switcher();
+                                        app.close_switcher();
+                                    }
+                                    _ => {
+                                        let url = resolve_address_input(trimmed, &app.settings());
+                                        if let Err(err) = app.add_page(&url) {
+                                            eprintln!("failed to open new page: {err}");
                                         }
+                                        app.close_switcher();
                                     }
                                 }
-                                [only] => app.switch_to(only),
-                                _ => {}
                             }
+                            [only] => app.switch_to(only),
+                            _ => {}
                         }
                     }
+                }
+            } else if let Some(chord) = winui_vk_to_chord(vk, ctrl, alt, shift) {
+                if let Some(action) = app.keybindings.borrow().action_for(&chord) {
+                    app.dispatch_action(action);
                 }
             }
             unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }

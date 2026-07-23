@@ -11,7 +11,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use browser_core::{domain_of, list_profile_names, resolve_address_input, HistoryStore, PageManager, Profile, Settings};
+use browser_core::{
+    domain_of, list_profile_names, resolve_address_input, Action, HistoryStore, KeyChord, Keybindings, PageManager, Profile,
+    Settings,
+};
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
 
@@ -38,6 +41,17 @@ pub struct AppState {
     /// picker opens — holds one row per existing profile.
     profile_list_box: gtk::Box,
     new_profile_entry: gtk::Entry,
+    /// The keybindings editor overlay's root widget — same in-window-overlay
+    /// pattern as the other three.
+    keybindings_panel: gtk::Widget,
+    /// Rebuilt from `Keybindings::bindings_for` each time the editor opens
+    /// (and after every add/remove) — holds one row per `Action`.
+    keybindings_list_box: gtk::Box,
+    keybindings: RefCell<Keybindings>,
+    /// `Some(action)` while the editor is waiting for the next real keydown
+    /// to become that action's new binding — checked first, ahead of normal
+    /// shortcut dispatch, by the window's `key-press-event` handler.
+    listening_for: Cell<Option<Action>>,
     core: RefCell<PageManager<WryEngine>>,
     /// GTK `Stack` children, keyed by page id — `browser_core::Page` doesn't
     /// hold these since they're a GTK-only concept.
@@ -205,6 +219,7 @@ impl AppState {
     pub fn open_switcher(self: &Rc<Self>) {
         self.close_settings();
         self.close_profile_picker();
+        self.close_keybindings();
         self.search_entry.set_text("");
         self.rebuild_switcher_grid();
         self.stack.set_sensitive(false);
@@ -226,6 +241,7 @@ impl AppState {
     pub fn open_settings(self: &Rc<Self>) {
         self.close_switcher();
         self.close_profile_picker();
+        self.close_keybindings();
         let settings = self.settings.borrow();
         self.start_page_entry.set_text(&settings.start_page);
         self.engine_combo.set_active_id(Some(&settings.default_search_engine));
@@ -290,6 +306,7 @@ impl AppState {
     pub fn open_profile_picker(self: &Rc<Self>) {
         self.close_switcher();
         self.close_settings();
+        self.close_keybindings();
         self.new_profile_entry.set_text("");
         self.rebuild_profile_list();
         self.stack.set_sensitive(false);
@@ -359,6 +376,118 @@ impl AppState {
             eprintln!("failed to launch a new process for profile {name:?}: {err}");
         }
         self.close_profile_picker();
+    }
+
+    /// Shows the keybindings editor, rebuilt from the current `Keybindings`
+    /// each time — see `open_switcher`'s doc comment for why it closes the
+    /// other overlays first.
+    pub fn open_keybindings(self: &Rc<Self>) {
+        self.close_switcher();
+        self.close_settings();
+        self.close_profile_picker();
+        self.listening_for.set(None);
+        self.rebuild_keybindings_list();
+        self.stack.set_sensitive(false);
+        self.keybindings_panel.show();
+    }
+
+    /// Hides the keybindings editor, cancelling any in-progress "press
+    /// keys…" capture. Always use this (rather than hiding
+    /// `keybindings_panel` directly) so the stack never gets left
+    /// insensitive.
+    pub fn close_keybindings(&self) {
+        self.listening_for.set(None);
+        self.keybindings_panel.hide();
+        self.stack.set_sensitive(true);
+    }
+
+    /// Whether the keybindings editor is currently shown — test/inspection
+    /// helper.
+    pub fn is_keybindings_open(&self) -> bool {
+        self.keybindings_panel.is_visible()
+    }
+
+    /// Called from the window's `key-press-event` handler when
+    /// `listening_for` is set: assigns `chord` as a new binding for that
+    /// action (in addition to any existing ones — the editor's "Add
+    /// binding" always adds, "×" on a tag is what removes), saves, clears
+    /// the listening state, and rebuilds the rows.
+    fn assign_listening_binding(self: &Rc<Self>, chord: KeyChord) {
+        let Some(action) = self.listening_for.take() else { return };
+        let mut chords = self.keybindings.borrow().bindings_for(action).to_vec();
+        if !chords.contains(&chord) {
+            chords.push(chord);
+        }
+        self.keybindings.borrow_mut().set_bindings(action, chords);
+        if let Err(err) = self.keybindings.borrow().save(&self.profile) {
+            eprintln!("failed to save keybindings: {err}");
+        }
+        self.rebuild_keybindings_list();
+    }
+
+    /// Rebuilds the keybindings editor's rows from scratch — one per
+    /// `Action::ALL`, each showing its label, its current chords as
+    /// removable tags, and an "Add binding" button (which shows "Press
+    /// keys…" instead while listening for that specific action).
+    fn rebuild_keybindings_list(self: &Rc<Self>) {
+        for child in self.keybindings_list_box.children() {
+            self.keybindings_list_box.remove(&child);
+        }
+
+        for &action in Action::ALL {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+
+            let label = gtk::Label::new(Some(action.label()));
+            label.set_width_chars(18);
+            label.set_halign(gtk::Align::Start);
+            row.pack_start(&label, false, false, 0);
+
+            let chords_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            let chords: Vec<KeyChord> = self.keybindings.borrow().bindings_for(action).to_vec();
+            for chord in chords {
+                let tag = gtk::Button::with_label(&format!("{chord} \u{d7}"));
+                tag.style_context().add_class("flat");
+                let app_clone = Rc::clone(self);
+                tag.connect_clicked(move |_| {
+                    let mut remaining = app_clone.keybindings.borrow().bindings_for(action).to_vec();
+                    remaining.retain(|c| *c != chord);
+                    app_clone.keybindings.borrow_mut().set_bindings(action, remaining);
+                    if let Err(err) = app_clone.keybindings.borrow().save(&app_clone.profile) {
+                        eprintln!("failed to save keybindings: {err}");
+                    }
+                    app_clone.rebuild_keybindings_list();
+                });
+                chords_box.pack_start(&tag, false, false, 0);
+            }
+            row.pack_start(&chords_box, true, true, 0);
+
+            let listening = self.listening_for.get() == Some(action);
+            let add_button = gtk::Button::with_label(if listening { "Press keys\u{2026}" } else { "Add binding" });
+            let app_clone = Rc::clone(self);
+            add_button.connect_clicked(move |_| {
+                app_clone.listening_for.set(Some(action));
+                app_clone.rebuild_keybindings_list();
+            });
+            row.pack_start(&add_button, false, false, 0);
+
+            self.keybindings_list_box.pack_start(&row, false, false, 0);
+        }
+        self.keybindings_list_box.show_all();
+    }
+
+    /// Runs whatever `action` means — the shared target of both normal
+    /// keydown dispatch and (indirectly, since it's just `AppState` methods)
+    /// the toolbar buttons.
+    fn dispatch_action(self: &Rc<Self>, action: Action) {
+        match action {
+            Action::OpenSwitcher => self.open_switcher(),
+            Action::ClosePage => self.close_page(&self.active_id()),
+            Action::Reload => self.with_active(|p| p.reload()),
+            Action::GoBack => self.with_active(|p| p.go_back()),
+            Action::GoForward => self.with_active(|p| p.go_forward()),
+            Action::OpenSettings => self.open_settings(),
+            Action::OpenProfilePicker => self.open_profile_picker(),
+        }
     }
 
     /// Ids of pages matching `query` (case-insensitive substring of title or
@@ -671,6 +800,41 @@ impl AppState {
     }
 }
 
+/// Normalizes a real GTK keydown event into a `KeyChord`, or `None` if the
+/// key itself is a bare modifier press (Ctrl/Alt/Shift/Super alone, with
+/// nothing else) — used both for normal shortcut dispatch and for the
+/// keybindings editor's "press keys…" capture, so a binding can never end up
+/// as just "Ctrl" with no actual key.
+fn gtk_key_to_chord(event: &gtk::gdk::EventKey) -> Option<KeyChord> {
+    let keyval = event.keyval();
+    let is_bare_modifier = matches!(
+        keyval.name().as_deref(),
+        Some("Control_L")
+            | Some("Control_R")
+            | Some("Shift_L")
+            | Some("Shift_R")
+            | Some("Alt_L")
+            | Some("Alt_R")
+            | Some("Super_L")
+            | Some("Super_R")
+            | Some("Meta_L")
+            | Some("Meta_R")
+    );
+    if is_bare_modifier {
+        return None;
+    }
+
+    let state = event.state();
+    let ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+    let alt = state.contains(gtk::gdk::ModifierType::MOD1_MASK);
+    let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+    let key = match keyval.to_unicode().filter(|c| c.is_ascii_alphanumeric()) {
+        Some(c) => c.to_ascii_uppercase().to_string(),
+        None => keyval.name()?.to_string(),
+    };
+    Some(KeyChord::new(ctrl, alt, shift, key))
+}
+
 /// Builds the full window + chrome (header bar, page stack, switcher overlay)
 /// and wires up all signal handlers. Does not create any page — call
 /// `app.add_page(&app.settings().start_page.clone())` (or any other URL)
@@ -749,7 +913,20 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         Some("avatar-default-symbolic"),
         gtk::IconSize::Button,
     )));
-    for button in [&back_button, &forward_button, &reload_button, &switcher_toggle, &settings_button, &profile_button] {
+    let keybindings_button = gtk::Button::new();
+    keybindings_button.set_image(Some(&gtk::Image::from_icon_name(
+        Some("input-keyboard-symbolic"),
+        gtk::IconSize::Button,
+    )));
+    for button in [
+        &back_button,
+        &forward_button,
+        &reload_button,
+        &switcher_toggle,
+        &settings_button,
+        &profile_button,
+        &keybindings_button,
+    ] {
         button.style_context().add_class("flat");
     }
 
@@ -782,6 +959,7 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     header_bar.pack_end(&switcher_toggle);
     header_bar.pack_end(&settings_button);
     header_bar.pack_end(&profile_button);
+    header_bar.pack_end(&keybindings_button);
 
     window.set_titlebar(Some(&header_bar));
 
@@ -948,17 +1126,52 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     profile_overlay.add(&profile_scrim);
     profile_overlay.add_overlay(&profile_box);
 
+    // --- Keybindings editor overlay: same shape again. One row per
+    // `Action::ALL`, rebuilt from the current `Keybindings` each time it
+    // opens and after every add/remove.
+    let keybindings_scrim = gtk::EventBox::new();
+    keybindings_scrim.style_context().add_class("switcher-scrim");
+    keybindings_scrim
+        .style_context()
+        .add_provider(&scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+    let keybindings_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    keybindings_box.set_halign(gtk::Align::Center);
+    keybindings_box.set_valign(gtk::Align::Center);
+    keybindings_box.style_context().add_class("settings-box");
+    keybindings_box.set_margin(24);
+
+    let keybindings_title = gtk::Label::new(Some("Keybindings"));
+    keybindings_title.style_context().add_class("settings-title");
+    keybindings_title.set_halign(gtk::Align::Start);
+    keybindings_box.pack_start(&keybindings_title, false, false, 0);
+
+    let keybindings_list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    keybindings_box.pack_start(&keybindings_list_box, false, false, 0);
+
+    let keybindings_close_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    keybindings_close_row.set_halign(gtk::Align::End);
+    let keybindings_close_button = gtk::Button::with_label("Close");
+    keybindings_close_row.pack_start(&keybindings_close_button, false, false, 0);
+    keybindings_box.pack_start(&keybindings_close_row, false, false, 0);
+
+    let keybindings_overlay = gtk::Overlay::new();
+    keybindings_overlay.add(&keybindings_scrim);
+    keybindings_overlay.add_overlay(&keybindings_box);
+
     let root_overlay = gtk::Overlay::new();
     root_overlay.add(&stack);
     root_overlay.add_overlay(&switcher_overlay);
     root_overlay.add_overlay(&settings_overlay);
     root_overlay.add_overlay(&profile_overlay);
+    root_overlay.add_overlay(&keybindings_overlay);
 
     window.add(&root_overlay);
     window.show_all();
     switcher_overlay.hide();
     settings_overlay.hide();
     profile_overlay.hide();
+    keybindings_overlay.hide();
     window.set_title("claude-browser");
 
     let settings = Settings::load(&profile);
@@ -978,6 +1191,10 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         profile_panel: profile_overlay.clone().upcast::<gtk::Widget>(),
         profile_list_box: profile_list_box.clone(),
         new_profile_entry: new_profile_entry.clone(),
+        keybindings_panel: keybindings_overlay.clone().upcast::<gtk::Widget>(),
+        keybindings_list_box: keybindings_list_box.clone(),
+        keybindings: RefCell::new(Keybindings::load(&profile)),
+        listening_for: Cell::new(None),
         core: RefCell::new(core),
         containers: RefCell::new(HashMap::new()),
         settings: RefCell::new(settings),
@@ -1169,32 +1386,59 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     }
     {
         let app = Rc::clone(&app);
+        keybindings_button.connect_clicked(move |_| {
+            app.open_keybindings();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        keybindings_scrim.connect_button_press_event(move |_, _| {
+            app.close_keybindings();
+            gtk::glib::Propagation::Stop
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        keybindings_close_button.connect_clicked(move |_| {
+            app.close_keybindings();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
         window.connect_key_press_event(move |_, event| {
-            let ctrl = event.state().contains(gtk::gdk::ModifierType::CONTROL_MASK);
-            let keyval = event.keyval();
-            let is_f1 = keyval == gtk::gdk::keys::Key::from_name("F1");
-            let unicode = keyval.to_unicode();
-            let is_t = unicode.map(|c| c.eq_ignore_ascii_case(&'t')).unwrap_or(false);
-            let is_l = unicode.map(|c| c.eq_ignore_ascii_case(&'l')).unwrap_or(false);
-            let is_w = unicode.map(|c| c.eq_ignore_ascii_case(&'w')).unwrap_or(false);
-            let is_escape = keyval == gtk::gdk::keys::Key::from_name("Escape");
-            if is_f1 || (ctrl && is_t) || (ctrl && is_l) {
-                app.open_switcher();
-                gtk::glib::Propagation::Stop
-            } else if is_escape && app.is_switcher_open() {
+            let is_escape = event.keyval() == gtk::gdk::keys::Key::from_name("Escape");
+            if is_escape && app.is_switcher_open() {
                 app.close_switcher();
-                gtk::glib::Propagation::Stop
+                return gtk::glib::Propagation::Stop;
             } else if is_escape && app.is_settings_open() {
                 app.close_settings();
-                gtk::glib::Propagation::Stop
+                return gtk::glib::Propagation::Stop;
             } else if is_escape && app.is_profile_picker_open() {
                 app.close_profile_picker();
-                gtk::glib::Propagation::Stop
-            } else if ctrl && is_w {
-                app.close_page(&app.active_id());
-                gtk::glib::Propagation::Stop
-            } else {
-                gtk::glib::Propagation::Proceed
+                return gtk::glib::Propagation::Stop;
+            } else if is_escape && app.is_keybindings_open() {
+                app.close_keybindings();
+                return gtk::glib::Propagation::Stop;
+            }
+
+            let Some(chord) = gtk_key_to_chord(event) else {
+                return gtk::glib::Propagation::Proceed;
+            };
+
+            // While the keybindings editor is waiting for a new binding,
+            // this keypress becomes that binding instead of triggering
+            // whatever it's currently bound to (if anything).
+            if app.listening_for.get().is_some() {
+                app.assign_listening_binding(chord);
+                return gtk::glib::Propagation::Stop;
+            }
+
+            match app.keybindings.borrow().action_for(&chord) {
+                Some(action) => {
+                    app.dispatch_action(action);
+                    gtk::glib::Propagation::Stop
+                }
+                None => gtk::glib::Propagation::Proceed,
             }
         });
     }

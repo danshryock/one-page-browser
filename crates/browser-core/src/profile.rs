@@ -27,6 +27,11 @@ impl Profile {
         Some(dirs.config_dir().join(&self.name).join("settings.json"))
     }
 
+    pub fn keybindings_path(&self) -> Option<PathBuf> {
+        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        Some(dirs.config_dir().join(&self.name).join("keybindings.json"))
+    }
+
     /// Reserved for the per-profile history database — resolved here so the
     /// path is settled and testable, but nothing opens a connection at this
     /// path yet (a separate step: `libsql`'s core API is async, and this
@@ -195,6 +200,13 @@ mod tests {
 
         assert!(settings_path.ends_with("work/settings.json"), "{settings_path:?}");
         assert!(history_path.ends_with("work/history.db"), "{history_path:?}");
+    }
+
+    #[test]
+    fn keybindings_path_is_scoped_under_the_profile_name() {
+        let profile = Profile::new("work");
+        let path = profile.keybindings_path().expect("a config dir should be available in tests");
+        assert!(path.ends_with("work/keybindings.json"), "{path:?}");
     }
 
     #[test]
