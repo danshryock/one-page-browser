@@ -6,8 +6,10 @@
 //! Linux and cross-compiles to Windows unchanged.
 
 mod engine;
+mod titlebar;
 
 pub use engine::WxEngine;
+use titlebar::AddressBarValue;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -82,7 +84,7 @@ fn parse_hex_color(hex: &str) -> Colour {
 
 pub struct AppState {
     frame: Frame,
-    address_bar: TextCtrl,
+    address_bar: titlebar::AddressBarHandle,
     page_book: SimpleBook,
     /// Order mirrors `page_book`'s internal page order exactly — every
     /// insertion/removal here is done in lockstep with a `page_book`
@@ -232,7 +234,7 @@ impl AppState {
             }
         }
         if let Some(page) = self.core.borrow().page(id) {
-            self.address_bar.set_value(&page.current_url());
+            self.address_bar.set_address_value(&page.current_url());
         }
     }
 
@@ -552,25 +554,61 @@ fn show_settings_dialog(app: &Rc<AppState>) {
 pub fn build_frame_and_app(profile: Profile) -> Rc<AppState> {
     let frame = Frame::builder().with_title("claude-browser").with_size(Size::new(1024, 768)).build();
 
+    // Custom title bar, phase 1 (widget-building) — see crates/browser-wx/src/titlebar/.
+    // Linux replaces the native title bar wholesale with a GTK header bar
+    // (built here, before any other wx widget, mirroring browser-linux-gtk3's
+    // own ordering); everywhere else keeps the native title bar and the wx
+    // toolbar row below it exactly as before.
+    #[cfg(target_os = "linux")]
+    let linux_titlebar = titlebar::linux::build(&frame);
+
     let root_sizer = BoxSizer::builder(Orientation::Vertical).build();
 
-    // --- Toolbar ---
-    let toolbar_panel = Panel::builder(&frame).build();
-    let toolbar_sizer = BoxSizer::builder(Orientation::Horizontal).build();
-    let back_button = Button::builder(&toolbar_panel).with_label("\u{25c0}").build();
-    let forward_button = Button::builder(&toolbar_panel).with_label("\u{25b6}").build();
-    let reload_button = Button::builder(&toolbar_panel).with_label("\u{27f3}").build();
-    let address_bar =
-        TextCtrl::builder(&toolbar_panel).with_style(TextCtrlStyle::ProcessEnter).build();
-    let switcher_toggle = Button::builder(&toolbar_panel).with_label("\u{25a6}").build();
-    let settings_button = Button::builder(&toolbar_panel).with_label("\u{2699}").build();
-    toolbar_sizer.add(&back_button, 0, SizerFlag::All, 4);
-    toolbar_sizer.add(&forward_button, 0, SizerFlag::All, 4);
-    toolbar_sizer.add(&reload_button, 0, SizerFlag::All, 4);
-    toolbar_sizer.add(&address_bar, 1, SizerFlag::Expand | SizerFlag::All, 4);
-    toolbar_sizer.add(&switcher_toggle, 0, SizerFlag::All, 4);
-    toolbar_sizer.add(&settings_button, 0, SizerFlag::All, 4);
-    toolbar_panel.set_sizer(toolbar_sizer, true);
+    // --- Toolbar --- (not built on Linux: the GTK header bar above serves
+    // this role instead, entirely outside wx's own sizer tree)
+    #[cfg(not(target_os = "linux"))]
+    let (toolbar_panel, back_button, forward_button, reload_button, address_bar, switcher_toggle, settings_button) = {
+        let toolbar_panel = Panel::builder(&frame).build();
+        let toolbar_sizer = BoxSizer::builder(Orientation::Horizontal).build();
+        let back_button = Button::builder(&toolbar_panel).with_label("\u{25c0}").build();
+        let forward_button = Button::builder(&toolbar_panel).with_label("\u{25b6}").build();
+        let reload_button = Button::builder(&toolbar_panel).with_label("\u{27f3}").build();
+        let address_bar = TextCtrl::builder(&toolbar_panel).with_style(TextCtrlStyle::ProcessEnter).build();
+        let switcher_toggle = Button::builder(&toolbar_panel).with_label("\u{25a6}").build();
+        let settings_button = Button::builder(&toolbar_panel).with_label("\u{2699}").build();
+        toolbar_sizer.add(&back_button, 0, SizerFlag::All, 4);
+        toolbar_sizer.add(&forward_button, 0, SizerFlag::All, 4);
+        toolbar_sizer.add(&reload_button, 0, SizerFlag::All, 4);
+        toolbar_sizer.add(&address_bar, 1, SizerFlag::Expand | SizerFlag::All, 4);
+        toolbar_sizer.add(&switcher_toggle, 0, SizerFlag::All, 4);
+        toolbar_sizer.add(&settings_button, 0, SizerFlag::All, 4);
+
+        // Windows only: the custom title bar (installed below, once
+        // toolbar_panel exists) strips the native min/max/close buttons
+        // along with the caption, so add our own to the same row. These
+        // don't need `Rc<AppState>` at all, so they're wired immediately.
+        #[cfg(target_os = "windows")]
+        {
+            let minimize_button = Button::builder(&toolbar_panel).with_label("\u{2015}").with_size(Size::new(40, -1)).build();
+            let maximize_button = Button::builder(&toolbar_panel).with_label("\u{25a1}").with_size(Size::new(40, -1)).build();
+            let close_button = Button::builder(&toolbar_panel).with_label("\u{2715}").with_size(Size::new(40, -1)).build();
+            toolbar_sizer.add(&minimize_button, 0, SizerFlag::All, 4);
+            toolbar_sizer.add(&maximize_button, 0, SizerFlag::All, 4);
+            toolbar_sizer.add(&close_button, 0, SizerFlag::All, 4);
+            minimize_button.on_click(move |_| frame.iconize(true));
+            maximize_button.on_click(move |_| frame.maximize(!frame.is_maximized()));
+            close_button.on_click(move |_| frame.close(false));
+        }
+
+        toolbar_panel.set_sizer(toolbar_sizer, true);
+        (toolbar_panel, back_button, forward_button, reload_button, address_bar, switcher_toggle, settings_button)
+    };
+
+    // Custom title bar, phase 2 (Windows): strip the native caption and
+    // install the WM_NCHITTEST subclass now that toolbar_panel (whose row
+    // acts as the caption) exists.
+    #[cfg(target_os = "windows")]
+    titlebar::windows::install(&frame, &toolbar_panel);
 
     // --- Content area: page_book and switcher_panel are unmanaged siblings
     // of the same content_panel parent, both manually sized to fill it (wx
@@ -602,6 +640,7 @@ pub fn build_frame_and_app(profile: Profile) -> Rc<AppState> {
 
     switcher_panel.hide();
 
+    #[cfg(not(target_os = "linux"))]
     root_sizer.add(&toolbar_panel, 0, SizerFlag::Expand, 0);
     root_sizer.add(&content_panel, 1, SizerFlag::Expand, 0);
     frame.set_sizer(root_sizer, true);
@@ -610,6 +649,9 @@ pub fn build_frame_and_app(profile: Profile) -> Rc<AppState> {
     let core = PageManager::new(settings.max_loaded_pages);
     let app = Rc::new(AppState {
         frame,
+        #[cfg(target_os = "linux")]
+        address_bar: linux_titlebar.address_bar.clone(),
+        #[cfg(not(target_os = "linux"))]
         address_bar,
         page_book,
         page_order: RefCell::new(Vec::new()),
@@ -664,51 +706,61 @@ pub fn build_frame_and_app(profile: Profile) -> Rc<AppState> {
         });
     }
 
-    {
-        let app = Rc::clone(&app);
-        back_button.on_click(move |_| app.with_active(|p| p.go_back()));
-    }
-    {
-        let app = Rc::clone(&app);
-        forward_button.on_click(move |_| app.with_active(|p| p.go_forward()));
-    }
-    {
-        let app = Rc::clone(&app);
-        reload_button.on_click(move |_| app.with_active(|p| p.reload()));
-    }
-    {
-        let app = Rc::clone(&app);
-        address_bar.on_enter_pressed(move |_| {
-            let text = app.address_bar.get_value();
-            let url = resolve_address_input(&text, &app.settings());
-            app.with_active(|p| p.navigate(&url));
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        switcher_toggle.on_click(move |_| {
-            if app.is_switcher_open() {
-                app.close_switcher();
-            } else {
-                app.open_switcher();
-            }
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        settings_button.on_click(move |_| {
-            show_settings_dialog(&app);
-        });
-    }
+    // Toolbar button/address-bar/shortcut wiring — Linux's real GTK header
+    // bar wires its own equivalent buttons (built as part of
+    // titlebar::linux::build) entirely independently, since none of them are
+    // wx widgets.
+    #[cfg(target_os = "linux")]
+    titlebar::linux::wire(&app, &linux_titlebar);
 
-    // wx's raw key events don't bubble from a focused child control up to
-    // the Frame (unlike GTK's, which do propagate to the toplevel unless a
-    // child stops them) — and wxdragon doesn't wrap `wxAcceleratorTable`, the
-    // usual fix for exactly this. Binding the same shortcut handler on the
-    // Frame *and* the address bar covers the common cases (browsing, typing
-    // a URL) without chasing every possible focus target.
-    let _ = bind_shortcut_handler(&app, &app.frame);
-    let _ = bind_shortcut_handler(&app, &app.address_bar);
+    #[cfg(not(target_os = "linux"))]
+    {
+        {
+            let app = Rc::clone(&app);
+            back_button.on_click(move |_| app.with_active(|p| p.go_back()));
+        }
+        {
+            let app = Rc::clone(&app);
+            forward_button.on_click(move |_| app.with_active(|p| p.go_forward()));
+        }
+        {
+            let app = Rc::clone(&app);
+            reload_button.on_click(move |_| app.with_active(|p| p.reload()));
+        }
+        {
+            let app = Rc::clone(&app);
+            address_bar.on_enter_pressed(move |_| {
+                let text = app.address_bar.get_value();
+                let url = resolve_address_input(&text, &app.settings());
+                app.with_active(|p| p.navigate(&url));
+            });
+        }
+        {
+            let app = Rc::clone(&app);
+            switcher_toggle.on_click(move |_| {
+                if app.is_switcher_open() {
+                    app.close_switcher();
+                } else {
+                    app.open_switcher();
+                }
+            });
+        }
+        {
+            let app = Rc::clone(&app);
+            settings_button.on_click(move |_| {
+                show_settings_dialog(&app);
+            });
+        }
+
+        // wx's raw key events don't bubble from a focused child control up to
+        // the Frame (unlike GTK's, which do propagate to the toplevel unless a
+        // child stops them) — and wxdragon doesn't wrap `wxAcceleratorTable`, the
+        // usual fix for exactly this. Binding the same shortcut handler on the
+        // Frame *and* the address bar covers the common cases (browsing, typing
+        // a URL) without chasing every possible focus target.
+        let _ = bind_shortcut_handler(&app, &app.frame);
+        let _ = bind_shortcut_handler(&app, &app.address_bar);
+    }
 
     app.frame.on_close(move |event| {
         if let WindowEventData::General(raw_event) = event {

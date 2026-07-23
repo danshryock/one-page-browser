@@ -226,7 +226,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "browser-core",
+ "gtk",
  "render-engine",
+ "windows 0.62.2",
  "wxdragon",
 ]
 

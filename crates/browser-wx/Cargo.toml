@@ -9,3 +9,18 @@ wxdragon = { version = "0.9", features = ["webview"] }
 render-engine = { path = "../render-engine" }
 browser-core = { path = "../browser-core" }
 anyhow = "1"
+
+# Custom title bar support (crates/browser-wx/src/titlebar/) — wxDragon has
+# no equivalent feature on either platform, so this reaches past it into raw
+# platform APIs: GTK's own header-bar-as-titlebar on Linux, hand-rolled
+# WM_NCHITTEST/WM_NCCALCSIZE handling on Windows. See src/titlebar/mod.rs.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_Graphics_Gdi",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
