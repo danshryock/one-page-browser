@@ -132,6 +132,14 @@ impl AppState {
         }
     }
 
+    /// Toggles reader mode on the active page — see
+    /// `WryEngine::toggle_reader_mode`'s doc comment for what it actually
+    /// does and its limitations. The toolbar button's action; a no-op if the
+    /// active page's engine isn't currently loaded.
+    pub fn toggle_reader_mode(self: &Rc<Self>) {
+        self.with_active(|engine| engine.toggle_reader_mode());
+    }
+
     pub fn add_page(self: &Rc<Self>, url: &str) -> anyhow::Result<()> {
         let id = self.core.borrow_mut().allocate_id();
 
@@ -866,6 +874,7 @@ impl AppState {
             Action::OpenProfilePicker => self.open_profile_picker(),
             Action::ToggleBookmark => self.toggle_bookmark_for_active(),
             Action::OpenBookmarks => self.open_bookmarks(),
+            Action::ToggleReaderMode => self.toggle_reader_mode(),
         }
     }
 
@@ -1543,6 +1552,12 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         gtk::IconSize::Button,
     )));
     screenshot_button.set_tooltip_text(Some("Save screenshot"));
+    let reader_mode_button = gtk::Button::new();
+    reader_mode_button.set_image(Some(&gtk::Image::from_icon_name(
+        Some("view-reader-symbolic"),
+        gtk::IconSize::Button,
+    )));
+    reader_mode_button.set_tooltip_text(Some("Toggle reader mode"));
     for button in [
         &back_button,
         &forward_button,
@@ -1553,6 +1568,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         &bookmark_toggle_button,
         &bookmarks_button,
         &screenshot_button,
+        &reader_mode_button,
     ] {
         button.style_context().add_class("flat");
     }
@@ -1589,6 +1605,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     header_bar.pack_end(&profile_button);
     header_bar.pack_end(&bookmarks_button);
     header_bar.pack_end(&screenshot_button);
+    header_bar.pack_end(&reader_mode_button);
 
     window.set_titlebar(Some(&header_bar));
 
@@ -2124,6 +2141,12 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         let app = Rc::clone(&app);
         screenshot_button.connect_clicked(move |_| {
             app.take_screenshot();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        reader_mode_button.connect_clicked(move |_| {
+            app.toggle_reader_mode();
         });
     }
     {

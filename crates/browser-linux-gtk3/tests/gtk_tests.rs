@@ -215,6 +215,35 @@ fn navigation_back_forward_reload() {
 }
 
 #[test]
+fn reader_mode_toggles_on_and_off() {
+    run_on_gtk_thread(|| {
+        let url_a = fixture_url("page_a.html");
+
+        let window = gtk::Window::new(gtk::WindowType::Toplevel);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        window.add(&content);
+        window.show_all();
+
+        let title = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let title_for_cb = std::rc::Rc::clone(&title);
+        let engine = WryEngine::new(&content, &url_a, move |new_title| {
+            *title_for_cb.borrow_mut() = new_title;
+        })
+        .expect("WryEngine::new should succeed");
+        assert!(wait_until(|| *title.borrow() == "Page A"), "initial load should reach page A");
+
+        engine.toggle_reader_mode().expect("toggle_reader_mode should succeed");
+        assert!(
+            wait_until(|| *title.borrow() == "Reader: Page A"),
+            "turning reader mode on should retitle the page to make it visually obvious"
+        );
+
+        engine.toggle_reader_mode().expect("toggle_reader_mode should succeed a second time");
+        assert!(wait_until(|| *title.borrow() == "Page A"), "turning reader mode off again should restore the original title");
+    });
+}
+
+#[test]
 fn page_lifecycle_add_switch_close() {
     run_on_gtk_thread(|| {
         let profile = test_profile("page-lifecycle");

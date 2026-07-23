@@ -72,6 +72,10 @@ build/run instructions.
   passed cross-process via argv. Found and fixed a real cross-compile break along the way: libsql's
   `encryption` feature needs `llvm-lib` when cross-compiling for MSVC, not available here, so it's now scoped
   to Linux only with a non-Linux stub. See `summaries/profile-passphrase-encryption.md`.
+- Reader mode (`render-engine::linux` + `browser-core` + `browser-linux-gtk3`): a hand-rolled content-
+  extraction heuristic (favors `<article>`/`<main>`, else the highest-scoring `<div>`/`<section>` by
+  paragraph count) injected via JS — not a vendored Readability.js (no network access here to fetch one).
+  See `summaries/reader-mode.md`.
 
 ## Next
 
@@ -82,7 +86,6 @@ Nothing specifically queued — pick the next item from the backlog below.
 - macOS: native chrome via AppKit, following the same `RenderEngine`-trait pattern as the other front ends.
 - `browser-windows-winui`: unified search/URL bar and bookmarks, matching what `browser-linux-gtk3` now has
   (both landed there only, per scope — see "Done" above).
-- Reader mode.
 - External password manager integration.
 - Internal password manager.
 - Changing/removing a profile's passphrase, or migrating an existing unencrypted profile to encrypted
