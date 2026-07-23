@@ -39,6 +39,11 @@ build/run instructions.
 - Separate `EditUrl`/`OpenSwitcher` actions (`browser-core` + `browser-linux-gtk3`): Ctrl+L now opens the
   switcher with the current URL preloaded and fully selected (not blanked); Ctrl+T/F1 keep the old
   blank-search behavior. See `summaries/edit-url-vs-new-page-actions.md`.
+- Private/incognito/guest profile (`browser-core` + `browser-linux-gtk3`): a single ephemeral
+  `Profile::ephemeral()` session covers all three names — `Settings`/`Keybindings` always start from
+  defaults, `Bookmarks` always starts empty, `HistoryStore` opens in-memory, and none of it is ever written
+  to disk. Launch via `--incognito`/`--private`/`--guest`, or the profile picker's new "New Private Window"
+  button. See `summaries/private-incognito-guest-profile.md`.
 
 ## Next
 
@@ -49,7 +54,6 @@ Nothing specifically queued — pick the next item from the backlog below.
 - macOS: native chrome via AppKit, following the same `RenderEngine`-trait pattern as the other front ends.
 - `browser-windows-winui`: unified search/URL bar and bookmarks, matching what `browser-linux-gtk3` now has
   (both landed there only, per scope — see "Done" above).
-- Private/incognito/guest profile.
 - Page screenshotting.
 - Reader mode.
 - External password manager integration.

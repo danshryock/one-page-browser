@@ -27,15 +27,24 @@ pub struct Bookmarks {
 impl Bookmarks {
     /// Loads bookmarks from `profile`'s config directory, falling back to
     /// an empty list if there's no file yet (first run) or it fails to
-    /// read/parse (e.g. from an incompatible older version).
+    /// read/parse (e.g. from an incompatible older version). An `ephemeral`
+    /// profile (private/incognito/guest) always starts empty, never reading
+    /// anything from disk.
     pub fn load(profile: &Profile) -> Self {
+        if profile.ephemeral {
+            return Self::default();
+        }
         profile.bookmarks_path().and_then(|path| Self::load_from(&path)).unwrap_or_default()
     }
 
     /// Saves bookmarks to `profile`'s config directory. Fails (rather than
     /// panicking) on I/O errors — callers should log and continue, not treat
-    /// this as fatal.
+    /// this as fatal. A no-op for an `ephemeral` profile: nothing about it is
+    /// ever written to disk.
     pub fn save(&self, profile: &Profile) -> anyhow::Result<()> {
+        if profile.ephemeral {
+            return Ok(());
+        }
         let path = profile
             .bookmarks_path()
             .ok_or_else(|| anyhow::anyhow!("no config directory available on this platform"))?;
@@ -195,5 +204,19 @@ mod tests {
         let path = temp_path("missing");
         let _ = std::fs::remove_file(&path);
         assert!(Bookmarks::load_from(&path).is_none());
+    }
+
+    #[test]
+    fn ephemeral_profile_never_touches_disk() {
+        let profile = crate::Profile::ephemeral();
+        let mut bookmarks = Bookmarks::load(&profile);
+        assert_eq!(bookmarks, Bookmarks::default(), "an ephemeral profile should always start empty");
+
+        bookmarks.add("https://example.com/a", "A", 100);
+        bookmarks.save(&profile).expect("save should report success even though it's a no-op");
+        assert!(
+            profile.bookmarks_path().map(|p| !p.exists()).unwrap_or(true),
+            "an ephemeral profile's bookmarks should never actually be written to disk"
+        );
     }
 }

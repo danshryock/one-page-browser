@@ -30,15 +30,24 @@ impl Settings {
 
     /// Loads settings from `profile`'s config directory, falling back to
     /// `Settings::default()` if there's no file yet (first run) or it fails
-    /// to read/parse (e.g. from an incompatible older version).
+    /// to read/parse (e.g. from an incompatible older version). An
+    /// `ephemeral` profile (private/incognito/guest) always gets a fresh
+    /// `Settings::default()`, never reading anything from disk.
     pub fn load(profile: &Profile) -> Self {
+        if profile.ephemeral {
+            return Self::default();
+        }
         profile.settings_path().and_then(|path| Self::load_from(&path)).unwrap_or_default()
     }
 
     /// Saves settings to `profile`'s config directory. Fails (rather than
     /// panicking) on I/O errors — callers should log and continue, not treat
-    /// this as fatal.
+    /// this as fatal. A no-op for an `ephemeral` profile: nothing about it is
+    /// ever written to disk.
     pub fn save(&self, profile: &Profile) -> anyhow::Result<()> {
+        if profile.ephemeral {
+            return Ok(());
+        }
         let path = profile
             .settings_path()
             .ok_or_else(|| anyhow::anyhow!("no config directory available on this platform"))?;
@@ -115,5 +124,19 @@ mod tests {
         let path = temp_path("missing");
         let _ = std::fs::remove_file(&path); // in case a previous run left it
         assert!(Settings::load_from(&path).is_none());
+    }
+
+    #[test]
+    fn ephemeral_profile_never_touches_disk() {
+        let profile = Profile::ephemeral();
+        let mut settings = Settings::load(&profile);
+        assert_eq!(settings, Settings::default(), "an ephemeral profile should always start from defaults");
+
+        settings.start_page = "https://should-never-be-saved.example".to_string();
+        settings.save(&profile).expect("save should report success even though it's a no-op");
+        assert!(
+            profile.settings_path().map(|p| !p.exists()).unwrap_or(true),
+            "an ephemeral profile's settings should never actually be written to disk"
+        );
     }
 }

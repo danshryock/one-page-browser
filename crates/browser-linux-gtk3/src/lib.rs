@@ -432,6 +432,16 @@ impl AppState {
         self.close_profile_picker();
     }
 
+    /// Launches a new, independent private/incognito/guest window — the
+    /// profile picker's "New Private Window" action. See
+    /// `Profile::ephemeral`'s doc comment for exactly what "private" means.
+    pub fn open_new_private_window(&self) {
+        if let Err(err) = browser_core::launch_new_ephemeral_process() {
+            eprintln!("failed to launch a new private window: {err}");
+        }
+        self.close_profile_picker();
+    }
+
     /// Shows the keybindings editor, rebuilt from the current `Keybindings`
     /// each time — see `open_switcher`'s doc comment for why it closes the
     /// other overlays first.
@@ -967,6 +977,18 @@ impl AppState {
         self.switcher_panel.is_visible()
     }
 
+    /// Whether this window belongs to an ephemeral (private/incognito/guest)
+    /// profile — test/inspection helper. More reliable than checking
+    /// `window.title()` directly: with a custom `GtkHeaderBar` set as the
+    /// window's titlebar (as this app always does), `gtk_window_get_title()`
+    /// doesn't reliably reflect what was passed to `set_title` under every
+    /// compositor — confirmed empirically while testing this feature, not
+    /// merely suspected — so tests (and any other code) should check this
+    /// instead of the window's own title property.
+    pub fn is_ephemeral(&self) -> bool {
+        self.profile.ephemeral
+    }
+
     /// Whether the page stack (and so the background webview) can currently
     /// take input/focus — test/inspection helper.
     pub fn is_background_page_interactive(&self) -> bool {
@@ -1110,7 +1132,7 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     }
 
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
-    window.set_title("claude-browser");
+    window.set_title(if profile.ephemeral { "claude-browser (Private)" } else { "claude-browser" });
     window.set_default_size(1024, 768);
     window.connect_delete_event(|_, _| {
         gtk::main_quit();
@@ -1368,7 +1390,9 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
 
     let profile_buttons_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     profile_buttons_row.set_halign(gtk::Align::End);
+    let new_private_window_button = gtk::Button::with_label("New Private Window");
     let profile_cancel_button = gtk::Button::with_label("Cancel");
+    profile_buttons_row.pack_start(&new_private_window_button, false, false, 0);
     profile_buttons_row.pack_start(&profile_cancel_button, false, false, 0);
     profile_box.pack_start(&profile_buttons_row, false, false, 0);
 
@@ -1456,10 +1480,11 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     profile_overlay.hide();
     keybindings_overlay.hide();
     bookmarks_overlay.hide();
-    window.set_title("claude-browser");
 
     let settings = Settings::load(&profile);
-    let history = HistoryStore::open(&profile)?;
+    // An ephemeral (private/incognito/guest) profile's history should never
+    // touch disk at all — see `Profile::ephemeral`'s doc comment.
+    let history = if profile.ephemeral { HistoryStore::open_in_memory()? } else { HistoryStore::open(&profile)? };
     let bookmarks = Bookmarks::load(&profile);
     let core = PageManager::new(settings.max_loaded_pages);
     let app = Rc::new(AppState {
@@ -1681,6 +1706,12 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         let app = Rc::clone(&app);
         create_profile_button.connect_clicked(move |_| {
             app.create_and_open_profile();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        new_private_window_button.connect_clicked(move |_| {
+            app.open_new_private_window();
         });
     }
     {

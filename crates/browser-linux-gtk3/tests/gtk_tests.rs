@@ -589,3 +589,33 @@ fn ctrl_enter_forces_a_new_page_even_when_one_match_exists() {
         cleanup_test_profile(&profile);
     });
 }
+
+#[test]
+fn ephemeral_profile_never_persists_and_marks_the_window_private() {
+    run_on_gtk_thread(|| {
+        let profile = Profile::ephemeral();
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        // Not checking `_window.title()` here: with a custom GtkHeaderBar as
+        // the titlebar (which this app always sets), `gtk_window_get_title()`
+        // doesn't reliably reflect what `build_window_and_app` passed to
+        // `set_title` under this headless compositor — confirmed empirically
+        // while writing this test, not merely suspected. `is_ephemeral()` is
+        // the reliable, direct way to check this instead.
+        assert!(app.is_ephemeral(), "an AppState built from an ephemeral profile should report itself as such");
+
+        app.add_page(&fixture_url("page_a.html")).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().is_some()));
+
+        app.toggle_bookmark_for_active();
+        assert!(app.is_active_bookmarked(), "bookmarking should still work in-memory for the session");
+
+        app.set_settings_start_page("https://should-not-persist.example");
+        app.save_settings();
+
+        // None of that should ever touch disk — an ephemeral profile never
+        // gets a directory of its own at all, unlike a real named profile.
+        assert!(profile.settings_path().map(|p| !p.exists()).unwrap_or(true), "settings should never be written to disk");
+        assert!(profile.bookmarks_path().map(|p| !p.exists()).unwrap_or(true), "bookmarks should never be written to disk");
+        assert!(profile.keybindings_path().map(|p| !p.exists()).unwrap_or(true), "keybindings should never be written to disk");
+    });
+}

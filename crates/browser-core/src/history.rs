@@ -70,6 +70,21 @@ impl HistoryStore {
         Ok(Self { _db: db, conn, rt })
     }
 
+    /// Opens a history store that never touches disk at all — nothing to
+    /// clean up, and it vanishes the moment the process exits. Used for
+    /// ephemeral (private/incognito/guest) profiles, where recording history
+    /// at all would defeat the point, but the switcher grid's history search
+    /// still expects a real `HistoryStore` to query against (an empty one,
+    /// in this case, for the lifetime of the session).
+    pub fn open_in_memory() -> anyhow::Result<Self> {
+        // libsql (like the sqlite3 it wraps) treats the literal path
+        // ":memory:" as a request for a private, in-process-only database
+        // rather than a real file — confirmed against this exact libsql
+        // version rather than assumed, since it's not a documented
+        // `Builder` method of its own.
+        Self::open_at(Path::new(":memory:"))
+    }
+
     /// Records a fresh visit to `url` with its (possibly just-updated)
     /// `title`. Upserts by `url`: a repeat visit updates `title`/`visited_at`
     /// and increments `visit_count`, rather than growing an unbounded visit
@@ -181,5 +196,14 @@ mod tests {
     fn empty_store_returns_no_results_without_erroring() {
         let store = temp_store("empty");
         assert_eq!(store.search("anything", 10).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn in_memory_store_records_and_searches_without_touching_disk() {
+        let store = HistoryStore::open_in_memory().expect("in-memory open should succeed");
+        store.record_visit("https://example.com/a", "A").unwrap();
+        let results = store.search("example.com", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://example.com/a");
     }
 }

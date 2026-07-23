@@ -96,15 +96,24 @@ pub struct Keybindings(HashMap<Action, Vec<KeyChord>>);
 impl Keybindings {
     /// Loads keybindings from `profile`'s config directory, falling back to
     /// `Keybindings::default()` if there's no file yet (first run) or it
-    /// fails to read/parse (e.g. from an incompatible older version).
+    /// fails to read/parse (e.g. from an incompatible older version). An
+    /// `ephemeral` profile (private/incognito/guest) always gets fresh
+    /// defaults, never reading anything from disk.
     pub fn load(profile: &Profile) -> Self {
+        if profile.ephemeral {
+            return Self::default();
+        }
         profile.keybindings_path().and_then(|path| Self::load_from(&path)).unwrap_or_default()
     }
 
     /// Saves keybindings to `profile`'s config directory. Fails (rather than
     /// panicking) on I/O errors — callers should log and continue, not treat
-    /// this as fatal.
+    /// this as fatal. A no-op for an `ephemeral` profile: nothing about it is
+    /// ever written to disk.
     pub fn save(&self, profile: &Profile) -> anyhow::Result<()> {
+        if profile.ephemeral {
+            return Ok(());
+        }
         let path = profile
             .keybindings_path()
             .ok_or_else(|| anyhow::anyhow!("no config directory available on this platform"))?;
@@ -236,5 +245,19 @@ mod tests {
     fn key_chord_display_renders_modifiers_in_order() {
         assert_eq!(KeyChord::new(true, true, true, "T").to_string(), "Ctrl+Alt+Shift+T");
         assert_eq!(KeyChord::new(false, false, false, "F1").to_string(), "F1");
+    }
+
+    #[test]
+    fn ephemeral_profile_never_touches_disk() {
+        let profile = crate::Profile::ephemeral();
+        let mut kb = Keybindings::load(&profile);
+        assert_eq!(kb, Keybindings::default(), "an ephemeral profile should always start from defaults");
+
+        kb.set_bindings(Action::ClosePage, vec![KeyChord::new(false, true, false, "F4")]);
+        kb.save(&profile).expect("save should report success even though it's a no-op");
+        assert!(
+            profile.keybindings_path().map(|p| !p.exists()).unwrap_or(true),
+            "an ephemeral profile's keybindings should never actually be written to disk"
+        );
     }
 }

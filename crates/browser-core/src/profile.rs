@@ -9,6 +9,14 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
     pub name: String,
+    /// A private/incognito/guest session: nothing about it is ever written
+    /// to disk (`Settings`/`Keybindings` fall back to their defaults and
+    /// silently no-op on save, `Bookmarks` stays empty and never saves, and
+    /// `HistoryStore` is opened in-memory via `HistoryStore::open_in_memory`)
+    /// so the whole profile vanishes the moment the process exits — see
+    /// `Profile::ephemeral`. `name` is still set (to `"Private Browsing"`)
+    /// for display purposes even though no path is ever derived from it.
+    pub ephemeral: bool,
 }
 
 impl Profile {
@@ -19,7 +27,15 @@ impl Profile {
     pub fn new(name: impl Into<String>) -> Self {
         let name = name.into();
         let is_safe = !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\']);
-        Self { name: if is_safe { name } else { "default".to_string() } }
+        Self { name: if is_safe { name } else { "default".to_string() }, ephemeral: false }
+    }
+
+    /// A private/incognito/guest profile: see the `ephemeral` field doc for
+    /// exactly what "private" means here. Every call creates a distinct,
+    /// unlinked session — there's nothing to name or look up later, unlike
+    /// `Profile::new`'s named, persistent profiles.
+    pub fn ephemeral() -> Self {
+        Self { name: "Private Browsing".to_string(), ephemeral: true }
     }
 
     pub fn settings_path(&self) -> Option<PathBuf> {
@@ -74,6 +90,15 @@ pub fn resolve_profile_name<I: IntoIterator<Item = String>>(args: I) -> String {
         }
     }
     "default".to_string()
+}
+
+/// Whether `--incognito`, `--private`, or `--guest` was passed — three names
+/// for the same `Profile::ephemeral()` session (see its doc comment), kept
+/// as synonyms since different users reach for different terms for exactly
+/// the same thing. Takes an iterator for the same testability reason as
+/// `resolve_profile_name`.
+pub fn resolve_ephemeral_requested<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter().any(|arg| arg == "--incognito" || arg == "--private" || arg == "--guest")
 }
 
 /// Pulls the first positional (non-flag) argument out — used for launching
@@ -140,6 +165,15 @@ fn list_profile_names_in(dir: &Path) -> Vec<String> {
 pub fn launch_new_profile_process(profile_name: &str) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     std::process::Command::new(exe).arg("--profile").arg(profile_name).spawn()?;
+    Ok(())
+}
+
+/// Launches a new, independent instance of this same binary in a fresh
+/// `Profile::ephemeral()` session — same spawn-and-forget reasoning as
+/// `launch_new_profile_process`.
+pub fn launch_new_ephemeral_process() -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe).arg("--incognito").spawn()?;
     Ok(())
 }
 
@@ -224,6 +258,22 @@ mod tests {
     #[test]
     fn default_profile_is_named_default() {
         assert_eq!(Profile::default().name, "default");
+        assert!(!Profile::default().ephemeral, "the default profile should be a normal, persistent one");
+    }
+
+    #[test]
+    fn ephemeral_profile_is_marked_ephemeral() {
+        let profile = Profile::ephemeral();
+        assert!(profile.ephemeral);
+    }
+
+    #[test]
+    fn resolve_ephemeral_requested_recognizes_all_three_synonyms() {
+        assert!(resolve_ephemeral_requested(args(&["program", "--incognito"])));
+        assert!(resolve_ephemeral_requested(args(&["program", "--private"])));
+        assert!(resolve_ephemeral_requested(args(&["program", "--guest"])));
+        assert!(!resolve_ephemeral_requested(args(&["program", "--profile", "work"])));
+        assert!(!resolve_ephemeral_requested(args(&[])));
     }
 
     #[test]
