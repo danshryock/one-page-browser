@@ -121,6 +121,18 @@ fn list_profile_names_in(dir: &Path) -> Vec<String> {
     names
 }
 
+/// Launches a new, independent instance of this same binary scoped to
+/// `profile_name` — used by the in-app profile picker: switching profiles
+/// means a new process, not swapping state in the running one, the same
+/// reasoning as the external-link chooser (`show_external_link_chooser`)
+/// already uses. Spawn-and-forget: the child runs independently of this
+/// process either way, so nothing here waits on or tracks it further.
+pub fn launch_new_profile_process(profile_name: &str) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe).arg("--profile").arg(profile_name).spawn()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -70,6 +70,12 @@ pub struct AppState {
     engine_combo: ComboBox,
     unlimited_check: CheckBox,
     limit_box: TextBox,
+    profile_overlay: Grid,
+    /// Rebuilt from `browser_core::list_profile_names()` each time the
+    /// picker opens — holds one row per existing profile.
+    profile_list_panel: StackPanel,
+    new_profile_box: TextBox,
+    new_profile_box_focused: Cell<bool>,
     core: RefCell<PageManager<WebView2Engine>>,
     /// Per-page container, keyed by page id — `browser_core::Page` doesn't
     /// hold these since they're a WinUI3-only concept. Each is a plain
@@ -223,6 +229,8 @@ impl AppState {
     }
 
     pub fn open_switcher(self: &Rc<Self>) {
+        self.close_settings();
+        self.close_profile_picker();
         let _ = self.search_box.SetText(&HSTRING::new());
         self.rebuild_switcher_grid();
         let _ = self.content_grid.SetIsHitTestVisible(false);
@@ -235,6 +243,8 @@ impl AppState {
     }
 
     pub fn open_settings(self: &Rc<Self>) {
+        self.close_switcher();
+        self.close_profile_picker();
         let settings = self.settings.borrow();
         let _ = self.start_page_box.SetText(&HSTRING::from(&settings.start_page));
         for (index, engine) in settings.search_engines.iter().enumerate() {
@@ -297,6 +307,78 @@ impl AppState {
             eprintln!("failed to save settings: {err}");
         }
         self.close_settings();
+    }
+
+    /// Shows the profile picker, rebuilt from `list_profile_names()` each
+    /// time (so a profile created in an earlier visit shows up).
+    pub fn open_profile_picker(self: &Rc<Self>) {
+        self.close_switcher();
+        self.close_settings();
+        let _ = self.new_profile_box.SetText(&HSTRING::new());
+        self.rebuild_profile_list();
+        let _ = self.content_grid.SetIsHitTestVisible(false);
+        let _ = self.profile_overlay.SetVisibility(Visibility::Visible);
+    }
+
+    pub fn close_profile_picker(&self) {
+        let _ = self.profile_overlay.SetVisibility(Visibility::Collapsed);
+        let _ = self.content_grid.SetIsHitTestVisible(true);
+    }
+
+    /// Rebuilds the profile picker's list of rows from scratch. The current
+    /// profile is marked and, unlike every other row, clicking it just
+    /// closes the picker instead of launching a duplicate process of the
+    /// profile already running.
+    fn rebuild_profile_list(self: &Rc<Self>) {
+        let Ok(children) = self.profile_list_panel.Children() else { return };
+        let _ = children.Clear();
+
+        for name in browser_core::list_profile_names() {
+            let is_current = name == self.profile.name;
+            let label_text = if is_current { format!("{name} (current)") } else { name.clone() };
+            let Ok(row) = Button::new() else { continue };
+            let _ = row.SetHorizontalAlignment(HorizontalAlignment::Stretch);
+            if let Ok(label) = TextBlock::new() {
+                let _ = label.SetText(&HSTRING::from(&label_text));
+                let _ = row.SetContent(&label);
+            }
+
+            let app_clone = Rc::clone(self);
+            let name_clone = name.clone();
+            let state = AssertSend((app_clone, name_clone, is_current));
+            let _ = row.Click(&winui3::Microsoft::UI::Xaml::RoutedEventHandler::new(move |_, _| {
+                let state = &state;
+                let (app, name, is_current) = &state.0;
+                if *is_current {
+                    app.close_profile_picker();
+                } else {
+                    if let Err(err) = browser_core::launch_new_profile_process(name) {
+                        eprintln!("failed to launch a new process for profile {name:?}: {err}");
+                    }
+                    app.close_profile_picker();
+                }
+                Ok(())
+            }));
+
+            let _ = children.Append(&row);
+        }
+    }
+
+    /// Reads the new-profile field and launches a new process for it — the
+    /// profile picker's "Create & Open" action. The new process creates the
+    /// profile's directory lazily on first `Settings`/`HistoryStore` access;
+    /// nothing needs pre-creating here.
+    pub fn create_and_open_profile(&self) {
+        let Ok(text) = self.new_profile_box.Text() else { return };
+        let name = text.to_string();
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        if let Err(err) = browser_core::launch_new_profile_process(name) {
+            eprintln!("failed to launch a new process for profile {name:?}: {err}");
+        }
+        self.close_profile_picker();
     }
 
     fn matching_page_ids(&self, query: &str) -> Vec<String> {
@@ -554,6 +636,7 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<Rc<AppState>> {
     let reload_button = icon_button("\u{27f3}")?;
     let switcher_toggle = icon_button("\u{229e}")?;
     let settings_button = icon_button("\u{2699}")?;
+    let profile_button = icon_button("\u{1f464}")?;
 
     let address_bar = TextBox::new()?;
     address_bar.SetWidth(500.0)?;
@@ -565,6 +648,7 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<Rc<AppState>> {
     toolbar.Children()?.Append(&address_bar)?;
     toolbar.Children()?.Append(&switcher_toggle)?;
     toolbar.Children()?.Append(&settings_button)?;
+    toolbar.Children()?.Append(&profile_button)?;
     root_grid.Children()?.Append(&toolbar)?;
 
     // --- Content row: page host + switcher overlay + settings overlay ---
@@ -661,6 +745,45 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<Rc<AppState>> {
     buttons_row.Children()?.Append(&save_button)?;
     settings_panel.Children()?.Append(&buttons_row)?;
 
+    // --- Profile picker overlay: same shape as the settings overlay above.
+    // Lists existing profiles (rebuilt each time it opens) plus a field to
+    // create a new one — picking any profile other than the current one
+    // launches a new, independent process scoped to it
+    // (`launch_new_profile_process`) rather than switching this window in
+    // place.
+    let profile_overlay = Grid::new()?;
+    Grid::SetRow(&profile_overlay, 1)?;
+    profile_overlay.SetVisibility(Visibility::Collapsed)?;
+    root_grid.Children()?.Append(&profile_overlay)?;
+
+    let profile_panel = StackPanel::new()?;
+    profile_panel.SetOrientation(Orientation::Vertical)?;
+    profile_panel.SetHorizontalAlignment(HorizontalAlignment::Center)?;
+    profile_panel.SetVerticalAlignment(VerticalAlignment::Center)?;
+    profile_panel.SetWidth(360.0)?;
+    profile_overlay.Children()?.Append(&profile_panel)?;
+
+    let profile_title = TextBlock::new()?;
+    profile_title.SetText(&HSTRING::from("Profiles"))?;
+    profile_panel.Children()?.Append(&profile_title)?;
+
+    let profile_list_panel = StackPanel::new()?;
+    profile_list_panel.SetOrientation(Orientation::Vertical)?;
+    profile_panel.Children()?.Append(&profile_list_panel)?;
+
+    let new_profile_box = TextBox::new()?;
+    new_profile_box.SetPlaceholderText(&HSTRING::from("New profile name\u{2026}"))?;
+    profile_panel.Children()?.Append(&new_profile_box)?;
+
+    let profile_buttons_row = StackPanel::new()?;
+    profile_buttons_row.SetOrientation(Orientation::Horizontal)?;
+    profile_buttons_row.SetHorizontalAlignment(HorizontalAlignment::Right)?;
+    let profile_cancel_button = icon_button("Cancel")?;
+    let create_profile_button = icon_button("Create & Open")?;
+    profile_buttons_row.Children()?.Append(&profile_cancel_button)?;
+    profile_buttons_row.Children()?.Append(&create_profile_button)?;
+    profile_panel.Children()?.Append(&profile_buttons_row)?;
+
     window.SetContent(&root_grid)?;
     window.SetExtendsContentIntoTitleBar(true)?;
     window.SetTitleBar(&toolbar)?;
@@ -682,6 +805,10 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<Rc<AppState>> {
         engine_combo,
         unlimited_check,
         limit_box,
+        profile_overlay,
+        profile_list_panel,
+        new_profile_box: new_profile_box.clone(),
+        new_profile_box_focused: Cell::new(false),
         core: RefCell::new(core),
         containers: RefCell::new(HashMap::new()),
         settings: RefCell::new(settings),
@@ -690,6 +817,7 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<Rc<AppState>> {
     });
 
     wire_events(&app, &back_button, &forward_button, &reload_button, &address_bar, &switcher_toggle, &settings_button, &search_box, &cancel_button, &save_button)?;
+    wire_profile_picker_events(&app, &profile_button, &profile_cancel_button, &create_profile_button, &new_profile_box)?;
     install_hwnd_subclass(&app, &window)?;
 
     Ok(app)
@@ -784,6 +912,55 @@ fn wire_events(
     Ok(())
 }
 
+fn wire_profile_picker_events(
+    app: &Rc<AppState>,
+    profile_button: &Button,
+    profile_cancel_button: &Button,
+    create_profile_button: &Button,
+    new_profile_box: &TextBox,
+) -> anyhow::Result<()> {
+    use winui3::Microsoft::UI::Xaml::RoutedEventHandler;
+
+    macro_rules! on_click {
+        ($button:expr, $app:ident, $body:expr) => {{
+            let state = AssertSend(Rc::clone(app));
+            $button.Click(&RoutedEventHandler::new(move |_, _| {
+                let state = &state;
+                let $app = &state.0;
+                $body;
+                Ok(())
+            }))?;
+        }};
+    }
+
+    on_click!(profile_button, app, app.open_profile_picker());
+    on_click!(profile_cancel_button, app, app.close_profile_picker());
+    on_click!(create_profile_button, app, app.create_and_open_profile());
+
+    // No working `KeyDown` on `TextBox` in this crate (see this module's
+    // doc comment) — Enter-to-submit goes through the same focus-flag +
+    // HWND-subclass `WM_KEYDOWN` route as the address bar/search box
+    // instead (see `new_profile_box_focused` and `subclass_proc`).
+    {
+        let state = AssertSend(Rc::clone(app));
+        new_profile_box.GotFocus(&RoutedEventHandler::new(move |_, _| {
+            let state = &state;
+            state.0.new_profile_box_focused.set(true);
+            Ok(())
+        }))?;
+    }
+    {
+        let state = AssertSend(Rc::clone(app));
+        new_profile_box.LostFocus(&RoutedEventHandler::new(move |_, _| {
+            let state = &state;
+            state.0.new_profile_box_focused.set(false);
+            Ok(())
+        }))?;
+    }
+
+    Ok(())
+}
+
 /// See this module's doc comment: `Window` has no working `Closed` event and
 /// `UIElement` has no working `KeyDown` event in this crate's bindings, so
 /// both go through a raw `HWND` subclass instead — the same technique
@@ -828,6 +1005,8 @@ unsafe extern "system" fn subclass_proc(
                     app.close_switcher();
                 } else if app.settings_overlay.Visibility().ok() == Some(Visibility::Visible) {
                     app.close_settings();
+                } else if app.profile_overlay.Visibility().ok() == Some(Visibility::Visible) {
+                    app.close_profile_picker();
                 }
             } else if ctrl && vk == b'W' as u16 {
                 let id = app.core.borrow().active_id().to_string();
@@ -838,6 +1017,8 @@ unsafe extern "system" fn subclass_proc(
                         let url = resolve_address_input(&text.to_string(), &app.settings());
                         app.with_active(|p| p.navigate(&url));
                     }
+                } else if app.new_profile_box_focused.get() {
+                    app.create_and_open_profile();
                 } else if app.search_box_focused.get() {
                     if let Ok(text) = app.search_box.Text() {
                         let trimmed = text.to_string();

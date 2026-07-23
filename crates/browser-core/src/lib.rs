@@ -15,7 +15,7 @@ mod history;
 mod profile;
 mod settings;
 pub use history::{HistoryEntry, HistoryStore};
-pub use profile::{list_profile_names, resolve_profile_name, resolve_url_argument, Profile};
+pub use profile::{launch_new_profile_process, list_profile_names, resolve_profile_name, resolve_url_argument, Profile};
 pub use settings::{SearchEngine, Settings};
 
 pub const HOME_URL: &str = "about:blank";

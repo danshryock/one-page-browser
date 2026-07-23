@@ -31,6 +31,13 @@ pub struct AppState {
     engine_combo: gtk::ComboBoxText,
     unlimited_check: gtk::CheckButton,
     limit_spin: gtk::SpinButton,
+    /// The profile picker overlay's root widget — same in-window-overlay
+    /// pattern as `settings_panel`/`switcher_panel`.
+    profile_panel: gtk::Widget,
+    /// Rebuilt from `browser_core::list_profile_names()` each time the
+    /// picker opens — holds one row per existing profile.
+    profile_list_box: gtk::Box,
+    new_profile_entry: gtk::Entry,
     core: RefCell<PageManager<WryEngine>>,
     /// GTK `Stack` children, keyed by page id — `browser_core::Page` doesn't
     /// hold these since they're a GTK-only concept.
@@ -190,13 +197,14 @@ impl AppState {
     /// the grid-button toggle as well as the F1 / Ctrl+T / Ctrl+L shortcuts.
     /// The page stack is made insensitive so the background webview can't
     /// steal keyboard focus (or process key/pointer input at all) while the
-    /// grid is up. Closes the settings overlay first if it's open — the
-    /// header bar's switcher/settings buttons are both reachable regardless
-    /// of which overlay (if any) is currently shown, so both `open_*`
-    /// methods defensively close the other rather than ever showing both at
-    /// once.
+    /// grid is up. Closes the other overlays first if either is open — the
+    /// header bar's switcher/settings/profile buttons are all reachable
+    /// regardless of which overlay (if any) is currently shown, so every
+    /// `open_*` method defensively closes the other two rather than ever
+    /// showing more than one at once.
     pub fn open_switcher(self: &Rc<Self>) {
         self.close_settings();
+        self.close_profile_picker();
         self.search_entry.set_text("");
         self.rebuild_switcher_grid();
         self.stack.set_sensitive(false);
@@ -213,10 +221,11 @@ impl AppState {
     }
 
     /// Shows the settings overlay, populated from the current `Settings`.
-    /// See `open_switcher`'s doc comment for why it closes the switcher grid
+    /// See `open_switcher`'s doc comment for why it closes the other overlays
     /// first.
     pub fn open_settings(self: &Rc<Self>) {
         self.close_switcher();
+        self.close_profile_picker();
         let settings = self.settings.borrow();
         self.start_page_entry.set_text(&settings.start_page);
         self.engine_combo.set_active_id(Some(&settings.default_search_engine));
@@ -272,6 +281,84 @@ impl AppState {
     /// helper.
     pub fn is_settings_open(&self) -> bool {
         self.settings_panel.is_visible()
+    }
+
+    /// Shows the profile picker, rebuilt from `list_profile_names()` each
+    /// time (so a profile created in an earlier visit to this picker shows
+    /// up) — see `open_switcher`'s doc comment for why it closes the other
+    /// overlays first.
+    pub fn open_profile_picker(self: &Rc<Self>) {
+        self.close_switcher();
+        self.close_settings();
+        self.new_profile_entry.set_text("");
+        self.rebuild_profile_list();
+        self.stack.set_sensitive(false);
+        self.profile_panel.show();
+    }
+
+    /// Hides the profile picker. Always use this (rather than hiding
+    /// `profile_panel` directly) so the stack never gets left insensitive.
+    pub fn close_profile_picker(&self) {
+        self.profile_panel.hide();
+        self.stack.set_sensitive(true);
+    }
+
+    /// Whether the profile picker is currently shown — test/inspection
+    /// helper.
+    pub fn is_profile_picker_open(&self) -> bool {
+        self.profile_panel.is_visible()
+    }
+
+    /// Rebuilds the profile picker's list of rows from scratch. The current
+    /// profile is marked and, unlike every other row, clicking it just
+    /// closes the picker instead of launching a duplicate process of the
+    /// profile already running.
+    fn rebuild_profile_list(self: &Rc<Self>) {
+        for child in self.profile_list_box.children() {
+            self.profile_list_box.remove(&child);
+        }
+
+        for name in list_profile_names() {
+            let is_current = name == self.profile.name;
+            let label_text = if is_current { format!("{name} (current)") } else { name.clone() };
+            let row = gtk::Button::with_label(&label_text);
+            row.style_context().add_class("flat");
+            if is_current {
+                row.style_context().add_class("current-profile-row");
+            }
+
+            let app_clone = Rc::clone(self);
+            let name_clone = name.clone();
+            row.connect_clicked(move |_| {
+                if is_current {
+                    app_clone.close_profile_picker();
+                    return;
+                }
+                if let Err(err) = browser_core::launch_new_profile_process(&name_clone) {
+                    eprintln!("failed to launch a new process for profile {name_clone:?}: {err}");
+                }
+                app_clone.close_profile_picker();
+            });
+
+            self.profile_list_box.pack_start(&row, false, false, 0);
+        }
+        self.profile_list_box.show_all();
+    }
+
+    /// Reads the new-profile field and launches a new process for it — the
+    /// profile picker's "Create & Open" action. The new process creates the
+    /// profile's directory lazily on first `Settings`/`HistoryStore` access;
+    /// nothing needs pre-creating here.
+    pub fn create_and_open_profile(&self) {
+        let name = self.new_profile_entry.text().to_string();
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        if let Err(err) = browser_core::launch_new_profile_process(name) {
+            eprintln!("failed to launch a new process for profile {name:?}: {err}");
+        }
+        self.close_profile_picker();
     }
 
     /// Ids of pages matching `query` (case-insensitive substring of title or
@@ -657,7 +744,12 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         Some("preferences-system-symbolic"),
         gtk::IconSize::Button,
     )));
-    for button in [&back_button, &forward_button, &reload_button, &switcher_toggle, &settings_button] {
+    let profile_button = gtk::Button::new();
+    profile_button.set_image(Some(&gtk::Image::from_icon_name(
+        Some("avatar-default-symbolic"),
+        gtk::IconSize::Button,
+    )));
+    for button in [&back_button, &forward_button, &reload_button, &switcher_toggle, &settings_button, &profile_button] {
         button.style_context().add_class("flat");
     }
 
@@ -689,6 +781,7 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
 
     header_bar.pack_end(&switcher_toggle);
     header_bar.pack_end(&settings_button);
+    header_bar.pack_end(&profile_button);
 
     window.set_titlebar(Some(&header_bar));
 
@@ -810,15 +903,62 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     settings_overlay.add(&settings_scrim);
     settings_overlay.add_overlay(&settings_box);
 
+    // --- Profile picker overlay: same in-window-overlay pattern again.
+    // Lists existing profiles (from `list_profile_names()`, rebuilt each
+    // time it opens) plus a field to create a new one — picking any profile
+    // other than the current one launches a new, independent process
+    // scoped to it (`launch_new_profile_process`) rather than switching this
+    // window in place.
+    let profile_scrim = gtk::EventBox::new();
+    profile_scrim.style_context().add_class("switcher-scrim");
+    profile_scrim
+        .style_context()
+        .add_provider(&scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+    let profile_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    profile_box.set_halign(gtk::Align::Center);
+    profile_box.set_valign(gtk::Align::Center);
+    profile_box.style_context().add_class("settings-box");
+    profile_box.set_margin(24);
+
+    let profile_title = gtk::Label::new(Some("Profiles"));
+    profile_title.style_context().add_class("settings-title");
+    profile_title.set_halign(gtk::Align::Start);
+    profile_box.pack_start(&profile_title, false, false, 0);
+
+    let profile_list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    profile_box.pack_start(&profile_list_box, false, false, 0);
+
+    let new_profile_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let new_profile_entry = gtk::Entry::new();
+    new_profile_entry.set_placeholder_text(Some("New profile name\u{2026}"));
+    new_profile_entry.set_hexpand(true);
+    let create_profile_button = gtk::Button::with_label("Create & Open");
+    new_profile_row.pack_start(&new_profile_entry, true, true, 0);
+    new_profile_row.pack_start(&create_profile_button, false, false, 0);
+    profile_box.pack_start(&new_profile_row, false, false, 0);
+
+    let profile_buttons_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    profile_buttons_row.set_halign(gtk::Align::End);
+    let profile_cancel_button = gtk::Button::with_label("Cancel");
+    profile_buttons_row.pack_start(&profile_cancel_button, false, false, 0);
+    profile_box.pack_start(&profile_buttons_row, false, false, 0);
+
+    let profile_overlay = gtk::Overlay::new();
+    profile_overlay.add(&profile_scrim);
+    profile_overlay.add_overlay(&profile_box);
+
     let root_overlay = gtk::Overlay::new();
     root_overlay.add(&stack);
     root_overlay.add_overlay(&switcher_overlay);
     root_overlay.add_overlay(&settings_overlay);
+    root_overlay.add_overlay(&profile_overlay);
 
     window.add(&root_overlay);
     window.show_all();
     switcher_overlay.hide();
     settings_overlay.hide();
+    profile_overlay.hide();
     window.set_title("claude-browser");
 
     let settings = Settings::load(&profile);
@@ -835,6 +975,9 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         engine_combo: engine_combo.clone(),
         unlimited_check: unlimited_check.clone(),
         limit_spin: limit_spin.clone(),
+        profile_panel: profile_overlay.clone().upcast::<gtk::Widget>(),
+        profile_list_box: profile_list_box.clone(),
+        new_profile_entry: new_profile_entry.clone(),
         core: RefCell::new(core),
         containers: RefCell::new(HashMap::new()),
         settings: RefCell::new(settings),
@@ -995,6 +1138,37 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     }
     {
         let app = Rc::clone(&app);
+        profile_button.connect_clicked(move |_| {
+            app.open_profile_picker();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        profile_scrim.connect_button_press_event(move |_, _| {
+            app.close_profile_picker();
+            gtk::glib::Propagation::Stop
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        profile_cancel_button.connect_clicked(move |_| {
+            app.close_profile_picker();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        create_profile_button.connect_clicked(move |_| {
+            app.create_and_open_profile();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        new_profile_entry.connect_activate(move |_| {
+            app.create_and_open_profile();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
         window.connect_key_press_event(move |_, event| {
             let ctrl = event.state().contains(gtk::gdk::ModifierType::CONTROL_MASK);
             let keyval = event.keyval();
@@ -1012,6 +1186,9 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
                 gtk::glib::Propagation::Stop
             } else if is_escape && app.is_settings_open() {
                 app.close_settings();
+                gtk::glib::Propagation::Stop
+            } else if is_escape && app.is_profile_picker_open() {
+                app.close_profile_picker();
                 gtk::glib::Propagation::Stop
             } else if ctrl && is_w {
                 app.close_page(&app.active_id());
