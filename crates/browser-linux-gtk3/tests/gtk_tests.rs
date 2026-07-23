@@ -41,7 +41,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use browser_core::Profile;
+use browser_core::{Action, Profile};
 use browser_linux_gtk3::build_window_and_app;
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
@@ -617,5 +617,29 @@ fn ephemeral_profile_never_persists_and_marks_the_window_private() {
         assert!(profile.settings_path().map(|p| !p.exists()).unwrap_or(true), "settings should never be written to disk");
         assert!(profile.bookmarks_path().map(|p| !p.exists()).unwrap_or(true), "bookmarks should never be written to disk");
         assert!(profile.keybindings_path().map(|p| !p.exists()).unwrap_or(true), "keybindings should never be written to disk");
+    });
+}
+
+#[test]
+fn keybindings_editor_lives_inside_settings() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("keybindings-in-settings");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        // The keybindings editor is no longer its own overlay/toolbar
+        // button — it's folded into settings, rebuilt every time settings
+        // opens, one row per Action::ALL.
+        app.open_settings();
+        assert!(app.is_settings_open());
+        assert_eq!(
+            app.keybindings_row_count(),
+            Action::ALL.len(),
+            "opening settings should populate the keybindings editor with one row per action"
+        );
+
+        app.close_settings();
+        assert!(!app.is_settings_open());
+
+        cleanup_test_profile(&profile);
     });
 }

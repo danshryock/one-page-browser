@@ -48,11 +48,10 @@ pub struct AppState {
     /// picker opens — holds one row per existing profile.
     profile_list_box: gtk::Box,
     new_profile_entry: gtk::Entry,
-    /// The keybindings editor overlay's root widget — same in-window-overlay
-    /// pattern as the other three.
-    keybindings_panel: gtk::Widget,
-    /// Rebuilt from `Keybindings::bindings_for` each time the editor opens
-    /// (and after every add/remove) — holds one row per `Action`.
+    /// The keybindings editor's row list — lives inside the settings overlay
+    /// (see `open_settings`'s doc comment for why it's not a separate
+    /// overlay of its own), rebuilt from `Keybindings::bindings_for` each
+    /// time settings opens (and after every add/remove).
     keybindings_list_box: gtk::Box,
     keybindings: RefCell<Keybindings>,
     /// `Some(action)` while the editor is waiting for the next real keydown
@@ -238,7 +237,6 @@ impl AppState {
     fn open_switcher_common(self: &Rc<Self>) {
         self.close_settings();
         self.close_profile_picker();
-        self.close_keybindings();
         self.close_bookmarks();
         self.rebuild_switcher_grid();
         self.stack.set_sensitive(false);
@@ -287,13 +285,15 @@ impl AppState {
         }
     }
 
-    /// Shows the settings overlay, populated from the current `Settings`.
-    /// See `open_switcher`'s doc comment for why it closes the other overlays
+    /// Shows the settings overlay, populated from the current `Settings`,
+    /// and rebuilds the keybindings editor's rows into the same overlay
+    /// (moved here rather than being its own separate overlay/toolbar
+    /// button — one "app configuration" destination instead of two). See
+    /// `open_switcher`'s doc comment for why it closes the other overlays
     /// first.
     pub fn open_settings(self: &Rc<Self>) {
         self.close_switcher();
         self.close_profile_picker();
-        self.close_keybindings();
         self.close_bookmarks();
         let settings = self.settings.borrow();
         self.start_page_entry.set_text(&settings.start_page);
@@ -310,6 +310,8 @@ impl AppState {
             }
         }
         drop(settings);
+        self.listening_for.set(None);
+        self.rebuild_keybindings_list();
         self.stack.set_sensitive(false);
         self.settings_panel.show();
     }
@@ -317,7 +319,10 @@ impl AppState {
     /// Hides the settings overlay without saving — used by Cancel, the
     /// scrim, and Escape. Always use this (rather than hiding
     /// `settings_panel` directly) so the stack never gets left insensitive.
+    /// Also cancels any in-progress keybinding "press keys…" capture, same
+    /// as closing used to when the keybindings editor was its own overlay.
     pub fn close_settings(&self) {
+        self.listening_for.set(None);
         self.settings_panel.hide();
         self.stack.set_sensitive(true);
     }
@@ -359,7 +364,6 @@ impl AppState {
     pub fn open_profile_picker(self: &Rc<Self>) {
         self.close_switcher();
         self.close_settings();
-        self.close_keybindings();
         self.close_bookmarks();
         self.new_profile_entry.set_text("");
         self.rebuild_profile_list();
@@ -442,36 +446,6 @@ impl AppState {
         self.close_profile_picker();
     }
 
-    /// Shows the keybindings editor, rebuilt from the current `Keybindings`
-    /// each time — see `open_switcher`'s doc comment for why it closes the
-    /// other overlays first.
-    pub fn open_keybindings(self: &Rc<Self>) {
-        self.close_switcher();
-        self.close_settings();
-        self.close_profile_picker();
-        self.close_bookmarks();
-        self.listening_for.set(None);
-        self.rebuild_keybindings_list();
-        self.stack.set_sensitive(false);
-        self.keybindings_panel.show();
-    }
-
-    /// Hides the keybindings editor, cancelling any in-progress "press
-    /// keys…" capture. Always use this (rather than hiding
-    /// `keybindings_panel` directly) so the stack never gets left
-    /// insensitive.
-    pub fn close_keybindings(&self) {
-        self.listening_for.set(None);
-        self.keybindings_panel.hide();
-        self.stack.set_sensitive(true);
-    }
-
-    /// Whether the keybindings editor is currently shown — test/inspection
-    /// helper.
-    pub fn is_keybindings_open(&self) -> bool {
-        self.keybindings_panel.is_visible()
-    }
-
     /// Shows the bookmarks overlay, rebuilt from the current `Bookmarks`
     /// each time — see `open_switcher`'s doc comment for why it closes the
     /// other overlays first.
@@ -479,7 +453,6 @@ impl AppState {
         self.close_switcher();
         self.close_settings();
         self.close_profile_picker();
-        self.close_keybindings();
         self.rebuild_bookmarks_list();
         self.stack.set_sensitive(false);
         self.bookmarks_panel.show();
@@ -600,6 +573,14 @@ impl AppState {
     /// Bookmarked URLs, most-recently-added first — test/inspection helper.
     pub fn bookmarked_urls(&self) -> Vec<String> {
         self.bookmarks.borrow().all().iter().map(|b| b.url.clone()).collect()
+    }
+
+    /// Number of rows currently shown in the keybindings editor (folded into
+    /// the settings overlay — see `open_settings`'s doc comment) — test/
+    /// inspection helper confirming it's actually populated when settings
+    /// opens, one row per `Action::ALL`.
+    pub fn keybindings_row_count(&self) -> usize {
+        self.keybindings_list_box.children().len()
     }
 
     /// Called from the window's `key-press-event` handler when
@@ -1177,11 +1158,6 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         Some("avatar-default-symbolic"),
         gtk::IconSize::Button,
     )));
-    let keybindings_button = gtk::Button::new();
-    keybindings_button.set_image(Some(&gtk::Image::from_icon_name(
-        Some("input-keyboard-symbolic"),
-        gtk::IconSize::Button,
-    )));
     // Starts unbookmarked/non-starred — `refresh_bookmark_toggle_button`
     // (called once below, after `app` exists, and on every active-page
     // change afterward) corrects this immediately if the start page already
@@ -1203,7 +1179,6 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         &switcher_toggle,
         &settings_button,
         &profile_button,
-        &keybindings_button,
         &bookmark_toggle_button,
         &bookmarks_button,
     ] {
@@ -1240,7 +1215,6 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     header_bar.pack_end(&switcher_toggle);
     header_bar.pack_end(&settings_button);
     header_bar.pack_end(&profile_button);
-    header_bar.pack_end(&keybindings_button);
     header_bar.pack_end(&bookmarks_button);
 
     window.set_titlebar(Some(&header_bar));
@@ -1345,6 +1319,28 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     limit_row.pack_start(&limit_spin, false, false, 0);
     settings_box.pack_start(&limit_row, false, false, 0);
 
+    // Keybindings editor, folded into the settings overlay rather than
+    // being its own separate destination — one row per `Action::ALL`,
+    // rebuilt from the current `Keybindings` each time settings opens and
+    // after every add/remove. Wrapped in a `ScrolledWindow` (rather than
+    // just packed straight into `settings_box`) since ~10 actions' worth of
+    // rows alongside the settings fields above would otherwise make the
+    // overlay taller than comfortably fits on screen.
+    settings_box.pack_start(&gtk::Separator::new(gtk::Orientation::Horizontal), false, false, 4);
+
+    let keybindings_title = gtk::Label::new(Some("Keybindings"));
+    keybindings_title.style_context().add_class("settings-title");
+    keybindings_title.set_halign(gtk::Align::Start);
+    settings_box.pack_start(&keybindings_title, false, false, 0);
+
+    let keybindings_list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let keybindings_scroll = gtk::ScrolledWindow::new(gtk::Adjustment::NONE, gtk::Adjustment::NONE);
+    keybindings_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    keybindings_scroll.set_propagate_natural_height(true);
+    keybindings_scroll.set_max_content_height(260);
+    keybindings_scroll.add(&keybindings_list_box);
+    settings_box.pack_start(&keybindings_scroll, true, true, 0);
+
     let settings_buttons_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     settings_buttons_row.set_halign(gtk::Align::End);
     let settings_cancel_button = gtk::Button::with_label("Cancel");
@@ -1404,39 +1400,6 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     profile_overlay.add(&profile_scrim);
     profile_overlay.add_overlay(&profile_box);
 
-    // --- Keybindings editor overlay: same shape again. One row per
-    // `Action::ALL`, rebuilt from the current `Keybindings` each time it
-    // opens and after every add/remove.
-    let keybindings_scrim = gtk::EventBox::new();
-    keybindings_scrim.style_context().add_class("switcher-scrim");
-    keybindings_scrim
-        .style_context()
-        .add_provider(&scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-
-    let keybindings_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    keybindings_box.set_halign(gtk::Align::Center);
-    keybindings_box.set_valign(gtk::Align::Center);
-    keybindings_box.style_context().add_class("settings-box");
-    keybindings_box.set_margin(24);
-
-    let keybindings_title = gtk::Label::new(Some("Keybindings"));
-    keybindings_title.style_context().add_class("settings-title");
-    keybindings_title.set_halign(gtk::Align::Start);
-    keybindings_box.pack_start(&keybindings_title, false, false, 0);
-
-    let keybindings_list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    keybindings_box.pack_start(&keybindings_list_box, false, false, 0);
-
-    let keybindings_close_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    keybindings_close_row.set_halign(gtk::Align::End);
-    let keybindings_close_button = gtk::Button::with_label("Close");
-    keybindings_close_row.pack_start(&keybindings_close_button, false, false, 0);
-    keybindings_box.pack_start(&keybindings_close_row, false, false, 0);
-
-    let keybindings_overlay = gtk::Overlay::new();
-    keybindings_overlay.add(&keybindings_scrim);
-    keybindings_overlay.add_overlay(&keybindings_box);
-
     // --- Bookmarks overlay: same shape again. One row per bookmark, rebuilt
     // from `Bookmarks::all()` each time it opens and after every add/remove.
     let bookmarks_scrim = gtk::EventBox::new();
@@ -1474,7 +1437,6 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     root_overlay.add_overlay(&switcher_overlay);
     root_overlay.add_overlay(&settings_overlay);
     root_overlay.add_overlay(&profile_overlay);
-    root_overlay.add_overlay(&keybindings_overlay);
     root_overlay.add_overlay(&bookmarks_overlay);
 
     window.add(&root_overlay);
@@ -1482,7 +1444,6 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     switcher_overlay.hide();
     settings_overlay.hide();
     profile_overlay.hide();
-    keybindings_overlay.hide();
     bookmarks_overlay.hide();
 
     let settings = Settings::load(&profile);
@@ -1504,7 +1465,6 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
         profile_panel: profile_overlay.clone().upcast::<gtk::Widget>(),
         profile_list_box: profile_list_box.clone(),
         new_profile_entry: new_profile_entry.clone(),
-        keybindings_panel: keybindings_overlay.clone().upcast::<gtk::Widget>(),
         keybindings_list_box: keybindings_list_box.clone(),
         keybindings: RefCell::new(Keybindings::load(&profile)),
         listening_for: Cell::new(None),
@@ -1726,25 +1686,6 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
     }
     {
         let app = Rc::clone(&app);
-        keybindings_button.connect_clicked(move |_| {
-            app.open_keybindings();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        keybindings_scrim.connect_button_press_event(move |_, _| {
-            app.close_keybindings();
-            gtk::glib::Propagation::Stop
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        keybindings_close_button.connect_clicked(move |_| {
-            app.close_keybindings();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
         bookmark_toggle_button.connect_clicked(move |_| {
             app.toggle_bookmark_for_active();
         });
@@ -1780,9 +1721,6 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
                 return gtk::glib::Propagation::Stop;
             } else if is_escape && app.is_profile_picker_open() {
                 app.close_profile_picker();
-                return gtk::glib::Propagation::Stop;
-            } else if is_escape && app.is_keybindings_open() {
-                app.close_keybindings();
                 return gtk::glib::Propagation::Stop;
             } else if is_escape && app.is_bookmarks_open() {
                 app.close_bookmarks();

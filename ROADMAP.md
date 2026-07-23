@@ -48,6 +48,9 @@ build/run instructions.
   (row labels, the "Unlimited" checkbox, bookmark rows) and flat-button text had no explicit color and fell
   back to the system theme's default (low-contrast against the overlays' dark background). See
   `summaries/fix-overlay-label-colors.md`.
+- Moved the keybindings editor into the settings overlay (`browser-linux-gtk3`) instead of its own overlay/
+  toolbar button — one "app configuration" destination instead of two, with the row list in a scrollable
+  section so the combined overlay doesn't grow too tall. See `summaries/move-keybindings-into-settings.md`.
 
 ## Next
 
@@ -68,7 +71,6 @@ Nothing specifically queued — pick the next item from the backlog below.
   above), never actually run; once it can be run on real Windows, expect a real debugging pass (custom
   title bar drag, the `WM_KEYDOWN` HWND-subclass keybinding capture, `WebView2` control behavior, etc. are
   all unverified at runtime).
-- Move the keybindings screen into the settings screen
 - Add the search engine management features
 - Add vector search to the page/history search using libsql's
   native vector search
