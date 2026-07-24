@@ -1,0 +1,76 @@
+name: macOS
+
+# Runs on GitHub's real macos-latest runners (genuine Apple hardware,
+# license-compliant — see summaries/windows-github-actions-ci.md's "why not
+# local VMs" section for why this couldn't be a local VM instead). This is
+# also the very first time browser-macos-appkit / render-engine::macos get
+# compiled at all: they were written on a Linux dev machine with no macOS
+# toolchain available, so this workflow doubles as that scaffold's first
+# real correctness check (see summaries/macos-appkit-scaffold.md). Expect
+# this to need real iteration on its first few runs.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-core:
+    name: Test browser-core + check render-engine (native macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Same platform-independent suite the Windows workflow runs — the
+      # Linux-only encrypted-store tests are #[cfg(target_os = "linux")]
+      # gated (see crates/browser-core/src/history.rs), so this exercises
+      # everything else for real on native macOS.
+      - name: cargo test -p browser-core
+        run: cargo test -p browser-core --verbose
+
+      - name: cargo check -p render-engine
+        run: cargo check -p render-engine --verbose
+
+  build-and-smoke-appkit:
+    name: Build + launch browser-macos-appkit (native macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build -p browser-macos-appkit --verbose
+
+      # macos-latest runners have a real interactive desktop session (like
+      # windows-latest, unlike the headless Linux runners), so this can
+      # actually launch the window and screenshot it.
+      - name: Launch and screenshot
+        run: |
+          set -euo pipefail
+          bin="target/debug/browser-macos-appkit"
+          if [ ! -x "$bin" ]; then
+            echo "browser-macos-appkit binary not found at $bin after build" >&2
+            exit 1
+          fi
+
+          "$bin" &
+          app_pid=$!
+          sleep 8
+
+          if ! kill -0 "$app_pid" 2>/dev/null; then
+            echo "browser-macos-appkit exited on its own within 8 seconds" >&2
+            exit 1
+          fi
+
+          screencapture -x browser-macos-appkit-screenshot.png
+          kill "$app_pid"
+
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-macos-appkit-screenshot
+          path: browser-macos-appkit-screenshot.png
+          if-no-files-found: ignore

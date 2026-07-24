@@ -88,8 +88,8 @@ build/run instructions.
   + real launch + screenshot, the first environment able to actually run WinUI 3 rather than only
   cross-compile/link-verify it (WinUI 3 needs the real Windows App SDK runtime, unavailable under Wine).
   Local VMs (Docker/KVM) were considered and rejected: a local macOS VM would violate Apple's EULA on
-  non-Apple hardware, and `cross` only cross-compiles, it doesn't run foreign-OS binaries. Not yet actually
-  run — no GitHub remote is connected to this repo yet. See `summaries/windows-github-actions-ci.md`.
+  non-Apple hardware, and `cross` only cross-compiles, it doesn't run foreign-OS binaries. See
+  `summaries/windows-github-actions-ci.md`.
 - `browser-macos-appkit` (new crate) + `render-engine::macos`: a **minimal scaffold**, not feature parity —
   a single native `NSWindow` with a toolbar strip (back/forward/reload `NSButton`s + an address-bar
   `NSTextField`) and a `WKWebView` (via `wry`, embedded as a real AppKit view, no `tao`/`winit`, matching
@@ -102,14 +102,31 @@ build/run instructions.
 
 ## Next
 
-Nothing specifically queued — pick the next item from the backlog below.
+Repo is now pushed to `danshryock/one-page-browser` (`git@github.com:danshryock/one-page-browser.git`).
+`.github/workflows/windows.yml` has already run for real once (on the push to `master`) — both jobs failed on
+their first real run, which is expected for code that had never actually executed anywhere but this dev
+machine's own local builds:
+- `test-core`: `cargo test -p browser-core` itself failed (not yet diagnosed — needs the real job log, which
+  needs an authenticated `gh`/API call this session doesn't have set up; see below).
+- `build-and-smoke-winui`: the `cargo build -p browser-windows-winui --target x86_64-pc-windows-msvc` step
+  failed (also not yet diagnosed).
+
+`.github/workflows/macos.yml` (new) has been written and pushed, mirroring the Windows workflow's
+`test-core`/`build-and-smoke-*` shape — its first run doubles as `browser-macos-appkit`'s first-ever real
+compile (see "Done" above — it's never been built anywhere before this).
+
+To actually debug either workflow's failures, real job logs are needed — GitHub's Actions log endpoints
+(both the whole-run `.../logs` zip and the per-job `.../jobs/{id}/logs`) return 403 to unauthenticated
+requests even for this public repo. `gh` (the GitHub CLI) isn't installed on this dev machine and installing
+it needs `sudo` (no passwordless sudo here) — so either the user installs+authenticates `gh` here (`sudo
+apt-get install -y gh && gh auth login`), or logs get pulled some other way, before the actual Windows/macOS
+CI failures can be diagnosed and fixed.
 
 ## Backlog (not yet started, roughly in the order raised)
 
 - `browser-macos-appkit`: bring it to feature parity with `browser-linux-gtk3` (switcher grid, settings/
   bookmarks/keybindings/profile-picker overlays, history integration) — see "Done" above for what exists so
-  far (a minimal single-page scaffold only), and a `macos-latest` GitHub Actions CI workflow once it's known
-  to actually compile.
+  far (a minimal single-page scaffold only).
 - `browser-windows-winui`: unified search/URL bar and bookmarks, matching what `browser-linux-gtk3` now has
   (both landed there only, per scope — see "Done" above).
 - External password manager integration — not attempted: which manager(s) and which integration protocol
