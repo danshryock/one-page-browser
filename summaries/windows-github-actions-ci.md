@@ -422,3 +422,90 @@ wrong direction), and — more significantly — concluding the crash dump point
 platform code, when the far more likely explanations were a usage bug, a wrapper-crate bug, or a build issue.
 This investigation is not resolved yet; each round has ruled something concrete out, which is real progress,
 but the actual cause remains open.
+
+## The `windows-reactor` comparison test: `winio-winui3` is now a real suspect, not just a plausible one
+
+Set up a real Windows 11 VM locally (`dockur/windows`, Docker + QEMU/KVM, storage on the host's `/`
+partition — `/home` didn't have the ~64GB needed) specifically to build and run a comparison app against
+Microsoft's own `windows-reactor`/`windows-webview` (in-tree in `microsoft/windows-rs`, built on the same
+`windows-bindgen` WinMD codegen as the base `windows` crate — see the "Microsoft-developed Rust bindings"
+research this session) instead of the community `winio-winui3` wrapper. Several real, non-obvious problems
+came up getting there, each worth recording:
+
+- **`restart: "no"` broke the Windows install itself.** Windows' unattended setup goes through multiple
+  internal reboots; the official `dockur/windows` compose example uses `restart: always` specifically so
+  Docker relaunches the container across those. Setting it to `"no"` (to avoid the container looping
+  indefinitely in the background) meant the *first* internal reboot killed the whole install permanently,
+  well before the OEM `install.bat` provisioning script ever ran. Fixed by using `restart: always` and just
+  remembering to `docker compose down` explicitly when done with the VM.
+- **The OEM auto-install mechanism never fired**, for reasons still unconfirmed (plausibly LTSC-specific —
+  the logs showed a different unattend XML, `win11x64-ltsc.xml`, than the standard flow). Recovered via a
+  genuinely useful fallback: QEMU exposes an HMP monitor socket (`/run/shm/monitor.sock`) even with no RDP
+  port published, and it supports `screendump` (real screenshots, no VNC client needed) and `sendkey`
+  (synthetic keyboard input) — enough to open a Command Prompt and drive the VM entirely from `docker exec`
+  + Python, no GUI access required. (Mouse input via HMP `mouse_move`/`mouse_button` never worked reliably in
+  this setup, despite the tablet device being active per `info mice` — worth real investigation if this
+  approach is reused, but keyboard-only driving was sufficient here.)
+- **The shared folder's `Z:` drive letter is session-scoped, not a global mount.** It's a guest-only Samba
+  share (`\\host.lan\Data`, confirmed via the container's `smb.conf`), and Windows maps it to `Z:` per
+  logon session — invisible from an elevated (UAC split-token) session, and, more importantly, invisible to
+  a SYSTEM-context scheduled task. Since there's no documented remote-exec mechanism for an already-installed
+  `dockur/windows` VM, the whole point was a file-based command channel (a scheduled task polling for a
+  `request.flag`, running whatever's in `command.bat`, writing results back) — which meant it had to run as
+  SYSTEM (to work regardless of interactive logon state), which meant it needed the shared folder to work
+  under SYSTEM. Fixed by addressing the share via its UNC path (`\\host.lan\Data\...`) everywhere instead of
+  `Z:\` — UNC paths aren't session-scoped, so this worked identically for install scripts, the SYSTEM-run
+  scheduled task, and interactive sessions alike.
+- **Repeated appends to a UNC-path log file caused a silent, permanent lock.** The first provisioning attempt
+  logged every step via `>> \\host.lan\Data\setup.log`; partway through (right after `rustup-init` finished,
+  before the next line), every subsequent append started failing with "The process cannot access the file
+  because it is being used by another process" — apparently triggered by a collision with this session
+  reading the same file from the Linux host mid-run. Since a failed output redirect in `cmd.exe` skips
+  running that line's command entirely, everything after that point (VS Build Tools, the Windows App SDK,
+  the scheduled task) silently never ran, even though the script "completed" and returned to a normal prompt.
+  Fixed by logging to a local file (`C:\OEM\setup.log`) and mirroring it to the shared folder via single-shot
+  `copy` calls after each milestone instead of holding the UNC file open across dozens of small appends.
+- **VS Build Tools triggered a mid-install reboot** despite `--norestart` (likely a prerequisite redistributable
+  outside the bootstrapper's own control). `vs_buildtools.exe` is designed to resume/repair on a subsequent
+  run, so simply re-launching the same provisioning script after the VM came back up (via `restart: always`)
+  completed it on the second attempt — no special resume logic needed.
+- **`cargo` running as SYSTEM (via the scheduled task) could build the exe but not usefully launch it.** The
+  build succeeded and reported `CRASHED_OR_EXITED` after launch, but with *zero* trace-log output — not even
+  the very first line of `main()`. This matches Windows' Session 0 isolation: a GUI process launched from a
+  SYSTEM-context scheduled task runs in the non-interactive services session and cannot render a window
+  there, regardless of which UI wrapper crate is used. Confirms the file-based automation is fine for
+  *building* but launching/observing a GUI app's crash-or-survive behavior needs to happen in the interactive
+  session (done here via the same QEMU `sendkey` channel).
+- **First real launch attempt in the interactive session hit a genuine, simple, diagnosable error**: `The
+  code execution cannot proceed because microsoft.windowsappruntime.bootstrap.dll was not found.` Traced to
+  having dropped the sample's `build.rs` (`windows_reactor_setup::as_self_contained()`) when adapting it,
+  on the assumption that installing the Windows App SDK runtime system-wide would be enough. It isn't:
+  `Microsoft.WindowsAppRuntime.Bootstrap.dll` is a thin shim that ships *with the app*, not as part of the
+  OS-wide runtime install — confirmed by reading `windows-reactor-setup`'s actual source, which embeds this
+  exact DLL as a build-time resource. Fixed with the lighter `windows_reactor_setup::as_framework_dependent()`
+  (copies just the bootstrap DLL + `resources.pri` next to the exe, no self-contained bundling needed since
+  the framework package is already installed).
+- **Cargo didn't notice the `Cargo.toml`/`build.rs` fix at first** — a rebuild after adding the
+  `windows-reactor-setup` build-dependency showed every crate as `Fresh` (cached), including the build script
+  itself, and reproduced the identical error. Plausibly a clock-skew artifact of editing files from the Linux
+  host over the same Samba share cargo's mtime-based fingerprinting reads from. Fixed by deleting `target/`
+  for a clean rebuild rather than chasing the exact cause.
+
+**The result, once all of that was worked around**: `reactor_smoke_test` — a `windows-reactor`/
+`windows-webview` app with the same toolbar-plus-`WebView2` shape as `browser-windows-winui`'s real app,
+adapted directly from `microsoft/windows-rs`'s own `crates/samples/reactor/webview` sample — built cleanly
+and **launched successfully**: a real window, toolbar (back/forward/reload/address bar/Go), stable for over
+10 seconds with no crash, no exception, no dialog. Trace log confirms `main: start` → `main: after bootstrap`
+→ `app: render start` → `app: render end`, all clean. The `WebView2` content area itself stayed blank (no
+`on_ready: WebView2 ready` trace line ever fired) — a separate, likely-environmental issue (this is a stripped
+IoT/LTSC eval image; the WebView2 Runtime itself may not be present even though the Edge icon is on the
+desktop) worth checking separately, not part of the crash comparison.
+
+This is real, if not conclusive, evidence: the same general shape of app (window + toolbar + `WebView2`,
+built against the same underlying Windows App SDK / WinRT / Composition stack) survives when built against
+Microsoft's own `windows-reactor`/`windows-webview`, on the same category of machine where `winio-winui3`-based
+smoke tests survive too but the real `browser-windows-winui` app crashes. It doesn't yet isolate *which* of
+the real app's specific `winio-winui3` calls is the problem (this test doesn't exercise `AppWindow().Resize()`,
+`ComboBox`, `CheckBox`, or the exact construction order the real app uses), but it's one more point toward
+"usage or wrapper bug," not "Microsoft's platform code," and a working, fast, local VM to keep iterating in
+rather than round-tripping through GitHub Actions for every next hypothesis.

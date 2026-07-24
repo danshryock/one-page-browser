@@ -158,8 +158,23 @@ here rather than left standing.
   `HistoryStore`'s exact behavior — a real, tested (7 new tests) alternative now available for future use
   beyond this investigation. All 86 `browser-core` tests and all 20 `browser-linux-gtk3` GTK tests pass.
 
+CI triggers are now restricted to `workflow_dispatch`/tags only (`v*.*`), not every push, and both workflows
+upload their compiled binaries as downloadable artifacts.
+
+**A local Windows VM (`dockur/windows`, Docker + QEMU/KVM) is now running on this dev machine** for much
+faster iteration than round-tripping through GitHub Actions. Built and ran a comparison app,
+`reactor_smoke_test`, against Microsoft's own `windows-reactor`/`windows-webview` (in-tree in
+`microsoft/windows-rs`, not the community `winio-winui3` wrapper) — same toolbar-plus-`WebView2` shape as the
+real app, adapted from Microsoft's own sample. **It launched successfully and ran stably for 10+ seconds: a
+real window, no crash, no exception.** That's one more real point toward "usage or wrapper bug" and away from
+"Microsoft's platform code" — see `summaries/windows-github-actions-ci.md`'s new section for the full list of
+non-obvious problems hit getting the VM working (Windows' internal-reboot/`restart:always` requirement,
+session-scoped `Z:` drives vs. UNC paths, Session 0 isolation blocking GUI launches from a SYSTEM-context
+task, and a missing `Microsoft.WindowsAppRuntime.Bootstrap.dll` fixed via `windows-reactor-setup`).
+
 Still an open investigation — see `summaries/windows-github-actions-ci.md` for the full blow-by-blow (every
-round, every ruled-out theory, the crash dump analysis, and what's still untested).
+round, every ruled-out theory, the crash dump analysis, the `windows-reactor` comparison result, and what's
+still untested).
 
 ## Backlog (not yet started, roughly in the order raised)
 
