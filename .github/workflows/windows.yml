@@ -170,6 +170,14 @@ jobs:
               }
             } else {
               Write-Host "no crash dump was generated in $dumpFolder"
+              Write-Host "diagnosing why: WER service state and debugger availability"
+              Get-Service -Name WerSvc -ErrorAction SilentlyContinue | Format-List Name, Status, StartType
+              $werDisabled = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" -Name Disabled -ErrorAction SilentlyContinue
+              Write-Host "WER Disabled registry value: $($werDisabled.Disabled)"
+              $cdbCheck = Get-Command cdb.exe -ErrorAction SilentlyContinue
+              Write-Host "cdb.exe on PATH: $(if ($cdbCheck) { $cdbCheck.Path } else { 'not found' })"
+              $windbgCheck = Get-Command windbg.exe -ErrorAction SilentlyContinue
+              Write-Host "windbg.exe on PATH: $(if ($windbgCheck) { $windbgCheck.Path } else { 'not found' })"
             }
 
             Write-Error "browser-windows-winui exited on its own within 8 seconds (exit code $($proc.ExitCode) / $hex) — see stdout/stderr and crash dump analysis above, and the logs/dumps uploaded as artifacts"
