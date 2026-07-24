@@ -198,13 +198,26 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    the two suspects above.
 
    Added a second bisection binary, `titlebar_smoke_test.rs`: identical to `minimal_smoke_test` plus *only*
-   `SetExtendsContentIntoTitleBar(true)` + `SetTitleBar(...)` — still no `install_hwnd_subclass`. If this one
-   also survives, that clears the custom title bar and points at the `subclass_proc` `WNDPROC` interception
-   instead; if it reproduces the crash, the custom title bar is confirmed as the cause. Not yet run.
+   `SetExtendsContentIntoTitleBar(true)` + `SetTitleBar(...)` — still no `install_hwnd_subclass`.
+
+   **Ran it — also survived cleanly.** Every checkpoint through `run() returned Ok`, still running 8 seconds
+   later. That clears the custom title bar too — neither a bare window nor the custom title bar alone
+   reproduces the crash.
+
+   Added a third bisection binary, `webview2_smoke_test.rs`: identical to `minimal_smoke_test` plus *only* an
+   embedded `WebView2` XAML control (mirroring `render_engine::WebView2Engine`'s construction — see
+   `render-engine/src/winui.rs`) navigated to a real URL — still no `install_hwnd_subclass`, no custom title
+   bar. `WebView2` is a much heavier native control than anything tried so far, backed by a real Edge WebView2
+   process with its own runtime/user-data-folder requirements — a genuinely plausible independent crash source
+   this debugging pass hadn't considered until ruling out the other two. If this one also survives, that
+   leaves `install_hwnd_subclass`/`subclass_proc` (the raw `WNDPROC` interception, still untested in isolation)
+   as the last remaining suspect from the real window's genuinely unusual code, or some combination of pieces
+   none of these three isolated tests captures. Not yet run.
 
 This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the
 real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine. It
 also caught a real mistake of mine along the way: guessing at what an NTSTATUS code meant instead of checking
 it, which sent the first fix attempt in the wrong direction — corrected once actually verified. This
-particular crash has taken several rounds without a definitive answer yet — a genuinely hard, first-ever
-debugging session for code that had never run anywhere before this CI existed.
+particular crash has taken many rounds without a definitive answer yet — a genuinely hard, first-ever
+debugging session for code that had never run anywhere before this CI existed — but each round has ruled
+something concrete out rather than just guessing blind, which is real progress even without a fix yet.
