@@ -162,9 +162,12 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
      the more targeted first attempt, since it can force the driver type rather than hoping for an automatic
      fallback.
 
-   This entire experiment is genuinely exploratory (the exact `d3dconfig` syntax for driver-type forcing
-   wasn't found in any indexed documentation) — expect this to need at least one more round once the real
-   `--help` output is visible in the log.
+   `d3dconfig --help`'s real output confirmed the exact syntax: `device force-warp[=(true|false)]` (not a
+   `driver-type` subcommand as first guessed — the real categories are `apps`/`debug-layer`/`device`/`dred`/
+   `message-break`/`message-mute`). `apps --add <exe>` also worked as expected, scoping settings to
+   `browser-windows-winui.exe` specifically rather than system-wide. The workflow now runs
+   `d3dconfig device "force-warp=true" <exe>` and exports the resulting config to confirm the setting actually
+   stuck before the launch attempt. Not yet run.
 
 This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the
 real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine. It

@@ -106,15 +106,15 @@ jobs:
       # This experiment installs the official "Graphics Tools" Windows
       # Feature-on-Demand (ships `d3dconfig.exe`, a real Microsoft tool for
       # managing the same per-application driver-type overrides the DirectX
-      # Control Panel GUI does) and tries to force WARP for
-      # browser-windows-winui.exe specifically. The *exact* subcommand syntax
-      # for forcing a driver type wasn't confirmed from documentation alone
-      # (Microsoft's blog post shows `apps`/`debug-layer`/`message-break`
-      # subcommands but not the driver-type one directly), so this dumps
-      # `--help` output for discovery and tries the most plausible syntax —
-      # genuinely exploratory, expect to need a follow-up once the real
-      # --help output is visible in this step's log.
-      - name: Try forcing WARP (software) rendering via d3dconfig
+      # Control Panel GUI does) and forces WARP for browser-windows-winui.exe
+      # specifically. The first version of this step didn't know the real
+      # subcommand syntax and dumped `--help` output to discover it — that
+      # confirmed `device force-warp[=(true|false)]` is the real one (under
+      # d3dconfig's own `device` category, not a `driver-type` subcommand as
+      # first guessed). `apps --add <exe>` (used first, to scope subsequent
+      # settings to this app rather than system-wide) was confirmed working
+      # in that same run.
+      - name: Force WARP (software) rendering via d3dconfig
         continue-on-error: true
         shell: pwsh
         run: |
@@ -130,29 +130,19 @@ jobs:
           }
           Write-Host "found d3dconfig at $d3dconfig"
 
-          Write-Host "--- d3dconfig --help ---"
-          & $d3dconfig --help 2>&1 | Out-String | Write-Host
-          Write-Host "--- d3dconfig apps --help ---"
-          & $d3dconfig apps --help 2>&1 | Out-String | Write-Host
-
           $exe = Get-ChildItem -Recurse -Filter "browser-windows-winui.exe" -Path target -ErrorAction SilentlyContinue |
             Select-Object -First 1 -ExpandProperty FullName
           if ($exe) {
             Write-Host "registering $exe with d3dconfig"
             & $d3dconfig apps --add $exe 2>&1 | Out-String | Write-Host
 
-            # Best-effort guesses at the driver-type-forcing subcommand,
-            # modeled on the `debug-layer debug-layer-mode=force-on` and
-            # `message-break allow-debug-breaks=true` syntax the blog post
-            # does show verbatim — none of these are confirmed correct yet.
-            foreach ($guess in @(
-              @("driver-type", "driver-type=warp", $exe),
-              @("driver-type", "--set", "warp", $exe),
-              @("apps", "--set-driver-type=warp", $exe)
-            )) {
-              Write-Host "--- trying: d3dconfig $($guess -join ' ') ---"
-              & $d3dconfig @guess 2>&1 | Out-String | Write-Host
-            }
+            Write-Host "--- d3dconfig device force-warp=true $exe ---"
+            & $d3dconfig device "force-warp=true" $exe 2>&1 | Out-String | Write-Host
+
+            Write-Host "--- d3dconfig --export (confirm the setting stuck) ---"
+            $exported = "$env:RUNNER_TEMP\d3dconfig-export.txt"
+            & $d3dconfig --export $exported 2>&1 | Out-String | Write-Host
+            Get-Content $exported -ErrorAction SilentlyContinue | Write-Host
           }
 
       # windows-latest runners provide a real interactive desktop session
