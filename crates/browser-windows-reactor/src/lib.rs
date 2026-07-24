@@ -15,11 +15,30 @@
 //! widget-tree-with-handles style, so this isn't a mechanical port.
 //!
 //! This version wires in `browser_core::PageManager<ReactorWebViewEngine>`
-//! for real (see `engine.rs`) and a working switcher overlay (search box +
-//! tile grid, open pages plus history matches, matching
-//! `browser-windows-winui`'s `rebuild_switcher_grid`). Still missing (see
-//! `ROADMAP.md`'s task list): settings/profile/keybindings overlays, the
-//! custom title bar.
+//! for real (see `engine.rs`), a working switcher/settings/profile/
+//! keybindings overlays, real global keyboard shortcuts (see
+//! `shortcuts.rs`), a native `TitleBar`-hosted toolbar, and
+//! `run_chooser`'s external-link launch handling — feature parity with
+//! `browser-windows-winui` (see `ROADMAP.md`).
+//!
+//! # Why `run_chooser` spawns a new process instead of swapping windows
+//!
+//! `browser-windows-winui`'s equivalent (`show_external_link_chooser`)
+//! builds the chooser as its own small `Window`, then on "Open" builds the
+//! *real* browser window in the same process and closes the chooser one —
+//! doable there since it owns the raw `HWND`s directly. `windows-reactor`
+//! has no public way to close the *primary* window it opened via
+//! `App::render` (`WindowHandle` — the type with a working `.close()` — is
+//! only returned by `ReactorWindow::render`/`.open()` for *secondary*
+//! windows; the primary window's registry key is never exposed). Rather
+//! than fight that, `run_chooser` reuses a pattern this codebase already
+//! has for exactly this shape of problem: `browser_core::
+//! launch_new_profile_process` (used by the profile picker to open a
+//! different profile) spawns a brand new process rather than swapping
+//! state in place. `run_chooser`'s "Open" button does the same —
+//! `exe --profile <name> <url>`, parsed back out by
+//! `resolve_profile_name`/`resolve_url_argument` exactly like any other
+//! relaunch — then exits this small chooser process outright.
 //!
 //! # Multi-page hosting in a declarative model
 //!
@@ -446,6 +465,14 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     .column_spacing(8.0)
     .margin(Thickness::uniform(8.0));
 
+    // Real WinUI 3 `Microsoft.UI.Xaml.Controls.TitleBar`, hosting the
+    // toolbar in its `Content` slot — the reactor-native equivalent of
+    // `browser-windows-winui`'s manual `window.SetExtendsContentIntoTitleBar
+    // (true)` + `window.SetTitleBar(&toolbar)`. Gives a real draggable
+    // custom title bar area with the toolbar embedded in it, using the
+    // platform's own title-bar control instead of a plain content row.
+    let title_bar = Element::from(TitleBar::new("claude-browser").content(toolbar));
+
     // Every *loaded* page's webview stays mounted (see this module's doc
     // comment on why); the active one is pushed last so it paints on top.
     let page_ids = core.borrow().page_ids();
@@ -528,7 +555,7 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     }
 
     trace("app: render end");
-    let mut rows = vec![Element::from(toolbar).grid_row(0), Element::from(content).grid_row(1)];
+    let mut rows = vec![title_bar.grid_row(0), Element::from(content).grid_row(1)];
     if let Some(overlay_element) = overlay_element {
         rows.push(overlay_element.grid_row(1));
     }
@@ -943,4 +970,62 @@ pub fn run(profile: Profile) -> anyhow::Result<()> {
         app(cx, &shared.0)
     })?;
     Ok(())
+}
+
+/// Shows a small standalone window for launching with a URL argument (e.g.
+/// from the OS's "open with"/default-browser handoff) — lets the user
+/// confirm/pick which profile to open it in before the real browser window
+/// appears. `default_profile` pre-fills the field (whatever `--profile`
+/// resolved to, or `"default"`). See this module's doc comment for why
+/// "Open" spawns a new process rather than swapping in the real browser
+/// window in place.
+pub fn run_chooser(url: String, default_profile: String) -> anyhow::Result<()> {
+    App::new()
+        .title("Open link")
+        .inner_size(480.0, 240.0)
+        .render(move |cx| chooser_app(cx, &url, &default_profile))?;
+    Ok(())
+}
+
+fn chooser_app(cx: &mut RenderCx, url: &str, default_profile: &str) -> Element {
+    let (profile_name, set_profile_name) = cx.use_state(default_profile.to_string());
+
+    let open: Callback<()> = Callback::new({
+        let profile_name = profile_name.clone();
+        let url = url.to_string();
+        move |()| {
+            if let Ok(exe) = std::env::current_exe() {
+                if let Err(err) = std::process::Command::new(exe).arg("--profile").arg(&profile_name).arg(&url).spawn() {
+                    eprintln!("failed to launch the browser process: {err}");
+                }
+            }
+            std::process::exit(0);
+        }
+    });
+    let cancel: Callback<()> = Callback::new(|()| std::process::exit(0));
+
+    let suggestions: Vec<Element> = list_profile_names()
+        .into_iter()
+        .map(|name| {
+            let set_profile_name = set_profile_name.clone();
+            Element::from(button(name.clone()).on_click(move || set_profile_name.call(name.clone())))
+        })
+        .collect();
+
+    vstack((
+        Element::from(text_block(url.to_string())),
+        Element::from(text_block("Open in profile")),
+        Element::from(text_box(profile_name).on_text_changed(set_profile_name)),
+        Element::from(hstack(suggestions).spacing(4.0)),
+        Element::from(
+            hstack((
+                Element::from(button("Cancel").on_click(move || cancel.invoke(()))),
+                Element::from(button("Open").on_click(move || open.invoke(()))),
+            ))
+            .spacing(8.0),
+        ),
+    ))
+    .spacing(12.0)
+    .margin(Thickness::uniform(16.0))
+    .into()
 }

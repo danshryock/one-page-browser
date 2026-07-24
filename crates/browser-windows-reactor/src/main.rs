@@ -4,9 +4,14 @@ fn main() -> anyhow::Result<()> {
     windows_reactor::bootstrap()?;
     browser_windows_reactor::trace("main: after bootstrap");
     let args: Vec<String> = std::env::args().collect();
-    let profile = browser_core::Profile::new(browser_core::resolve_profile_name(args));
-    let result = browser_windows_reactor::run(profile);
-    browser_windows_reactor::trace(&format!("main: run() returned {result:?}"));
+    let result = if let Some(url) = browser_core::resolve_url_argument(args.clone()) {
+        let default_profile = browser_core::resolve_profile_name(args);
+        browser_windows_reactor::run_chooser(url, default_profile)
+    } else {
+        let profile = browser_core::Profile::new(browser_core::resolve_profile_name(args));
+        browser_windows_reactor::run(profile)
+    };
+    browser_windows_reactor::trace(&format!("main: run returned {result:?}"));
     result?;
     Ok(())
 }

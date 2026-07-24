@@ -157,10 +157,39 @@ uses a text field (`"Ctrl+Shift+P"` format, parsed by `shortcuts::parse_chord`) 
 `browser-windows-winui`'s live "press keys…" capture — reintroducing a raw `HWND` subclass just for that one
 feature would undercut the point of moving off `winio-winui3` in the first place.
 
-Still to build: the custom title bar (`ExtendsContentIntoTitleBar` equivalent — not yet checked whether
-`windows-reactor` exposes this) and the external-link-launch chooser window
-(`browser-windows-winui::show_external_link_chooser`'s equivalent). Feature parity is otherwise close; see
-`summaries/windows-github-actions-ci.md` for the full incremental build log.
+**The custom title bar and external-link chooser are both done** — `browser-windows-reactor` is now at feature
+parity with `browser-windows-winui`. The title bar uses reactor's native `TitleBar` widget (real WinUI 3
+`Microsoft.UI.Xaml.Controls.TitleBar`, with a `.content()` slot) hosting the toolbar, rather than
+`winio-winui3`'s manual `window.SetExtendsContentIntoTitleBar(true)` + `window.SetTitleBar(&toolbar)` — a more
+idiomatic path, and verified in the VM: the toolbar now sits directly alongside the native minimize/maximize/
+close buttons instead of in a separate row below a plain window title bar.
+
+`run_chooser` (the external-link-launch handoff) has a real architectural difference from
+`browser-windows-winui::show_external_link_chooser`, documented in `lib.rs`'s module doc comment:
+`windows-reactor` has no public way to close the *primary* window opened via `App::render` (`WindowHandle`,
+the type with a working `.close()`, is only returned for *secondary* windows via `ReactorWindow`). Rather than
+fight that, `run_chooser` reuses a pattern this codebase already has for exactly this shape of problem —
+`browser_core::launch_new_profile_process` (used by the profile picker) spawns a new process instead of
+swapping state in place. `run_chooser`'s "Open" button does the same (`exe --profile <name> <url>`) and exits
+the small chooser process outright. Verified in the VM end-to-end: launching with a URL argument shows the
+small chooser (URL, profile field pre-filled, suggestions, Cancel/Open); clicking Open spawns exactly one new
+`browser-windows-reactor.exe` process with the right arguments (confirmed via `tasklist`) and the chooser
+process exits (confirmed via `taskkill`/process list, not just visually — the dead chooser window kept
+rendering stale pixels for a few seconds after its process actually exited, the same stale-repaint artifact
+seen elsewhere with dead windows in this VM, not a real hang).
+
+One real bug found and fixed along the way, worth remembering for any future build script in this repo:
+`build.rs` had gated its `windows_reactor_setup::as_framework_dependent()` call with
+`#[cfg(target_os = "windows", target_env = "msvc")]`, which reflects the *host* build.rs itself compiles for
+(always true, since Cargo always compiles/runs build scripts on the build machine) — not the crate's actual
+`--target`. This silently skipped the bootstrap-DLL copy for every *cross-compiled* build from this Linux
+machine (invisible until now since every test so far used a *native* Windows build in the VM, where host and
+target coincide), and shipped the user a `.exe` that failed at launch with "microsoft.windowsappruntime.
+bootstrap.dll was not found." Fixed by checking `CARGO_CFG_TARGET_OS`/`CARGO_CFG_TARGET_ENV` at runtime
+instead (the correct way for a build script to ask what it's really building for) and making the dependency
+itself unconditional rather than target-gated.
+
+See `summaries/windows-github-actions-ci.md` for the full incremental build log.
 
 Repo is pushed to `danshryock/one-page-browser` (`git@github.com:danshryock/one-page-browser.git`), with `gh`
 installed and authenticated on this dev machine — real job logs are pulled via `gh run view --log-failed`/the
