@@ -503,6 +503,19 @@ jobs:
       # uploaded raw as an artifact. This is a real, first-ever debugging
       # pass for browser-windows-winui (see ROADMAP.md) — expect this to
       # take a few more rounds.
+      #
+      # This step launches whatever `browser-windows-winui.exe` the Build
+      # step above just produced — currently (see `AppState`'s `history`
+      # field comment in lib.rs) that's a TEMPORARY build using
+      # `MemoryHistoryStore` instead of the real, libsql-backed
+      # `HistoryStore`, testing the *actual production binary* (not an
+      # approximating smoke-test binary) with no libsql calls in its own
+      # code path — nine separate smoke-test binaries already ruled out
+      # every individual piece and combination of this codebase's own
+      # unusual code (see summaries/windows-github-actions-ci.md), so this
+      # is checking whether the *real* app's full complexity (many
+      # controls/overlays at once) still crashes even with libsql calls
+      # removed from the equation entirely.
       - name: Launch and screenshot
         shell: pwsh
         run: |
