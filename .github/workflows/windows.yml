@@ -92,6 +92,69 @@ jobs:
       - name: Build (native MSVC — no cargo-xwin needed on a real Windows runner)
         run: cargo build -p browser-windows-winui --target x86_64-pc-windows-msvc --verbose
 
+      # Checkpoint tracing (see browser-windows-winui/src/lib.rs's trace())
+      # proved the crash happens *after* a fully successful startup — window
+      # built, page added, activated, ~30 real window messages handled —
+      # right at the point WinUI 3 would do its first Composition/DirectX
+      # render pass. GitHub Actions' windows-latest runners have no real GPU
+      # (a basic/virtual display adapter only), and this exact crash pattern
+      # is a documented category for Composition-based UI frameworks on
+      # GPU-less machines. WARP (Windows Advanced Rasterization Platform) is
+      # Microsoft's own bundled software Direct3D rasterizer, specifically
+      # meant for this (server/VM/no-GPU scenarios) — see
+      # https://learn.microsoft.com/en-us/windows/win32/direct3darticles/directx-warp.
+      # This experiment installs the official "Graphics Tools" Windows
+      # Feature-on-Demand (ships `d3dconfig.exe`, a real Microsoft tool for
+      # managing the same per-application driver-type overrides the DirectX
+      # Control Panel GUI does) and tries to force WARP for
+      # browser-windows-winui.exe specifically. The *exact* subcommand syntax
+      # for forcing a driver type wasn't confirmed from documentation alone
+      # (Microsoft's blog post shows `apps`/`debug-layer`/`message-break`
+      # subcommands but not the driver-type one directly), so this dumps
+      # `--help` output for discovery and tries the most plausible syntax —
+      # genuinely exploratory, expect to need a follow-up once the real
+      # --help output is visible in this step's log.
+      - name: Try forcing WARP (software) rendering via d3dconfig
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Add-WindowsCapability -Online -Name "Tools.Graphics.DirectX~~~~0.0.1.0"
+          $d3dconfig = Get-ChildItem -Path "$env:WINDIR\System32" -Filter "d3dconfig.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $d3dconfig) {
+            $d3dconfig = (Get-Command d3dconfig.exe -ErrorAction SilentlyContinue).Path
+          }
+          if (-not $d3dconfig) {
+            Write-Host "d3dconfig.exe not found after installing the Graphics Tools feature — skipping this experiment"
+            exit 0
+          }
+          Write-Host "found d3dconfig at $d3dconfig"
+
+          Write-Host "--- d3dconfig --help ---"
+          & $d3dconfig --help 2>&1 | Out-String | Write-Host
+          Write-Host "--- d3dconfig apps --help ---"
+          & $d3dconfig apps --help 2>&1 | Out-String | Write-Host
+
+          $exe = Get-ChildItem -Recurse -Filter "browser-windows-winui.exe" -Path target -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+          if ($exe) {
+            Write-Host "registering $exe with d3dconfig"
+            & $d3dconfig apps --add $exe 2>&1 | Out-String | Write-Host
+
+            # Best-effort guesses at the driver-type-forcing subcommand,
+            # modeled on the `debug-layer debug-layer-mode=force-on` and
+            # `message-break allow-debug-breaks=true` syntax the blog post
+            # does show verbatim — none of these are confirmed correct yet.
+            foreach ($guess in @(
+              @("driver-type", "driver-type=warp", $exe),
+              @("driver-type", "--set", "warp", $exe),
+              @("apps", "--set-driver-type=warp", $exe)
+            )) {
+              Write-Host "--- trying: d3dconfig $($guess -join ' ') ---"
+              & $d3dconfig @guess 2>&1 | Out-String | Write-Host
+            }
+          }
+
       # windows-latest runners provide a real interactive desktop session
       # (unlike Linux runners), so this can actually launch a visible window
       # and screenshot it — genuine visual confirmation the app renders,

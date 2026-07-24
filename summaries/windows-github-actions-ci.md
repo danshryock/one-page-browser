@@ -132,10 +132,39 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    all of that, somewhere inside WinUI 3's own message pump (`Application::Start`'s internals, which we don't
    control directly). Added the same tracing to the very top of `subclass_proc` (the `SetWindowSubclass`-based
    `WNDPROC` handling `WM_KEYDOWN`/`WM_DESTROY`/`WM_NCDESTROY` — see this file's module doc comment on why that
-   exists) to log every window message it receives, which will show whether the crash happens before the
-   subclass sees any message at all (pointing at WinUI 3's own Composition/rendering pipeline — GitHub Actions'
-   basic virtual display adapter is a real, previously-documented source of WinUI3/Composition crashes on CI,
-   worth checking next if this comes back empty too) or during handling of a specific one. Not yet run.
+   exists) to log every window message it receives. That run showed ~30 real messages handled cleanly —
+   `WM_SHOWWINDOW`, `WM_ACTIVATE`, `WM_NCPAINT`, `WM_ERASEBKGND`, `WM_SIZE`, `WM_MOVE`, `WM_PAINT`, `WM_GETICON`
+   — ending with `WM_SETCURSOR` (`0x0020`) fired twice, then **nothing**. That's exactly the point WinUI 3 would
+   start its first real Composition/DirectX render pass, and matches a documented category of crash: GitHub
+   Actions' `windows-latest` runners have no real GPU (a basic/virtual display adapter only), and
+   Composition-based UI frameworks (WinUI 3 uses `DirectComposition`/`Windows.UI.Composition`, not just plain
+   HWND painting — which we now know works fine, since dozens of ordinary window messages were handled without
+   issue) are a known source of exactly this kind of fast-fail on GPU-less machines.
+
+   Researched whether there's a way to force software (WARP — Windows Advanced Rasterization Platform,
+   Microsoft's own bundled software Direct3D rasterizer, explicitly meant for server/VM/no-GPU scenarios: see
+   [Microsoft's WARP guide](https://learn.microsoft.com/en-us/windows/win32/direct3darticles/directx-warp))
+   rendering for an *existing* compiled app without modifying its source (`browser-windows-winui` doesn't
+   create its own Direct3D device — `winio-winui3`/WinUI 3's internals do, with no Rust-accessible hook to
+   request WARP directly). Two real, first-party mechanisms exist:
+   - **`d3dconfig.exe`**, a Microsoft console tool ([DirectX dev blog
+     post](https://devblogs.microsoft.com/directx/d3dconfig-a-new-tool-to-manage-directx-control-panel-settings/))
+     for managing the same per-application driver-type overrides the DirectX Control Panel GUI (`dxcpl.exe`)
+     does, installable via the "Graphics Tools" Windows Feature-on-Demand
+     (`Add-WindowsCapability -Online -Name "Tools.Graphics.DirectX~~~~0.0.1.0"`). The blog post shows `apps`/
+     `debug-layer`/`message-break` subcommands verbatim but not the driver-type one specifically — its exact
+     syntax for forcing WARP isn't confirmed from documentation, so the workflow installs it, dumps `--help`
+     output for real, and tries a few plausible guesses at the syntax.
+   - The **`Microsoft.Direct3D.WARP` NuGet package** ships `D3D10Warp.dll` (the same file name backs both
+     D3D10 and D3D11 WARP support historically), which Microsoft's own docs say can be placed next to an app's
+     `.exe` — but this only helps if WinUI 3's Composition stack already *attempts* a WARP fallback and just
+     needs a working DLL, not if it doesn't attempt a software fallback at all. Not tried yet — `d3dconfig` is
+     the more targeted first attempt, since it can force the driver type rather than hoping for an automatic
+     fallback.
+
+   This entire experiment is genuinely exploratory (the exact `d3dconfig` syntax for driver-type forcing
+   wasn't found in any indexed documentation) — expect this to need at least one more round once the real
+   `--help` output is visible in the log.
 
 This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the
 real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine. It
