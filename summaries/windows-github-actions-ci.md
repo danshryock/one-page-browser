@@ -102,13 +102,22 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    never checked into the repo) — the correct place for "where a tool happens to live on this specific box."
    After this fix, `test-core` passed fully and the winui build step itself succeeded.
 2. **`build-and-smoke-winui`'s launch step then failed differently**: the app crashed immediately with exit
-   code `-1073741189` (`0xC000027B`, `STATUS_DLL_NOT_FOUND` — a Windows loader failure before any of our own
-   code runs). The likely cause: the "Install Windows App SDK runtime" step's `Start-Process ... -Wait`
-   never checked the installer's own exit code, so a silently-failed install looked identical to a
-   successful one in the log — this diagnosis is the strongest lead so far but not yet confirmed, since the
-   install step's own log showed no output either way. The workflow now captures and prints the installer's
-   exit code plus whether a `WindowsAppRuntime` AppX package actually landed (`Get-AppxPackage`), so the next
-   run's log will directly confirm or rule this out rather than requiring another inference chain.
+   code `-1073741189` (`0xC000027B`). First guess (wrong, not checked before writing it down) was
+   "`STATUS_DLL_NOT_FOUND`," theorizing the "Install Windows App SDK runtime" step's `Start-Process ... -Wait`
+   silently swallowed a failed install. That step was improved to capture/print the installer's exit code and
+   confirm via `Get-AppxPackage` whether the runtime landed — and on the next run it clearly had (exit code
+   `0`, `Microsoft.WindowsAppRuntime.2` v2.2.0.0 present, both x64/x86) — yet the exact same crash code
+   recurred, ruling that theory out. Actually checking `0xC000027B` against a real reference
+   (`ntstatus.h`) instead of guessing: it's `STATUS_STOWED_EXCEPTION`, not a missing-DLL code at all — this is
+   Windows' fast-fail for an **unhandled exception**, most plausibly a Rust panic unwinding across the
+   `ApplicationInitializationCallback` FFI boundary (or a genuine WinRT-level exception) somewhere inside
+   `browser-windows-winui`'s own startup code — which has never actually run anywhere before this workflow
+   (see `ROADMAP.md`'s "`browser-windows-winui` debugging" backlog entry; this is that debugging pass,
+   happening for the first time). The launch step now redirects the app's own stdout/stderr to files and
+   prints + uploads them regardless of outcome, since the previous version gave no way to see *what* failed
+   beyond a bare exit code — next run's log should show a panic message or our own `eprintln!` output.
 
 This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the
-real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine.
+real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine. It
+also caught a real mistake of mine along the way: guessing at what an NTSTATUS code meant instead of checking
+it, which sent the first fix attempt in the wrong direction — corrected once actually verified.

@@ -96,6 +96,20 @@ jobs:
       # (unlike Linux runners), so this can actually launch a visible window
       # and screenshot it — genuine visual confirmation the app renders,
       # rather than only "it compiled and linked."
+      #
+      # First real run crashed with exit code -1073741189 (0xC000027B). That's
+      # STATUS_STOWED_EXCEPTION, not a missing-DLL code (an earlier version of
+      # this comment guessed DLL_NOT_FOUND without checking — wrong; verified
+      # against ntstatus.h afterward) — it means an unhandled exception
+      # (a Rust panic unwinding across the `ApplicationInitializationCallback`
+      # FFI boundary, or a genuine WinRT-level exception) crashed the process,
+      # most likely from inside browser-windows-winui's own startup code,
+      # which has never actually been run before this workflow (see
+      # ROADMAP.md's "browser-windows-winui debugging" backlog entry). The
+      # previous version of this step gave no way to see *what* failed beyond
+      # that exit code, so it now redirects the app's own stdout/stderr to a
+      # file and prints it regardless of outcome — should reveal a panic
+      # message or our own eprintln! output next time this runs.
       - name: Launch and screenshot
         shell: pwsh
         run: |
@@ -107,11 +121,20 @@ jobs:
             exit 1
           }
 
-          $proc = Start-Process -FilePath $exe -PassThru
+          $stdout = "$env:GITHUB_WORKSPACE\browser-windows-winui-stdout.log"
+          $stderr = "$env:GITHUB_WORKSPACE\browser-windows-winui-stderr.log"
+          $proc = Start-Process -FilePath $exe -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
           Start-Sleep -Seconds 8
 
+          Write-Host "--- stdout ---"
+          Get-Content $stdout -ErrorAction SilentlyContinue
+          Write-Host "--- stderr ---"
+          Get-Content $stderr -ErrorAction SilentlyContinue
+          Write-Host "--------------"
+
           if ($proc.HasExited) {
-            Write-Error "browser-windows-winui exited on its own within 8 seconds (exit code $($proc.ExitCode)) — see the Windows App SDK install step above if this is a 'Class not registered'-style failure"
+            $hex = "0x{0:X8}" -f $proc.ExitCode
+            Write-Error "browser-windows-winui exited on its own within 8 seconds (exit code $($proc.ExitCode) / $hex) — see stdout/stderr above, and the logs uploaded as artifacts"
             exit 1
           }
 
@@ -124,6 +147,16 @@ jobs:
           $bitmap.Save("$env:GITHUB_WORKSPACE\browser-windows-winui-screenshot.png")
 
           Stop-Process -Id $proc.Id -Force
+
+      - name: Upload app logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-windows-winui-logs
+          path: |
+            browser-windows-winui-stdout.log
+            browser-windows-winui-stderr.log
+          if-no-files-found: ignore
 
       - name: Upload screenshot
         if: always()
