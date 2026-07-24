@@ -48,9 +48,18 @@ build-windows-winui = "xwin build --target x86_64-pc-windows-msvc -p browser-win
 # (unlike cargo-zigbuild, which bundles its own self-contained C
 # toolchain) — those tools do exist (Ubuntu's clang-21/lld-21/llvm-21
 # packages), just not symlinked as plain, unversioned names on default PATH.
-# force = true so this wins over cargo-xwin's own "clang-cl"/"llvm-lib"
-# (bare names it puts in the child build's environment), since plain [env]
-# entries only apply when a var isn't already set.
-[env]
-CC_x86_64_pc_windows_msvc = { value = "/usr/lib/llvm-21/bin/clang-cl", force = true }
-AR_x86_64_pc_windows_msvc = { value = "/usr/lib/llvm-21/bin/llvm-lib", force = true }
+#
+# This used to live here as a repo-tracked `[env]` table, but that broke a
+# genuine native-Windows build (GitHub Actions' windows-latest runner):
+# `[env]` entries apply unconditionally regardless of host OS, so the
+# native runner picked up this Linux-only clang-cl path too and failed with
+# "failed to find tool /usr/lib/llvm-21/bin/clang-cl" — a path that only
+# exists on this dev machine's cargo-xwin cross-compile setup, and would
+# never be right on a real Windows/macOS box. Cargo config also merges in
+# `$CARGO_HOME/config.toml` (i.e. `~/.cargo/config.toml`), which is NOT
+# checked into the repo — that's where these two lines now live on this
+# machine, which is the correct place for "where a tool happens to be
+# installed on this specific box" (see also `Cross.toml`'s comment on the
+# unrelated, unused `cross` tool for the same kind of distinction). If
+# `cargo build-windows-winui` ever fails here with a similar ToolNotFound
+# error, check `~/.cargo/config.toml` first.
