@@ -143,6 +143,16 @@ jobs:
           Get-Content $stderr -ErrorAction SilentlyContinue
           Write-Host "--------------"
 
+          # Temporary: browser-windows-winui/src/main.rs writes checkpoint
+          # lines straight to this file (with an explicit sync_all() after
+          # each) — see that file's comment. Start-Process's working
+          # directory defaults to this step's own (the repo checkout root),
+          # so this relative path matches where the app actually wrote it.
+          $traceFile = "$env:GITHUB_WORKSPACE\winui-trace.log"
+          Write-Host "--- winui-trace.log ---"
+          Get-Content $traceFile -ErrorAction SilentlyContinue
+          Write-Host "-----------------------"
+
           if ($proc.HasExited) {
             $hex = "0x{0:X8}" -f $proc.ExitCode
 
@@ -202,6 +212,7 @@ jobs:
           path: |
             browser-windows-winui-stdout.log
             browser-windows-winui-stderr.log
+            winui-trace.log
           if-no-files-found: ignore
 
       # Raw dumps, for offline analysis if `cdb` wasn't available on this

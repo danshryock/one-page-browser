@@ -115,9 +115,20 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    (see `ROADMAP.md`'s "`browser-windows-winui` debugging" backlog entry; this is that debugging pass,
    happening for the first time). The launch step now redirects the app's own stdout/stderr to files and
    prints + uploads them regardless of outcome, since the previous version gave no way to see *what* failed
-   beyond a bare exit code — next run's log should show a panic message or our own `eprintln!` output.
+   beyond a bare exit code — but the redirected stdout/stderr both came back **completely empty** on the next
+   run, meaning the crash is too abrupt for normal stream flushing (consistent with `RaiseFailFastException`-
+   style termination, which explicitly skips the usual CRT/unwind cleanup). Registered a Windows Error
+   Reporting local dump for the exe next — also came back empty (`WerSvc` confirmed running, WER not
+   disabled, but still no `.dmp` written for this specific crash), and this runner has no `cdb`/`windbg` on
+   `PATH` to attach a debugger directly either. Switched strategy again: added temporary checkpoint tracing
+   directly in `browser-windows-winui/src/main.rs` (`trace(...)`, writing straight to a file with an explicit
+   `sync_all()` after every line — survives an abrupt fast-fail in a way buffered stdio doesn't) at each step
+   of `main()`/`run()`, so the resulting `winui-trace.log` will show exactly how far startup got before the
+   crash, regardless of whether the crash itself gives any information at all. Not yet run.
 
 This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the
 real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine. It
 also caught a real mistake of mine along the way: guessing at what an NTSTATUS code meant instead of checking
-it, which sent the first fix attempt in the wrong direction — corrected once actually verified.
+it, which sent the first fix attempt in the wrong direction — corrected once actually verified. This
+particular crash has taken several rounds without a definitive answer yet — a genuinely hard, first-ever
+debugging session for code that had never run anywhere before this CI existed.
