@@ -3,7 +3,9 @@ fn main() -> anyhow::Result<()> {
     browser_windows_reactor::trace("main: start");
     windows_reactor::bootstrap()?;
     browser_windows_reactor::trace("main: after bootstrap");
-    let result = browser_windows_reactor::run();
+    let args: Vec<String> = std::env::args().collect();
+    let profile = browser_core::Profile::new(browser_core::resolve_profile_name(args));
+    let result = browser_windows_reactor::run(profile);
     browser_windows_reactor::trace(&format!("main: run() returned {result:?}"));
     result?;
     Ok(())

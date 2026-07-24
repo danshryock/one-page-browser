@@ -230,6 +230,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "browser-core",
+ "render-engine",
  "windows-reactor",
  "windows-reactor-setup",
  "windows-webview",

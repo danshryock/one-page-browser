@@ -6,6 +6,12 @@ license.workspace = true
 
 [dependencies]
 browser-core = { path = "../browser-core" }
+# For the RenderEngine trait, so PageManager<ReactorWebViewEngine> (see
+# src/engine.rs) can be reused as-is rather than reinvented. The impl itself
+# stays local to this crate (not in render-engine, alongside WebView2Engine)
+# to avoid pulling windows-reactor/windows-webview's git dependency into
+# browser-windows-winui's build via the shared crate.
+render-engine = { path = "../render-engine" }
 anyhow = "1"
 
 # windows-reactor/windows-webview are Microsoft's own in-tree Rust bindings

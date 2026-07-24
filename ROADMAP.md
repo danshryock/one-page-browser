@@ -126,9 +126,25 @@ reconciler never tears down a page's `WebView2` control just because it's not cu
 them all in one `Grid` cell, active page last so it paints on top — real WinUI 3 `Grid` behavior, not a hack.
 Added a second page, switched back and forth, no crash either direction.
 
-Still to build, roughly in order: the real switcher overlay (search + tiles, wiring `browser_core::PageManager`
-in for real — the minimal page-button row so far doesn't use it), settings/profile/keybindings overlays, and
-the custom title bar.
+**`browser_core::PageManager<ReactorWebViewEngine>` is now wired in for real** (new `engine.rs`: a
+`RenderEngine` impl backed by `windows-webview`'s `WebView`, kept out of the shared `render-engine` crate so
+`browser-windows-winui`'s build doesn't pick up `windows-reactor`/`windows-webview`'s git dependency
+transitively), replacing the placeholder page-button row with a working switcher overlay: a search box plus a
+tile grid of open pages (via `PageManager::matching_ids`) and history matches (via `HistoryStore::search`,
+`browser_core::HOME_URL`/`resolve_address_input` reused throughout), matching
+`browser-windows-winui`'s `rebuild_switcher_grid`. Uses reactor's native `grid_view` control (real wrapping
+tile layout, handled by the control itself) rather than `winio-winui3`'s fixed-column-count workaround (that
+crate has no working `SizeChanged` event to react to the real window width with). Verified running in the VM:
+opened the switcher, it rendered a real tile from live `PageManager` data plus the add-page tile, no crash.
+Two honest rough edges to revisit: the tile grid's visual layout doesn't yet look like distinct bounded
+squares (needs a border/background per tile), and clicking through `grid_view`'s selection wasn't fully
+verified interactively (no visible keyboard-focus indicator inside the control after tabbing into it — Tab
+navigation *into* the toolbar/overlay controls around it works fine).
+
+Still to build, roughly in order: settings/profile/keybindings overlays, and the custom title bar. Also
+worth trying once the keybindings overlay is underway: `KeyboardAccelerator` (already used for the address
+bar's Enter-to-navigate) might let real global shortcuts work without `winio-winui3`'s raw `HWND`-subclass
+workaround entirely.
 
 Repo is pushed to `danshryock/one-page-browser` (`git@github.com:danshryock/one-page-browser.git`), with `gh`
 installed and authenticated on this dev machine — real job logs are pulled via `gh run view --log-failed`/the
