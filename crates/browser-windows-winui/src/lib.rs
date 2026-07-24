@@ -38,8 +38,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use browser_core::{
-    domain_of, list_profile_names, resolve_address_input, Action, HistoryBackend, KeyChord, Keybindings, MemoryHistoryStore,
-    PageManager, Profile, Settings,
+    domain_of, list_profile_names, resolve_address_input, Action, HistoryStore, KeyChord, Keybindings, PageManager, Profile,
+    Settings,
 };
 use render_engine::{AssertSend, RenderEngine, WebView2Engine};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -106,15 +106,7 @@ pub struct AppState {
     /// (nothing called "Stack" exists in this bindings subset).
     containers: RefCell<HashMap<String, Grid>>,
     settings: RefCell<Settings>,
-    // TEMPORARY, for the browser-windows-winui Windows CI launch-crash
-    // investigation (see summaries/windows-github-actions-ci.md): swapped
-    // from the real, libsql-backed `HistoryStore` to the libsql-free
-    // `MemoryHistoryStore` to test the *actual production binary* (not just
-    // an approximating smoke-test binary) with no libsql calls anywhere in
-    // its own code path. Loses persistent history across restarts while
-    // this is in place — revert to `HistoryStore` once this experiment is
-    // done, real users need history that survives a restart.
-    history: MemoryHistoryStore,
+    history: HistoryStore,
     keybindings_overlay: Grid,
     /// Rebuilt from the current `Keybindings` each time the editor opens
     /// (and after every add/remove) — holds one row per `Action`.
@@ -990,8 +982,7 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<Rc<AppState>> {
     window.SetTitleBar(&toolbar)?;
 
     let settings = Settings::load(&profile);
-    // TEMPORARY — see AppState's `history` field comment.
-    let history = MemoryHistoryStore::new();
+    let history = HistoryStore::open(&profile)?;
     let core = PageManager::new(settings.max_loaded_pages);
     let app = Rc::new(AppState {
         window: window.clone(),

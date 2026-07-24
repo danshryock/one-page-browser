@@ -363,6 +363,30 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    substring search). Nine for nine now: every individual piece, every combination, the exact real-app
    construction order, and now a `libsql`-free history backend too, all survive cleanly.
 
+   ### The decisive test: the real production binary itself, with libsql removed
+
+   All nine bisection binaries above *approximate* pieces of the real app — none of them are the actual
+   `browser-windows-winui.exe` the user runs. Asked directly whether the real binary had actually been tested
+   with `MemoryHistoryStore` — it hadn't. Temporarily swapped `AppState`'s `history` field (and its
+   construction in `build_window_and_app`) from the real, libsql-backed `HistoryStore` to `MemoryHistoryStore`
+   directly in `browser-windows-winui/src/lib.rs`, clearly marked `TEMPORARY` in both places, and let the
+   existing `Launch and screenshot` CI step (which already launches whatever `browser-windows-winui.exe` the
+   Build step just produced) test it — no new CI step needed.
+
+   **Result: crashed identically.** Same `STATUS_STOWED_EXCEPTION`, same message sequence ending at
+   `WM_SETCURSOR`, even with the real app's *full* complexity intact (switcher grid, settings/profile/
+   keybindings/bookmarks overlays, real page/`WebView2` management via `add_page`) and zero `libsql` calls
+   anywhere in the actual code path taken. `winui-trace.log` shows `build_window_and_app`, `add_page`, and
+   `activate` all completing successfully — the crash happens exactly where it always has, entirely
+   independent of whether `libsql` is involved at all.
+
+   This is the most direct confirmation available: not an approximation, the actual production binary, with
+   the one remaining untested variable (libsql calls in the real, full-complexity app) removed entirely, and
+   it crashes exactly the same. Reverted the swap immediately afterward — `MemoryHistoryStore` has no
+   persistence across restarts, which would be a real regression for actual users; the `HistoryBackend`
+   trait and `MemoryHistoryStore` implementation stay in `browser_core` as genuine, tested, reusable additions
+   (not reverted), just not wired into the real app's `AppState`.
+
    ### Where this leaves things
 
    Nine independent bisection binaries — a bare window, custom title bar, `WebView2`, HWND subclass, three
@@ -370,7 +394,11 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    construction order/timing, and finally a `libsql`-free `MemoryHistoryStore` in that same exact order —
    **all survived cleanly**, several going well past the exact point the real app crashes at. Every real,
    plausible suspect this codebase's own code offers has been tested and ruled out, individually and
-   combined. The crash dump closes the loop: the fault lives entirely inside
+   combined. **The real production binary itself**, temporarily rebuilt with `MemoryHistoryStore` in place of
+   the real `HistoryStore` (its full complexity otherwise intact — switcher grid, all four overlays, real
+   page/`WebView2` management), **crashed identically anyway** — the most direct confirmation available that
+   this isn't anything in this codebase's code, approximated or real. The crash dump closes the loop: the
+   fault lives entirely inside
    Microsoft's own system DLLs, with zero frames from this codebase anywhere in any thread's stack. Tokio's
    own footprint was independently confirmed minimal and has been removed entirely from `browser_core` as a
    real simplification either way, and `HistoryStore` is now abstracted behind a `HistoryBackend` trait with

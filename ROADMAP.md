@@ -146,6 +146,14 @@ thoroughly as practically possible from this environment:
   `HistoryStore`'s exact behavior. Not implicated either (the ninth bisection binary above ruled it out), but
   a real, tested (7 new tests) alternative now available for future use beyond this investigation. All 86
   `browser-core` tests and all 20 `browser-linux-gtk3` GTK tests pass.
+- **Went further and tested the real production binary itself**: temporarily swapped `AppState`'s `history`
+  field in `browser-windows-winui/src/lib.rs` to `MemoryHistoryStore`, so the existing `Launch and screenshot`
+  CI step launched the *actual* `browser-windows-winui.exe` — full complexity intact (switcher grid, all four
+  overlays, real page/`WebView2` management), zero `libsql` calls in its real code path. **Crashed
+  identically anyway.** The most direct confirmation available, beyond any approximating smoke-test binary,
+  that this is not this codebase's code. Reverted immediately afterward — `MemoryHistoryStore` has no
+  persistence across restarts, a real regression for actual users; the trait/implementation stay in
+  `browser_core` as genuine reusable additions, just not wired into the real app.
 
 This is being left as a well-documented, open environment-compatibility issue rather than chased further —
 doing so would need Microsoft's own private symbols or a live debugger on a matching machine, beyond what's

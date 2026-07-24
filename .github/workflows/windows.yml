@@ -504,18 +504,23 @@ jobs:
       # pass for browser-windows-winui (see ROADMAP.md) — expect this to
       # take a few more rounds.
       #
-      # This step launches whatever `browser-windows-winui.exe` the Build
-      # step above just produced — currently (see `AppState`'s `history`
-      # field comment in lib.rs) that's a TEMPORARY build using
-      # `MemoryHistoryStore` instead of the real, libsql-backed
-      # `HistoryStore`, testing the *actual production binary* (not an
-      # approximating smoke-test binary) with no libsql calls in its own
-      # code path — nine separate smoke-test binaries already ruled out
-      # every individual piece and combination of this codebase's own
-      # unusual code (see summaries/windows-github-actions-ci.md), so this
-      # is checking whether the *real* app's full complexity (many
-      # controls/overlays at once) still crashes even with libsql calls
-      # removed from the equation entirely.
+      # This step launches the real, full `browser-windows-winui.exe` (all
+      # its normal complexity: switcher grid, settings/profile/keybindings/
+      # bookmarks overlays, real page/WebView2 management). It was
+      # temporarily rebuilt with `MemoryHistoryStore` (a libsql-free
+      # `HistoryBackend`, see `crates/browser-core/src/history.rs`) swapped
+      # in for the real, libsql-backed `HistoryStore` for one run, to test
+      # the *actual production binary* — not an approximating smoke-test
+      # binary — with zero libsql calls anywhere in its own code path.
+      # Result: **crashed identically** (same `STATUS_STOWED_EXCEPTION`,
+      # same message sequence ending at `WM_SETCURSOR`) even with libsql
+      # entirely out of the picture and the real app's full complexity
+      # intact — the most direct confirmation yet of the crash dump's own
+      # finding (see summaries/windows-github-actions-ci.md): the fault is
+      # inside WinUI 3's own Composition/WinRT internals, unrelated to
+      # anything this codebase's code does. Reverted back to the real
+      # `HistoryStore` afterward — real users need history that survives a
+      # restart.
       - name: Launch and screenshot
         shell: pwsh
         run: |
