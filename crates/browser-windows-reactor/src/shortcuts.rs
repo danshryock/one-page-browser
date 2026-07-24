@@ -11,6 +11,23 @@
 //! single alphanumeric characters convert via a plain cast rather than
 //! needing 36 named constants. F-keys (`VK_F1` = `0x70`) and the arrow/
 //! escape keys are the other well-known standard values.
+//!
+//! # Known gap: accelerators don't fire while focus is inside `WebView2`
+//!
+//! Confirmed working for every other control (toolbar buttons, the address
+//! bar, overlays) via real testing in the dockur/windows VM — not a guess.
+//! But `WebView2` is a genuinely separate rendering surface (its own
+//! process, in Chromium's case), and real WinUI 3 apps need to explicitly
+//! bridge `Controller::on_accelerator_key_pressed` (documented in
+//! `windows-webview`'s own docs: "browser-level keys arrive before the page
+//! sees them") to let application shortcuts fire while focus is inside the
+//! browser content — otherwise the embedded browser consumes the keystroke
+//! first. `windows-webview`'s reactor bridge (`webview()`, used by
+//! `lib.rs`'s `page_element`) doesn't expose the underlying `Controller` at
+//! all — only a bare `WebView` — so this crate currently has no way to wire
+//! that bridge up. A real, current limitation of this in-development crate,
+//! not something fixable from here without either a lower-level COM/WinRT
+//! escape hatch or an upstream change to `windows-webview` itself.
 use browser_core::KeyChord;
 use windows_reactor::{KeyboardAccelerator, VirtualKey, VirtualKeyModifiers};
 

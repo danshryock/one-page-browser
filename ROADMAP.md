@@ -189,6 +189,33 @@ bootstrap.dll was not found." Fixed by checking `CARGO_CFG_TARGET_OS`/`CARGO_CFG
 instead (the correct way for a build script to ask what it's really building for) and making the dependency
 itself unconditional rather than target-gated.
 
+**Real user feedback investigated**: keybindings moved out of their own toolbar button/overlay into a
+section within the settings overlay (per explicit request — a worse fit as a separate entry point than in
+`browser-windows-winui`, where the extra toolbar icon made more sense). Two bug reports ("keyboard shortcuts
+don't work," "the page never renders") led to a careful re-diagnosis, not just a guess:
+- **Shortcuts**: confirmed working correctly via a rigorous retest in the VM (`Ctrl+T`, `Escape`,
+  address-bar Enter-to-navigate all fire — verified via trace logging, not assumption). The one *reported*
+  failure during testing turned out to be a testing artifact (not enough time for the newly-launched window
+  to claim real focus before sending input — confirmed by the fact keystrokes were landing on the launching
+  `cmd` window instead, visible in its own command history). There is one real, current, documented gap
+  though: `windows-webview`'s reactor bridge (`webview()`) doesn't expose the underlying `Controller` object,
+  so there's no way to wire up `Controller::on_accelerator_key_pressed` — meaning shortcuts genuinely won't
+  fire while keyboard focus is *inside* the `WebView2` content area itself (a real WinUI 3/WebView2
+  integration requirement, not specific to this codebase — see `shortcuts.rs`'s doc comment). If a user's
+  focus ends up there (plausible if they click into a blank/not-yet-rendered page trying to interact with
+  it), shortcuts won't reach the app until focus moves back out.
+- **Blank page**: root-caused to `on_ready` (the callback `windows-webview`'s `webview()` calls once
+  `WebView2` actually initializes) never firing — confirmed via trace logging showing zero occurrences
+  across a full navigate attempt. Also found and fixed a real bug in `engine.rs` along the way:
+  `ReactorWebViewEngine::navigate()`/`go_back()`/`go_forward()`/`reload()` were silently returning `Ok(())`
+  when the webview wasn't ready yet, instead of a real error — meaning "successfully navigated" and
+  "silently did nothing because not ready" were indistinguishable in logs, which got in the way of this
+  exact diagnosis. Fixed to return a real error instead. The underlying blank-page cause itself is still
+  open: it matches the same symptom seen throughout this VM's testing (believed to be this eval image's
+  `WebView2` Runtime, a separate component from the Windows App SDK), but since it was also reported on a
+  real machine, that explanation needs to be confirmed rather than assumed — worth checking whether the
+  WebView2 Runtime (not just Edge) is actually present there.
+
 See `summaries/windows-github-actions-ci.md` for the full incremental build log.
 
 Repo is pushed to `danshryock/one-page-browser` (`git@github.com:danshryock/one-page-browser.git`), with `gh`

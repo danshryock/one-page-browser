@@ -15,9 +15,10 @@
 //! widget-tree-with-handles style, so this isn't a mechanical port.
 //!
 //! This version wires in `browser_core::PageManager<ReactorWebViewEngine>`
-//! for real (see `engine.rs`), a working switcher/settings/profile/
-//! keybindings overlays, real global keyboard shortcuts (see
-//! `shortcuts.rs`), a native `TitleBar`-hosted toolbar, and
+//! for real (see `engine.rs`), a working switcher/settings/profile overlay
+//! set (keybindings live as a section *within* settings, not their own
+//! overlay — see `keybindings_section`), real global keyboard shortcuts
+//! (see `shortcuts.rs`), a native `TitleBar`-hosted toolbar, and
 //! `run_chooser`'s external-link launch handling — feature parity with
 //! `browser-windows-winui` (see `ROADMAP.md`).
 //!
@@ -121,15 +122,16 @@ enum Tile {
 }
 
 /// Mutually exclusive, mirroring `browser-windows-winui`'s
-/// close_switcher/close_settings/close_profile_picker/close_keybindings —
-/// opening any one of these closes whichever else was open.
+/// close_switcher/close_settings/close_profile_picker — opening any one of
+/// these closes whichever else was open. No separate `Keybindings` variant:
+/// that editor is a section within `Settings` (see `keybindings_section`),
+/// not its own overlay.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Overlay {
     None,
     Switcher,
     Settings,
     Profile,
-    Keybindings,
 }
 
 fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
@@ -244,11 +246,16 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         let address = address.clone();
         let settings = Rc::clone(shared);
         move || {
+            trace("navigate_from_address_bar: fired");
             let core = core.borrow();
             if let Some(engine) = core.page(&active_id).and_then(|p| p.engine.as_ref()) {
                 let url = resolve_address_input(&address, &settings.settings.borrow());
+                trace(&format!("navigate_from_address_bar: navigating to {url}"));
                 use render_engine::RenderEngine;
-                let _ = engine.navigate(&url);
+                let result = engine.navigate(&url);
+                trace(&format!("navigate_from_address_bar: navigate() returned {result:?}"));
+            } else {
+                trace("navigate_from_address_bar: no active engine found");
             }
         }
     };
@@ -275,7 +282,10 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
 
     let close_any_overlay: Callback<()> = Callback::new({
         let set_overlay = set_overlay.clone();
-        move |()| set_overlay.call(Overlay::None)
+        move |()| {
+            trace("close_any_overlay: fired (Escape)");
+            set_overlay.call(Overlay::None)
+        }
     });
 
     let open_settings: Callback<()> = Callback::new({
@@ -285,7 +295,9 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         let set_engine_index_draft = set_engine_index_draft.clone();
         let set_unlimited_draft = set_unlimited_draft.clone();
         let set_limit_draft = set_limit_draft.clone();
+        let set_listening_for = set_listening_for.clone();
         move |()| {
+            set_listening_for.call(None);
             let settings = shared.settings.borrow();
             set_start_page_draft.call(settings.start_page.clone());
             let idx = settings
@@ -362,15 +374,6 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         }
     });
 
-    let open_keybindings: Callback<()> = Callback::new({
-        let set_overlay = set_overlay.clone();
-        let set_listening_for = set_listening_for.clone();
-        move |()| {
-            set_listening_for.call(None);
-            set_overlay.call(Overlay::Keybindings);
-        }
-    });
-
     // Runs whatever `action` means — the shared target of every global
     // keyboard-accelerator dispatch built below. Mirrors
     // `browser-windows-winui`'s `dispatch_action`: Bookmarks/EditUrl/reader
@@ -383,6 +386,7 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         let open_settings = open_settings.clone();
         let open_profile = open_profile.clone();
         move |action: Action| {
+            trace(&format!("dispatch_action: fired for {action:?}"));
             use render_engine::RenderEngine;
             match action {
                 Action::OpenSwitcher => open_switcher.invoke(()),
@@ -446,18 +450,12 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
             move || open_profile.invoke(())
         }))
         .grid_column(6),
-        Element::from(button("\u{2328}").on_click({
-            let open_keybindings = open_keybindings.clone();
-            move || open_keybindings.invoke(())
-        }))
-        .grid_column(7),
     ))
     .columns([
         GridLength::Auto,
         GridLength::Auto,
         GridLength::Auto,
         GridLength::STAR,
-        GridLength::Auto,
         GridLength::Auto,
         GridLength::Auto,
         GridLength::Auto,
@@ -510,23 +508,18 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
             set_limit_draft.clone(),
             save_settings.clone(),
             close_any_overlay.clone(),
-        )),
-        Overlay::Profile => Some(profile_overlay(
-            &shared,
-            &new_profile_draft,
-            set_new_profile_draft.clone(),
-            create_and_open_profile.clone(),
-            close_any_overlay.clone(),
-        )),
-        Overlay::Keybindings => Some(keybindings_overlay(
-            &shared,
-            &core,
             &keybindings,
             listening_for,
             set_listening_for.clone(),
             &new_binding_text,
             set_new_binding_text.clone(),
             &bump,
+        )),
+        Overlay::Profile => Some(profile_overlay(
+            &shared,
+            &new_profile_draft,
+            set_new_profile_draft.clone(),
+            create_and_open_profile.clone(),
             close_any_overlay.clone(),
         )),
     };
@@ -782,8 +775,23 @@ fn settings_overlay(
     set_limit_text: SetState<String>,
     on_save: Callback<()>,
     on_cancel: Callback<()>,
+    keybindings: &HookRef<Keybindings>,
+    listening_for: Option<Action>,
+    set_listening_for: SetState<Option<Action>>,
+    new_binding_text: &str,
+    set_new_binding_text: SetState<String>,
+    bump: &Callback<()>,
 ) -> Element {
     let engine_names: Vec<String> = shared.settings.borrow().search_engines.iter().map(|e| e.name.clone()).collect();
+    let keybindings_section = keybindings_section(
+        shared,
+        keybindings,
+        listening_for,
+        set_listening_for,
+        new_binding_text,
+        set_new_binding_text,
+        bump,
+    );
     vstack((
         Element::from(text_block("Start page")),
         Element::from(text_box(start_page.to_string()).on_text_changed(set_start_page)),
@@ -792,6 +800,7 @@ fn settings_overlay(
         Element::from(check_box(unlimited).content("Unlimited loaded pages").on_checked(set_unlimited)),
         Element::from(text_block("Loaded pages limit")),
         Element::from(text_box(limit_text.to_string()).enabled(!unlimited).on_text_changed(set_limit_text)),
+        keybindings_section,
         Element::from(
             hstack((
                 Element::from(button("Cancel").on_click(move || on_cancel.invoke(()))),
@@ -801,7 +810,7 @@ fn settings_overlay(
         ),
     ))
     .spacing(8.0)
-    .width(360.0)
+    .width(480.0)
     .margin(Thickness::uniform(16.0))
     .into()
 }
@@ -858,25 +867,26 @@ fn profile_overlay(
     .into()
 }
 
-/// Mirrors `browser-windows-winui`'s keybindings editor: one row per
-/// `Action::ALL`, each showing its label, current chords as removable tags,
-/// and either an "Add binding" button or (while `listening_for == Some
-/// (action)`) a text entry to type the new chord in `"Ctrl+Shift+P"` format
-/// — see `shortcuts::parse_chord`'s doc comment for why text entry rather
-/// than live key capture.
-#[allow(clippy::too_many_arguments)]
-fn keybindings_overlay(
+/// Mirrors `browser-windows-winui`'s keybindings editor, folded into the
+/// settings overlay as its own section (per explicit user feedback — this
+/// front end originally had it behind a separate toolbar button/overlay,
+/// matching `browser-windows-winui`'s layout, but that's a worse fit here):
+/// one row per `Action::ALL`, each showing its label, current chords as
+/// removable tags, and either an "Add binding" button or (while
+/// `listening_for == Some(action)`) a text entry to type the new chord in
+/// `"Ctrl+Shift+P"` format — see `shortcuts::parse_chord`'s doc comment for
+/// why text entry rather than live key capture. Returns just the rows
+/// (no title/wrapper — `settings_overlay` supplies those as part of its own
+/// single panel).
+fn keybindings_section(
     shared: &Rc<Shared>,
-    core: &HookRef<PageManager<ReactorWebViewEngine>>,
     keybindings: &HookRef<Keybindings>,
     listening_for: Option<Action>,
     set_listening_for: SetState<Option<Action>>,
     new_binding_text: &str,
     set_new_binding_text: SetState<String>,
     bump: &Callback<()>,
-    on_close: Callback<()>,
 ) -> Element {
-    let _ = core; // reserved: a future revision may show per-action conflicts
     let mut rows: Vec<Element> = Vec::new();
     for &action in Action::ALL {
         let chords = keybindings.borrow().bindings_for(action).to_vec();
@@ -944,11 +954,8 @@ fn keybindings_overlay(
     vstack((
         Element::from(text_block("Keybindings").bold()),
         Element::from(vstack(rows).spacing(4.0)),
-        Element::from(hstack((Element::from(button("Close").on_click(move || on_close.invoke(()))),)).spacing(8.0)),
     ))
     .spacing(8.0)
-    .width(480.0)
-    .margin(Thickness::uniform(16.0))
     .into()
 }
 

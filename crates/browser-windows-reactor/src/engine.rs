@@ -42,25 +42,32 @@ impl RenderEngine for ReactorWebViewEngine {
     fn navigate(&self, url: &str) -> anyhow::Result<()> {
         match self.web.borrow().as_ref() {
             Some(w) => w.navigate(url).map_err(|err| anyhow::anyhow!("{err}")),
-            None => Ok(()), // not ready yet; the initial navigate in on_ready will use the real start URL
+            // Real error, not `Ok(())` — a prior version of this code masked
+            // "not ready yet" as success, which made it indistinguishable
+            // from a genuine successful navigation in logs/traces. That
+            // ambiguity got in the way of diagnosing a real user report of
+            // pages never rendering: callers need to be able to tell "we
+            // never actually asked the browser to navigate" apart from "we
+            // did, and it should be showing something."
+            None => anyhow::bail!("webview not ready yet"),
         }
     }
     fn go_back(&self) -> anyhow::Result<()> {
         match self.web.borrow().as_ref() {
             Some(w) => w.go_back().map_err(|err| anyhow::anyhow!("{err}")),
-            None => Ok(()),
+            None => anyhow::bail!("webview not ready yet"),
         }
     }
     fn go_forward(&self) -> anyhow::Result<()> {
         match self.web.borrow().as_ref() {
             Some(w) => w.go_forward().map_err(|err| anyhow::anyhow!("{err}")),
-            None => Ok(()),
+            None => anyhow::bail!("webview not ready yet"),
         }
     }
     fn reload(&self) -> anyhow::Result<()> {
         match self.web.borrow().as_ref() {
             Some(w) => w.reload().map_err(|err| anyhow::anyhow!("{err}")),
-            None => Ok(()),
+            None => anyhow::bail!("webview not ready yet"),
         }
     }
     fn current_url(&self) -> anyhow::Result<String> {
