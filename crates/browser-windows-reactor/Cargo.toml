@@ -1,0 +1,30 @@
+[package]
+name = "browser-windows-reactor"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+browser-core = { path = "../browser-core" }
+anyhow = "1"
+
+# windows-reactor/windows-webview are Microsoft's own in-tree Rust bindings
+# for WinUI 3 (built on the same windows-bindgen WinMD codegen as the base
+# `windows` crate), not yet published to crates.io as real code (the
+# crates.io listing is a 0.0.0 placeholder — see
+# summaries/windows-github-actions-ci.md's "windows-reactor comparison test"
+# section) — hence the git dependency rather than a version. Being tried as
+# a replacement for `winio-winui3` (the community-maintained wrapper
+# `browser-windows-winui` depends on) since a comparison smoke test against
+# it survived where the real app crashes with STATUS_STOWED_EXCEPTION under
+# winio-winui3 — see that same doc section for the full investigation.
+#
+# Same MSVC-only gating as browser-windows-winui: WinRT/COM interop needs
+# MSVC specifically, not the x86_64-pc-windows-gnu target the other Windows
+# crates in this workspace use.
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))'.dependencies]
+windows-reactor = { git = "https://github.com/microsoft/windows-rs" }
+windows-webview = { git = "https://github.com/microsoft/windows-rs", features = ["reactor"] }
+
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))'.build-dependencies]
+windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs" }

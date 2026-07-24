@@ -102,6 +102,22 @@ build/run instructions.
 
 ## Next
 
+**`crates/browser-windows-reactor`** — a new, sixth front end, replacing `browser-windows-winui`'s
+`winio-winui3` dependency with Microsoft's own in-tree `windows-reactor`/`windows-webview` (see
+`summaries/windows-github-actions-ci.md`'s comparison-test section for why). Being built incrementally,
+feature by feature, not ported in one pass — `windows-reactor`'s declarative render-function-of-state model
+is a genuinely different shape from `winio-winui3`'s imperative widget-tree-with-handles style. First
+milestone done and verified running (not just compiled) in the local `dockur/windows` VM: a real window,
+toolbar (back/forward/reload), an address bar with working state and Enter-to-navigate (via
+`.keyboard_accelerator(..)` — a real, working per-element keyboard-shortcut API, unlike `winio-winui3`'s
+missing `KeyDown`/`Window::Closed` that forced a raw `HWND` subclass workaround), and a single `WebView2`
+page, reusing `browser_core::resolve_address_input`. Ran through ~40 real render cycles (one per keystroke)
+with no crash. The `WebView2` content area itself stayed blank — the same pre-existing issue seen in the
+comparison test, believed to be this eval VM image's WebView2 Runtime, not an app bug. Still to build, roughly
+in order: multi-page support (`PageManager`/`RenderEngine` integration — the biggest open design question,
+since `windows-reactor`'s hooks need a pattern for a *dynamic* list of independently-stateful pages, not yet
+researched), the switcher overlay, settings/profile/keybindings overlays, and the custom title bar.
+
 Repo is pushed to `danshryock/one-page-browser` (`git@github.com:danshryock/one-page-browser.git`), with `gh`
 installed and authenticated on this dev machine — real job logs are pulled via `gh run view --log-failed`/the
 Actions API, not guessed at.

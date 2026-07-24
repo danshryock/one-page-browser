@@ -8,6 +8,7 @@ members = [
     "crates/browser-windows-nwg",
     "crates/browser-wx",
     "crates/browser-windows-winui",
+    "crates/browser-windows-reactor",
     "crates/browser-macos-appkit",
 ]
 

@@ -40,6 +40,10 @@ run-wx = "run -p browser-wx"
 # own "build" verb *is* reachable directly through [alias] the same way
 # run-win32/run-nwg reach cargo's built-in "run".
 build-windows-winui = "xwin build --target x86_64-pc-windows-msvc -p browser-windows-winui"
+# Same reasoning as build-windows-winui above, for the windows-reactor-based
+# rebuild (see crates/browser-windows-reactor/src/lib.rs's module doc
+# comment).
+build-windows-reactor = "xwin build --target x86_64-pc-windows-msvc -p browser-windows-reactor"
 
 # browser-core pulls in libsql, whose libsql-ffi dependency compiles a
 # bundled sqlite3.c via cc-rs for *every* target it's built for, including
