@@ -333,6 +333,32 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    all survive cleanly. Combined with the crash dump showing the fault entirely inside Microsoft's own system
    DLLs, this is as conclusive as it gets without Microsoft's private symbols or a live debugger.
 
+   ### Abstracting `HistoryStore` to isolate `libsql` itself
+
+   Asked to go one step further: abstract over `HistoryStore` and build a `libsql`-free in-memory version, to
+   see whether `libsql` itself (not just the `tokio`/`futures_executor` code bridging its `async fn`s) could
+   be involved. Added a real `HistoryBackend` trait to `browser_core` (`record_visit`/`search`/
+   `search_similar`) implemented by both the existing libsql-backed `HistoryStore` (an additive change — its
+   own inherent methods are unchanged, so every existing call site keeps working exactly as before) and a new
+   `MemoryHistoryStore`: a plain `Vec<(HistoryEntry, [f32; DIMS])>` behind a `RefCell`, no SQL at all —
+   `search` is a manual substring scan, `search_similar` reuses `embedding::embed` plus a new public
+   `embedding::cosine_distance` helper, compared directly in Rust instead of via libsql's
+   `vector_distance_cos`. Mirrors `HistoryStore`'s exact behavior (same upsert semantics, same `< 0.9` cutoff,
+   same ordering) rather than being a lesser stand-in, with 7 new tests (including one confirming it works as
+   a trait object) — all 86 `browser-core` tests, all 20 GTK tests, and all three build targets still pass.
+
+   Added a ninth bisection binary, `memory_history_smoke_test.rs`: the same exact construction order as
+   `exact_order_smoke_test.rs`, but calling `MemoryHistoryStore` instead of `HistoryStore`. One honest caveat
+   worth being explicit about: this does **not** actually remove `libsql-ffi` from the compiled exe —
+   `libsql` is a Cargo *package*-level dependency of `browser_core`, which the whole `browser-windows-winui`
+   crate depends on (for the real app), and Cargo doesn't support excluding a dependency for one binary target
+   within a package. So `libsql-ffi`'s bundled SQLite is statically linked into every one of these nine test
+   binaries regardless — including `minimal_smoke_test`, the very first one, which never calls any
+   `browser_core` history code at all and still survived cleanly. That already answers "does `libsql-ffi`
+   merely being present in the binary matter" (no). What this ninth binary actually isolates is narrower but
+   still real: whether *calling* `MemoryHistoryStore`'s code path specifically, instead of libsql's, changes
+   anything. Not yet run.
+
    ### Where this leaves things
 
    Eight independent bisection binaries — a bare window, custom title bar, `WebView2`, HWND subclass, three
@@ -342,10 +368,12 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    ruled out, individually and combined. The crash dump closes the loop: the fault lives entirely inside
    Microsoft's own system DLLs, with zero frames from this codebase anywhere in any thread's stack. Tokio's
    own footprint was independently confirmed minimal and has been removed entirely from `browser_core` as a
-   real simplification either way. Further diagnosis beyond this would need either Microsoft's own private
-   symbols (not publicly available) or a live interactive debugger session on a matching machine — beyond
-   what's practically achievable from this environment. This is being left as a well-documented, real, open
-   environment-compatibility issue (see `ROADMAP.md`) rather than chased further blind.
+   real simplification either way, and `HistoryStore` is now abstracted behind a `HistoryBackend` trait with
+   a genuine `libsql`-free alternative implementation available for future use (not just this investigation).
+   Further diagnosis beyond this would need either Microsoft's own private symbols (not publicly available)
+   or a live interactive debugger session on a matching machine — beyond what's practically achievable from
+   this environment. This is being left as a well-documented, real, open environment-compatibility issue (see
+   `ROADMAP.md`) rather than chased further blind.
 
 This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the
 real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine. It

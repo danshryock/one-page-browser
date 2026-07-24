@@ -77,6 +77,19 @@ pub fn embed(text: &str) -> [f32; DIMS] {
     vector
 }
 
+/// Cosine distance between two embeddings — `1.0 - cosine_similarity`,
+/// matching libsql's native `vector_distance_cos` SQL function's convention
+/// (0.0 for identical vectors, up to ~2.0 for opposite ones; unrelated
+/// vocabulary lands close to 1.0). Since `embed` always returns an
+/// L2-normalized vector, cosine similarity is just the dot product — no
+/// separate division by magnitudes needed. Used by `MemoryHistoryStore`
+/// (`history.rs`), a pure-Rust backend with no SQL at all, to reproduce the
+/// same `search_similar` behavior the libsql-backed `HistoryStore` gets from
+/// the database.
+pub fn cosine_distance(a: &[f32; DIMS], b: &[f32; DIMS]) -> f32 {
+    1.0 - a.iter().zip(b.iter()).map(|(x, y)| x * y).sum::<f32>()
+}
+
 /// Renders an embedding as the JSON-array text libsql's `vector32(...)` SQL
 /// function expects (e.g. `"[0.1,-0.2,0.0]"`) — the only representation
 /// this code hands to SQL; libsql packs it into its own compact `F32_BLOB`

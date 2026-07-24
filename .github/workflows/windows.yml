@@ -389,6 +389,46 @@ jobs:
             Stop-Process -Id $proc.Id -Force
           }
 
+      # Ninth round: same exact construction order as the step above, but
+      # using the new browser_core::MemoryHistoryStore (a HistoryBackend
+      # trait impl added specifically for this — see history.rs) instead of
+      # the libsql-backed HistoryStore — a plain Vec<HistoryEntry> behind a
+      # RefCell, no SQL, no libsql calls at all in this binary's own code.
+      # Note: libsql-ffi is still statically linked into this exe regardless
+      # (it's a Cargo *package*-level dependency of browser_core, which this
+      # whole crate depends on for the real app — Cargo doesn't support
+      # per-binary-target dependency exclusion within one package), so this
+      # doesn't test "libsql absent from the binary" (already answered: even
+      # `minimal_smoke_test`, which never touches browser_core's history
+      # code at all, links the same libsql-ffi and survived) — it tests
+      # whether *calling* MemoryHistoryStore's code path specifically,
+      # rather than libsql's, changes anything.
+      - name: Launch MemoryHistoryStore WinUI 3 smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Get-ChildItem -Recurse -Filter "memory_history_smoke_test.exe" -Path target |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) {
+            Write-Error "memory_history_smoke_test.exe not found under target/ after build"
+            exit 1
+          }
+
+          $proc = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 8
+
+          Write-Host "--- memory-history-smoke-trace.log ---"
+          Get-Content "$env:GITHUB_WORKSPACE\memory-history-smoke-trace.log" -ErrorAction SilentlyContinue
+          Write-Host "---------------------------------------"
+
+          if ($proc.HasExited) {
+            $hex = "0x{0:X8}" -f $proc.ExitCode
+            Write-Host "memory_history_smoke_test exited on its own within 8 seconds (exit code $($proc.ExitCode) / $hex)"
+          } else {
+            Write-Host "memory_history_smoke_test is still running after 8 seconds — did NOT crash"
+            Stop-Process -Id $proc.Id -Force
+          }
+
       # Checkpoint tracing (see browser-windows-winui/src/lib.rs's trace())
       # proved the crash happens *after* a fully successful startup — window
       # built, page added, activated, ~30 real window messages handled —
@@ -571,6 +611,7 @@ jobs:
             full-combo-smoke-trace.log
             historystore-smoke-trace.log
             exact-order-smoke-trace.log
+            memory-history-smoke-trace.log
           if-no-files-found: ignore
 
       # Raw dumps, for offline analysis if `cdb` wasn't available on this

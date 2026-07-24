@@ -22,10 +22,33 @@
 //! either way, since tokio's reactor/threading machinery was always dead
 //! weight for a workload that's never actually asynchronous.)
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{domain_of, embedding, Profile};
+
+/// Abstracts over what a "history store" actually needs to do, independent
+/// of how it's backed — added to isolate `libsql` itself (not just the
+/// `tokio` runtime bridging its `async fn`s — see this module's doc comment
+/// on that) as a variable during the `browser-windows-winui` Windows CI
+/// launch-crash investigation (see `summaries/windows-github-actions-ci.md`):
+/// `MemoryHistoryStore` below implements the same trait with no `libsql`/SQL
+/// involved at all, so a WinUI 3 smoke test can exercise the exact same
+/// `record_visit`/`search`/`search_similar` call shape the real app makes
+/// without linking libsql-ffi's bundled SQLite into the picture.
+///
+/// `HistoryStore`'s own inherent methods (below) already have this exact
+/// signature shape; this trait doesn't change any existing call site's
+/// behavior, since inherent methods take priority over trait methods when
+/// called directly (`store.search(...)` still resolves to the inherent
+/// method) — it only matters for code that wants to be generic over which
+/// backend it's talking to.
+pub trait HistoryBackend {
+    fn record_visit(&self, url: &str, title: &str) -> anyhow::Result<()>;
+    fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<HistoryEntry>>;
+    fn search_similar(&self, query: &str, limit: usize) -> anyhow::Result<Vec<HistoryEntry>>;
+}
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS history (
@@ -211,6 +234,95 @@ impl HistoryStore {
             libsql::params![embedding_literal, limit as i64],
         ))?;
         collect_entries(&mut rows)
+    }
+}
+
+impl HistoryBackend for HistoryStore {
+    fn record_visit(&self, url: &str, title: &str) -> anyhow::Result<()> {
+        self.record_visit(url, title)
+    }
+
+    fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<HistoryEntry>> {
+        self.search(query, limit)
+    }
+
+    fn search_similar(&self, query: &str, limit: usize) -> anyhow::Result<Vec<HistoryEntry>> {
+        self.search_similar(query, limit)
+    }
+}
+
+/// A `HistoryBackend` with no `libsql`/SQL involved at all — entries live in
+/// a plain `Vec` behind a `RefCell`, `search` is a manual substring scan, and
+/// `search_similar` uses the same `embedding::embed`/`cosine_distance` the
+/// libsql-backed `HistoryStore` computes anyway, just compared directly in
+/// Rust instead of via `vector_distance_cos` in SQL. Behavior deliberately
+/// mirrors `HistoryStore` exactly (same upsert-by-url semantics in
+/// `record_visit`, same `distance < 0.9` cutoff, same most-recent-first/
+/// most-similar-first ordering) so the two are interchangeable from a
+/// caller's perspective — this exists to isolate `libsql` itself as a
+/// variable (see this module's `HistoryBackend` doc comment), not to be a
+/// lesser/partial implementation.
+#[derive(Default)]
+pub struct MemoryHistoryStore {
+    entries: RefCell<Vec<(HistoryEntry, [f32; embedding::DIMS])>>,
+}
+
+impl MemoryHistoryStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl HistoryBackend for MemoryHistoryStore {
+    fn record_visit(&self, url: &str, title: &str) -> anyhow::Result<()> {
+        let now = now_unix();
+        let emb = embedding::embed(title);
+        let mut entries = self.entries.borrow_mut();
+        if let Some((entry, stored_emb)) = entries.iter_mut().find(|(entry, _)| entry.url == url) {
+            entry.title = title.to_string();
+            entry.visited_at = now;
+            entry.visit_count += 1;
+            *stored_emb = emb;
+        } else {
+            entries.push((
+                HistoryEntry {
+                    url: url.to_string(),
+                    domain: domain_of(url),
+                    title: title.to_string(),
+                    first_visited_at: now,
+                    visited_at: now,
+                    visit_count: 1,
+                },
+                emb,
+            ));
+        }
+        Ok(())
+    }
+
+    fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<HistoryEntry>> {
+        let query = query.to_lowercase();
+        let entries = self.entries.borrow();
+        let mut matches: Vec<HistoryEntry> = entries
+            .iter()
+            .filter(|(entry, _)| entry.url.to_lowercase().contains(&query) || entry.title.to_lowercase().contains(&query))
+            .map(|(entry, _)| entry.clone())
+            .collect();
+        matches.sort_by_key(|entry| std::cmp::Reverse(entry.visited_at));
+        matches.truncate(limit);
+        Ok(matches)
+    }
+
+    fn search_similar(&self, query: &str, limit: usize) -> anyhow::Result<Vec<HistoryEntry>> {
+        let query_embedding = embedding::embed(query);
+        let entries = self.entries.borrow();
+        let mut scored: Vec<(f32, HistoryEntry)> = entries
+            .iter()
+            .map(|(entry, emb)| (embedding::cosine_distance(&query_embedding, emb), entry.clone()))
+            .filter(|(distance, _)| *distance < 0.9)
+            .collect();
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("distances are never NaN"));
+        scored.truncate(limit);
+        Ok(scored.into_iter().map(|(_, entry)| entry).collect())
     }
 }
 
@@ -402,6 +514,91 @@ mod tests {
         let results = store.search("example.com", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].url, "https://example.com/a");
+    }
+
+    mod memory_history_store {
+        use super::*;
+
+        #[test]
+        fn records_and_searches_by_url_and_title() {
+            let store = MemoryHistoryStore::new();
+            store.record_visit("https://example.com/rust", "Rust Programming Language").unwrap();
+
+            let by_url = store.search("example.com", 10).unwrap();
+            assert_eq!(by_url.len(), 1);
+            assert_eq!(by_url[0].url, "https://example.com/rust");
+            assert_eq!(by_url[0].domain, "example.com");
+
+            let by_title = store.search("rust programming", 10).unwrap();
+            assert_eq!(by_title.len(), 1, "search should be case-insensitive");
+        }
+
+        #[test]
+        fn revisiting_a_url_updates_it_instead_of_duplicating() {
+            let store = MemoryHistoryStore::new();
+            store.record_visit("https://example.com/a", "First Title").unwrap();
+            let first = store.search("example.com/a", 10).unwrap();
+            assert_eq!(first[0].visit_count, 1);
+
+            store.record_visit("https://example.com/a", "Updated Title").unwrap();
+            let second = store.search("example.com/a", 10).unwrap();
+            assert_eq!(second.len(), 1, "revisiting shouldn't create a second entry");
+            assert_eq!(second[0].title, "Updated Title");
+            assert_eq!(second[0].visit_count, 2);
+        }
+
+        #[test]
+        fn search_orders_most_recently_visited_first() {
+            let store = MemoryHistoryStore::new();
+            store.record_visit("https://a.example/one", "One").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            store.record_visit("https://a.example/two", "Two").unwrap();
+
+            let results = store.search("a.example", 10).unwrap();
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].url, "https://a.example/two");
+            assert_eq!(results[1].url, "https://a.example/one");
+        }
+
+        #[test]
+        fn empty_store_returns_no_results_without_erroring() {
+            let store = MemoryHistoryStore::new();
+            assert_eq!(store.search("anything", 10).unwrap(), vec![]);
+            assert_eq!(store.search_similar("anything", 10).unwrap(), vec![]);
+        }
+
+        #[test]
+        fn search_similar_finds_lexically_related_titles_not_matched_by_substring_search() {
+            let store = MemoryHistoryStore::new();
+            store.record_visit("https://rust-lang.org/tutorial", "Rust Programming Language Tutorial").unwrap();
+            store.record_visit("https://example.com/bread", "Baking Sourdough Bread At Home").unwrap();
+
+            assert_eq!(store.search("rust programming language guide", 10).unwrap(), vec![]);
+
+            let similar = store.search_similar("Rust Programming Language Guide", 10).unwrap();
+            assert_eq!(similar.len(), 1, "only the vocabulary-sharing entry should be similar enough to return");
+            assert_eq!(similar[0].url, "https://rust-lang.org/tutorial");
+        }
+
+        #[test]
+        fn search_similar_returns_nothing_for_an_unrelated_query() {
+            let store = MemoryHistoryStore::new();
+            store.record_visit("https://example.com/bread", "Baking Sourdough Bread At Home").unwrap();
+
+            let results = store.search_similar("Quantum Computing Research Papers", 10).unwrap();
+            assert_eq!(results, vec![], "a query sharing no vocabulary with anything should return nothing");
+        }
+
+        /// Confirms `MemoryHistoryStore` is usable through the shared
+        /// `HistoryBackend` trait, not just its own inherent methods — the
+        /// actual point of having the trait.
+        #[test]
+        fn is_usable_as_a_trait_object() {
+            let store: Box<dyn HistoryBackend> = Box::new(MemoryHistoryStore::new());
+            store.record_visit("https://example.com", "Example Domain").unwrap();
+            let results = store.search("example", 10).unwrap();
+            assert_eq!(results.len(), 1);
+        }
     }
 
     fn temp_profile(name: &str) -> Profile {

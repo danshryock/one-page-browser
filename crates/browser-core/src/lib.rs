@@ -18,7 +18,7 @@ mod keybindings;
 mod profile;
 mod settings;
 pub use bookmarks::{Bookmark, Bookmarks};
-pub use history::{HistoryEntry, HistoryStore};
+pub use history::{HistoryBackend, HistoryEntry, HistoryStore, MemoryHistoryStore};
 pub use keybindings::{Action, KeyChord, Keybindings};
 pub use profile::{
     launch_new_encrypted_profile_process, launch_new_ephemeral_process, launch_new_profile_process, list_profile_names,
