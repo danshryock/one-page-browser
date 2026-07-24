@@ -17,10 +17,17 @@ name: Windows
 # Wine-based build+run loop, so there's little this workflow would add for
 # them.
 
+# Manual runs (workflow_dispatch, the "Run workflow" button in the Actions
+# tab) or a pushed tag matching v*.* -- NOT every push to master. This
+# workflow was originally push-triggered, but during active debugging that
+# meant a full Windows Actions run (several minutes, real billed runner time)
+# on every single commit, dozens of times over. Push a tag (e.g.
+# `git tag v0.1.0-ci && git push origin v0.1.0-ci`) or trigger manually from
+# the Actions tab instead.
 on:
   push:
-    branches: [main, master]
-  pull_request:
+    tags:
+      - "v*.*"
   workflow_dispatch:
 
 jobs:
@@ -95,15 +102,32 @@ jobs:
       - name: Build (native MSVC — no cargo-xwin needed on a real Windows runner)
         run: cargo build -p browser-windows-winui --target x86_64-pc-windows-msvc --verbose
 
+      # Every compiled binary from this package (the real app plus every
+      # src/bin/*_smoke_test.rs) plus its .pdb, downloadable from the run's
+      # Actions summary page — for running directly on a real Windows
+      # machine (or a future local Windows test environment) without
+      # rebuilding from source, and to keep a copy of exactly what a given
+      # CI run actually tested.
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-windows-winui-binaries
+          path: |
+            target/x86_64-pc-windows-msvc/debug/*.exe
+            target/x86_64-pc-windows-msvc/debug/*.pdb
+          if-no-files-found: error
+
       # Bisection: does *any* WinUI 3 app crash at first paint on this
-      # runner (a genuine environment/WinUI 3 limitation), or is it specific
-      # to something in browser-windows-winui's own code? `minimal_smoke_test`
-      # (src/bin/) does the bare minimum: init, bootstrap, one Window,
-      # Activate() — no subclassing, no custom title bar, no controls, no
-      # WebView2. CONFIRMED (first real run): it survived past 8 seconds —
-      # every checkpoint through `run() returned Ok` logged, process still
-      # running, no crash — proving WinUI 3 itself works fine on this runner.
-      # The bug is specific to something in this crate's own code.
+      # runner, or is it specific to something in browser-windows-winui's
+      # own code (a real usage bug, a bug in the `winio-winui3` wrapper
+      # crate, or something in the build/cross-compile setup — see
+      # summaries/windows-github-actions-ci.md's correction on why "it's a
+      # Microsoft platform bug" was ruled out as too hasty a conclusion)?
+      # `minimal_smoke_test` (src/bin/) does the bare minimum: init,
+      # bootstrap, one Window, Activate() — no subclassing, no custom title
+      # bar, no controls, no WebView2. CONFIRMED (first real run): it
+      # survived past 8 seconds — every checkpoint through `run() returned
+      # Ok` logged, process still running, no crash.
       - name: Launch minimal WinUI 3 smoke test (no subclassing/controls)
         shell: pwsh
         run: |
@@ -127,6 +151,39 @@ jobs:
             Write-Host "minimal_smoke_test exited on its own within 8 seconds (exit code $($proc.ExitCode) / $hex)"
           } else {
             Write-Host "minimal_smoke_test is still running after 8 seconds — did NOT crash"
+            Stop-Process -Id $proc.Id -Force
+          }
+
+      # Every bisection binary tried so far ran at WinUI 3's default window
+      # size — none of them called `window.AppWindow()?.Resize(...)`, which
+      # the real `build_window_and_app` does as its very first action after
+      # `Window::new()`. A wrong/unusual call into a specific real API (ours,
+      # or the `winio-winui3` wrapper crate's implementation of it) is a far
+      # more plausible bug location than Microsoft's own well-tested WinRT/
+      # Composition internals — this tests that call in complete isolation.
+      - name: Launch AppWindow-resize WinUI 3 smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Get-ChildItem -Recurse -Filter "appwindow_resize_smoke_test.exe" -Path target |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) {
+            Write-Error "appwindow_resize_smoke_test.exe not found under target/ after build"
+            exit 1
+          }
+
+          $proc = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 8
+
+          Write-Host "--- appwindow-resize-smoke-trace.log ---"
+          Get-Content "$env:GITHUB_WORKSPACE\appwindow-resize-smoke-trace.log" -ErrorAction SilentlyContinue
+          Write-Host "-----------------------------------------"
+
+          if ($proc.HasExited) {
+            $hex = "0x{0:X8}" -f $proc.ExitCode
+            Write-Host "appwindow_resize_smoke_test exited on its own within 8 seconds (exit code $($proc.ExitCode) / $hex)"
+          } else {
+            Write-Host "appwindow_resize_smoke_test is still running after 8 seconds — did NOT crash"
             Stop-Process -Id $proc.Id -Force
           }
 
@@ -631,6 +688,7 @@ jobs:
             historystore-smoke-trace.log
             exact-order-smoke-trace.log
             memory-history-smoke-trace.log
+            appwindow-resize-smoke-trace.log
           if-no-files-found: ignore
 
       # Raw dumps, for offline analysis if `cdb` wasn't available on this

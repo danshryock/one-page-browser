@@ -259,7 +259,7 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    step for the *real* app finally produced something new: **a genuine crash dump.** (WER had silently failed
    to write one on every previous run for reasons never pinned down — this time it worked.)
 
-   ### The crash dump: the fault is inside Microsoft's own system DLLs, not our code
+   ### The crash dump (see this document's later correction: read this section's own limitations carefully)
 
    Downloaded the 232MB `.dmp` and analyzed it locally with `minidump-stackwalk` (`cargo install
    minidump-stackwalk`, the `rust-minidump` project's CLI — genuinely useful that this is possible entirely
@@ -284,18 +284,17 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
 
    Tried symbolicating against Microsoft's public symbol server (`--symbols-url
    https://msdl.microsoft.com/download/symbols`, confirmed reachable) — no additional resolution, these
-   specific internal offsets aren't covered by public PDBs. Even without exact function names, the module
-   list alone is conclusive: **the actual unhandled exception originates entirely inside Microsoft's own
-   WinRT/COM/Composition stack, not in anything this codebase wrote** — not the custom title bar, not
-   `WebView2`, not the HWND subclass, not `browser_core`/tokio, individually or in any combination tested.
-   Searched for precedent: `combase!RoOriginateLanguageException`-rooted stowed-exception crashes are a real,
-   recurring category of WinAppSDK/WinUI 3 issue in Microsoft's own GitHub trackers (e.g.
-   [WindowsAppSDK#4861](https://github.com/microsoft/WindowsAppSDK/issues/4861),
-   [WindowsAppSDK#999](https://github.com/microsoft/WindowsAppSDK/issues/999)), and GitHub Actions' Windows
-   runner images have their own documented rough edges around Windows App SDK/SDK version mismatches (e.g.
-   [WindowsAppSDK#5851](https://github.com/microsoft/WindowsAppSDK/issues/5851)) — consistent with this being
-   a real compatibility issue between WinUI 3's Composition internals and this specific CI environment
-   (Windows NT 10.0.26100, confirmed from the dump), not a bug introduced by this project's own code.
+   specific internal offsets aren't covered by public PDBs.
+   **Caveat, added on review rather than left unexamined:** every frame past frame 0 above is "found by stack
+   scanning," `minidump-stackwalk`'s own label for a heuristic (scanning stack memory for values that look
+   like return addresses) rather than a reliable CFI-based unwind — it can include stale/unrelated values left
+   over on the stack from earlier calls. "No frames from `browser-windows-winui.exe` in this stack" is real
+   data worth recording, but it is not strong enough on its own to conclude the fault originates inside
+   Microsoft's code rather than in, say, a `winio-winui3` wrapper function whose own frame just wasn't
+   recovered by the scan. (An earlier version of this section drew exactly that conclusion — corrected further
+   down, since WinRT/WinUI 3 are heavily used, well-tested libraries elsewhere and "Microsoft's platform code
+   has a bug" shouldn't be where this investigation lands without much stronger evidence than an unreliable
+   stack scan.)
 
    ### Follow-up: is tokio itself really clean, and does exact construction order matter?
 
@@ -330,8 +329,9 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    **Ran it — also survived**, trace going the same distance past the real crash point (through
    `WM_NCHITTEST`/`WM_NCMOUSEMOVE`/`WM_MOUSELEAVE`) as `full_combo_smoke_test` did. Eight for eight: every
    individual piece, every combination up to all of them, and now the exact real-app construction order too,
-   all survive cleanly. Combined with the crash dump showing the fault entirely inside Microsoft's own system
-   DLLs, this is as conclusive as it gets without Microsoft's private symbols or a live debugger.
+   all survive cleanly — but see this document's later correction: every one of these still used only
+   `Window`/`Grid`/`TextBlock`/`WebView2` at the default window size, none of the real app's `Button`/
+   `TextBox`/`ComboBox`/`CheckBox`/`AppWindow().Resize()` usage.
 
    ### Abstracting `HistoryStore` to isolate `libsql` itself
 
@@ -387,32 +387,38 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    trait and `MemoryHistoryStore` implementation stay in `browser_core` as genuine, tested, reusable additions
    (not reverted), just not wired into the real app's `AppState`.
 
-   ### Where this leaves things
+   ### Correction: "it's Microsoft's fault" was premature
 
-   Nine independent bisection binaries — a bare window, custom title bar, `WebView2`, HWND subclass, three
-   combinations up to all of them, `browser_core`'s `HistoryStore` (with real queries), the exact real-app
-   construction order/timing, and finally a `libsql`-free `MemoryHistoryStore` in that same exact order —
-   **all survived cleanly**, several going well past the exact point the real app crashes at. Every real,
-   plausible suspect this codebase's own code offers has been tested and ruled out, individually and
-   combined. **The real production binary itself**, temporarily rebuilt with `MemoryHistoryStore` in place of
-   the real `HistoryStore` (its full complexity otherwise intact — switcher grid, all four overlays, real
-   page/`WebView2` management), **crashed identically anyway** — the most direct confirmation available that
-   this isn't anything in this codebase's code, approximated or real. The crash dump closes the loop: the
-   fault lives entirely inside
-   Microsoft's own system DLLs, with zero frames from this codebase anywhere in any thread's stack. Tokio's
-   own footprint was independently confirmed minimal and has been removed entirely from `browser_core` as a
-   real simplification either way, and `HistoryStore` is now abstracted behind a `HistoryBackend` trait with
-   a genuine `libsql`-free alternative implementation available for future use (not just this investigation).
-   Further diagnosis beyond this would need either Microsoft's own private symbols (not publicly available)
-   or a live interactive debugger session on a matching machine — beyond what's practically achievable from
-   this environment. This is being left as a well-documented, real, open environment-compatibility issue (see
-   `ROADMAP.md`) rather than chased further blind.
+   An earlier version of this document concluded from the crash dump (frames in `combase.dll`/`ucrtbase.dll`/
+   `KERNELBASE.dll`, none from this codebase's own module) that the fault must be inside WinUI 3's/WinRT's own
+   Composition internals. That conclusion doesn't hold up: WinRT and WinUI 3 are heavily used, well-tested
+   libraries running far more complex production apps than this one, elsewhere, without this problem. The
+   crash-dump stack itself is also weaker evidence than it first looked — every frame past the innermost one
+   was "found by stack scanning" (a heuristic, not a reliable unwind), and no public symbols resolved even
+   with Microsoft's own symbol server reachable, so "no frames from our module" is suggestive, not proof of
+   where the fault actually originates. The far more likely explanations, in roughly descending probability,
+   are: (a) how this codebase calls a specific real API, (b) a bug in `winio-winui3` (the community-
+   maintained Rust binding subset this crate depends on — its own module doc comment already documents real
+   gaps, like several delegate types having no working `add` accessor at all, so it wrapping *some* API
+   incorrectly is entirely plausible), or (c) something about the cross-compile/build setup.
+
+   Revisiting what the ten bisection binaries actually covered, with that framing: every one of them used only
+   `Window`/`Grid`/`TextBlock`/`WebView2`, and only one event handler
+   (`WebView2::NavigationCompleted`) — at WinUI 3's *default* window size. None of them called
+   `window.AppWindow()?.Resize(...)` (the real app's very first action after `Window::new()` — see
+   `build_window_and_app` in `lib.rs`), and none exercised `Button.Click`, `TextBox` `GotFocus`/`LostFocus`/
+   `TextChanged`, `ComboBox`, or `CheckBox` — all real, specific API calls the real app makes constantly (every
+   toolbar button, the address bar, the search box, the whole settings overlay) via `winio-winui3`'s delegate
+   types (`RoutedEventHandler`, `TextChangedEventHandler`). That's substantial, previously-untested surface
+   area — a real usage or wrapper bug has plenty of room to hide in it. Added a tenth bisection binary,
+   `appwindow_resize_smoke_test.rs`, testing `AppWindow().Resize(...)` in isolation — the single most
+   specific, novel, previously-unexamined call available. Not yet run.
 
 This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the
 real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine. It
-also caught a real mistake of mine along the way: guessing at what an NTSTATUS code meant instead of checking
-it, which sent the first fix attempt in the wrong direction — corrected once actually verified. This
-particular crash took many rounds and, in the end, a genuine crash dump to reach a conclusive answer — a
-first-ever debugging session for code that had never run anywhere before this CI existed, and each round
-ruled something concrete out rather than just guessing blind, which is real progress even without a code fix
-at the end of it.
+also caught two real mistakes of mine along the way, both corrected once actually checked rather than left
+standing: guessing at what an NTSTATUS code meant instead of verifying it (sent an early fix attempt in the
+wrong direction), and — more significantly — concluding the crash dump pointed to a bug in Microsoft's own
+platform code, when the far more likely explanations were a usage bug, a wrapper-crate bug, or a build issue.
+This investigation is not resolved yet; each round has ruled something concrete out, which is real progress,
+but the actual cause remains open.

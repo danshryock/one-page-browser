@@ -112,8 +112,15 @@ compiles and runs on real macOS, not just `cargo check`-clean on Linux.
 
 **`.github/workflows/windows.yml`** — `test-core` (`cargo test -p browser-core` + `cargo check -p
 render-engine`) is fully green. `build-and-smoke-winui` (the `browser-windows-winui` build itself) also
-succeeds; only the interactive launch/screenshot smoke-test still fails, and it's now been diagnosed about as
-thoroughly as practically possible from this environment:
+succeeds; only the interactive launch/screenshot smoke-test still fails. This has been a long debugging
+session with a lot of real progress ruling things out — but **the actual cause is still unknown**, and an
+earlier version of this note wrongly concluded the fault must be inside Microsoft's own WinRT/Composition
+internals. That conclusion was premature: WinRT/WinUI 3 are heavily used, well-tested libraries running far
+more complex production apps than this one elsewhere without this problem. The far more likely explanations
+are (a) how this codebase calls the APIs, (b) a bug in `winio-winui3` (the community-maintained Rust binding
+subset this crate depends on — its own doc comments already note real gaps, like several delegate types
+having no working `add` accessor at all), or (c) something about the build/cross-compile setup. Corrected
+here rather than left standing.
 - Two genuine bugs found and fixed along the way: a Linux-only `clang-cl` path leaking into the native build
   via `.cargo/config.toml`, and the Windows App SDK runtime install step silently swallowing its own exit
   code.
@@ -122,43 +129,37 @@ thoroughly as practically possible from this environment:
   `crates/browser-windows-winui/src/lib.rs`'s `trace()`, kept permanently rather than removed).
 - Forcing WARP (software) rendering via `d3dconfig` (confirmed actually applied) made no difference, ruling
   out a simple GPU-driver theory.
-- **Nine bisection binaries** (`crates/browser-windows-winui/src/bin/*_smoke_test.rs`) — a bare window,
+- **Ten bisection binaries so far** (`crates/browser-windows-winui/src/bin/*_smoke_test.rs`) — a bare window,
   the custom title bar alone, `WebView2` alone, HWND subclassing alone, three combinations of those up to all
   of them together, `HistoryStore` with real queries run and displayed, the real app's *exact* construction
-  order/timing, and finally a `libsql`-free `MemoryHistoryStore` (see below) in that same exact order —
-  **all survived cleanly**, several going well past the exact point the real app crashes at. Every real,
-  plausible suspect this codebase's own code offers has been tested and ruled out.
-- **A genuine crash dump**, finally captured and analyzed locally (`minidump-stackwalk`, no Windows machine
-  needed): the crashing thread's entire stack lives inside Microsoft's own `combase.dll`/`ucrtbase.dll`/
-  `KERNELBASE.dll` — `browser-windows-winui.exe`'s own module is loaded but appears **nowhere** in any thread's
-  stack. The fault is inside WinUI 3's/WinRT's own Composition internals, not this codebase's code — a real,
-  documented category of issue in Microsoft's own trackers (stowed exceptions rooted in
-  `combase!RoOriginateLanguageException`), consistent with GitHub Actions' Windows runners having their own
-  known WinAppSDK compatibility rough edges.
+  order/timing, a `libsql`-free `MemoryHistoryStore` in that same exact order, and (temporarily) the real
+  production binary itself with `MemoryHistoryStore` swapped in — **all survived cleanly except the real
+  binary, which still crashes**. But every one of these tests used only `Window`/`Grid`/`TextBlock`/
+  `WebView2`, and only one event handler (`WebView2::NavigationCompleted`) — none of them exercised
+  `window.AppWindow()?.Resize(...)` (the real app's very first action after `Window::new()`), nor any of
+  `Button.Click`, `TextBox` `GotFocus`/`LostFocus`/`TextChanged`, `ComboBox`, or `CheckBox` — all real,
+  specific API calls the real app makes constantly (toolbar buttons, address bar, search box, settings
+  overlay) that a genuine usage or wrapper-crate bug could plausibly live in. That's real, substantial,
+  previously-untested surface area, not yet ruled out.
+- A real crash dump was captured and analyzed locally (`minidump-stackwalk`, no Windows machine needed): the
+  crashing thread's stack (via stack-scanning, not a reliable unwind — no matching public symbols were found
+  either) shows frames in `combase.dll`/`ucrtbase.dll`/`KERNELBASE.dll`, with `browser-windows-winui.exe`'s
+  own module loaded but not appearing in the (unreliable) scanned frames. That's real data, but on its own
+  it's not strong enough to conclude the fault is in Microsoft's code rather than in how a specific API is
+  being called from this codebase or `winio-winui3` — a real, specific, previously-untested call
+  (`AppWindow().Resize(...)`) is being checked in isolation next.
 - Along the way, replaced `browser_core::HistoryStore`'s `tokio` runtime with `futures_executor::block_on` —
   libsql's local backend is never actually async (confirmed by reading its source), so tokio's reactor/thread
   machinery (already about as minimal as tokio gets, but still unnecessary) was dead weight regardless of
-  whether it was implicated in the crash (it wasn't — the `HistoryStore` bisection binary ruled it out before
-  this change). A real simplification either way.
+  whether it was implicated in the crash. A real simplification either way.
 - Also abstracted `HistoryStore` behind a new `HistoryBackend` trait (`record_visit`/`search`/
   `search_similar`), additive to `HistoryStore`'s own unchanged inherent methods, and added
   `MemoryHistoryStore`: a genuine `libsql`-free implementation (a `Vec` behind a `RefCell`, no SQL) mirroring
-  `HistoryStore`'s exact behavior. Not implicated either (the ninth bisection binary above ruled it out), but
-  a real, tested (7 new tests) alternative now available for future use beyond this investigation. All 86
-  `browser-core` tests and all 20 `browser-linux-gtk3` GTK tests pass.
-- **Went further and tested the real production binary itself**: temporarily swapped `AppState`'s `history`
-  field in `browser-windows-winui/src/lib.rs` to `MemoryHistoryStore`, so the existing `Launch and screenshot`
-  CI step launched the *actual* `browser-windows-winui.exe` — full complexity intact (switcher grid, all four
-  overlays, real page/`WebView2` management), zero `libsql` calls in its real code path. **Crashed
-  identically anyway.** The most direct confirmation available, beyond any approximating smoke-test binary,
-  that this is not this codebase's code. Reverted immediately afterward — `MemoryHistoryStore` has no
-  persistence across restarts, a real regression for actual users; the trait/implementation stay in
-  `browser_core` as genuine reusable additions, just not wired into the real app.
+  `HistoryStore`'s exact behavior — a real, tested (7 new tests) alternative now available for future use
+  beyond this investigation. All 86 `browser-core` tests and all 20 `browser-linux-gtk3` GTK tests pass.
 
-This is being left as a well-documented, open environment-compatibility issue rather than chased further —
-doing so would need Microsoft's own private symbols or a live debugger on a matching machine, beyond what's
-practical here. See `summaries/windows-github-actions-ci.md` for the full blow-by-blow (every round, every
-ruled-out theory, the full crash dump analysis).
+Still an open investigation — see `summaries/windows-github-actions-ci.md` for the full blow-by-blow (every
+round, every ruled-out theory, the crash dump analysis, and what's still untested).
 
 ## Backlog (not yet started, roughly in the order raised)
 

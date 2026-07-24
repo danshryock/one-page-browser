@@ -9,10 +9,16 @@ name: macOS
 # real correctness check (see summaries/macos-appkit-scaffold.md). Expect
 # this to need real iteration on its first few runs.
 
+# Manual runs (workflow_dispatch) or a pushed tag matching v*.* -- NOT every
+# push to master. See windows.yml's matching comment for why: macOS Actions
+# runners are also real, billed runner time, and this workflow shouldn't run
+# on every commit during active iteration. Push a tag (e.g.
+# `git tag v0.1.0-ci && git push origin v0.1.0-ci`) or trigger manually from
+# the Actions tab instead.
 on:
   push:
-    branches: [main, master]
-  pull_request:
+    tags:
+      - "v*.*"
   workflow_dispatch:
 
 jobs:
@@ -42,6 +48,16 @@ jobs:
 
       - name: Build
         run: cargo build -p browser-macos-appkit --verbose
+
+      # The compiled binary itself, downloadable from the run's Actions
+      # summary page — for running locally (a real Mac, or a future macOS
+      # test environment) without needing to rebuild from source.
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-macos-appkit-binary
+          path: target/debug/browser-macos-appkit
+          if-no-files-found: error
 
       # macos-latest runners have a real interactive desktop session (like
       # windows-latest, unlike the headless Linux runners), so this can
