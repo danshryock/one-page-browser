@@ -165,9 +165,33 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    `d3dconfig --help`'s real output confirmed the exact syntax: `device force-warp[=(true|false)]` (not a
    `driver-type` subcommand as first guessed — the real categories are `apps`/`debug-layer`/`device`/`dred`/
    `message-break`/`message-mute`). `apps --add <exe>` also worked as expected, scoping settings to
-   `browser-windows-winui.exe` specifically rather than system-wide. The workflow now runs
-   `d3dconfig device "force-warp=true" <exe>` and exports the resulting config to confirm the setting actually
-   stuck before the launch attempt. Not yet run.
+   `browser-windows-winui.exe` specifically rather than system-wide. Ran it for real: `d3dconfig --export`
+   confirmed `ForceWARP=1` genuinely landed for this exe, in both the D3D10/11 and D3D12 `Application0`
+   sections — **and the crash was identical anyway**, same exit code, same exact message sequence in
+   `winui-trace.log`. Clean negative result: either the per-app AppCompat-style override doesn't reach
+   whatever device-creation path WinUI 3's Composition stack actually uses, or the root cause isn't
+   hardware/software device selection at all.
+
+   Reconsidered the trace log itself: the last messages before the crash are `0x031F`
+   (`WM_DWMNCRENDERINGCHANGED` — DWM's own non-client-area rendering notification) and `0x0020`
+   (`WM_SETCURSOR`, twice) — i.e., the crash sits right at DWM/non-client-area interaction, not necessarily
+   inside the app's own Direct3D device selection at all. That reframes what's worth checking next: is this a
+   fundamental "no GPU" limitation of the runner (would affect *any* WinUI 3 app), or something in
+   `browser-windows-winui`'s own code? Two real candidates for the latter, both genuinely unusual code sitting
+   directly in the window's setup/message path:
+   - `install_hwnd_subclass`/`subclass_proc` — the raw `WNDPROC` interception workaround for `winio-winui3`'s
+     missing `KeyDown`/`Window::Closed` delegates (see `lib.rs`'s module doc comment).
+   - `window.SetExtendsContentIntoTitleBar(true)` + `SetTitleBar(&toolbar)` (`lib.rs` around line 981) — a
+     custom title bar, which requires exactly the non-client-area/DWM interaction the trace's last messages
+     point at. This is at least as plausible a suspect as raw GPU absence, and wasn't considered until
+     rereading the trace with that framing.
+
+   Added `crates/browser-windows-winui/src/bin/minimal_smoke_test.rs`: the bare minimum WinUI 3 app (init,
+   bootstrap, one plain `Window`, `Activate()`) — no subclassing, no custom title bar, no controls, no
+   `WebView2`. The workflow now builds and launches it (with its own `trace()` log, `minimal-smoke-trace.log`)
+   right after building the full app, non-fatally (informational only, doesn't fail the job either way). If it
+   survives past `WM_SETCURSOR` where the full app dies, that implicates one of the two suspects above rather
+   than a fundamental environment limitation. Not yet run.
 
 This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the
 real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine. It
