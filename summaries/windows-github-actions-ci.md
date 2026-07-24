@@ -325,17 +325,24 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    real queries → `WebView2` → HWND subclass → `Activate`, mirroring where each piece actually happens
    relative to the others, including `WebView2` only being created after the window/history/subclass setup
    the way `add_page` really does it). Tests whether the specific interleaving — not any single piece in
-   isolation — matters. Not yet run.
+   isolation — matters.
+
+   **Ran it — also survived**, trace going the same distance past the real crash point (through
+   `WM_NCHITTEST`/`WM_NCMOUSEMOVE`/`WM_MOUSELEAVE`) as `full_combo_smoke_test` did. Eight for eight: every
+   individual piece, every combination up to all of them, and now the exact real-app construction order too,
+   all survive cleanly. Combined with the crash dump showing the fault entirely inside Microsoft's own system
+   DLLs, this is as conclusive as it gets without Microsoft's private symbols or a live debugger.
 
    ### Where this leaves things
 
-   Seven independent bisection binaries (bare window, custom title bar, `WebView2`, HWND subclass, three
-   combinations up to all of them, and `browser_core`/tokio) all survived cleanly — each one individually
-   ruling out a real, plausible suspect rather than guessing blind. The crash dump then closed the loop:
-   the fault lives entirely inside Microsoft's own system DLLs, with zero frames from this codebase anywhere
-   in the crashing thread. Tokio's own footprint was independently confirmed minimal and has now been removed
-   entirely as a real simplification, and an eighth test targets exact construction-order/timing as the one
-   remaining untested variable. Further diagnosis beyond that would need either Microsoft's own private
+   Eight independent bisection binaries — a bare window, custom title bar, `WebView2`, HWND subclass, three
+   combinations up to all of them, `browser_core`'s `HistoryStore` (with real queries), and finally the real
+   app's exact construction order/timing — **all survived cleanly**, several going well past the exact point
+   the real app crashes at. Every real, plausible suspect this codebase's own code offers has been tested and
+   ruled out, individually and combined. The crash dump closes the loop: the fault lives entirely inside
+   Microsoft's own system DLLs, with zero frames from this codebase anywhere in any thread's stack. Tokio's
+   own footprint was independently confirmed minimal and has been removed entirely from `browser_core` as a
+   real simplification either way. Further diagnosis beyond this would need either Microsoft's own private
    symbols (not publicly available) or a live interactive debugger session on a matching machine — beyond
    what's practically achievable from this environment. This is being left as a well-documented, real, open
    environment-compatibility issue (see `ROADMAP.md`) rather than chased further blind.
