@@ -61,6 +61,22 @@ const TILE_WIDTH: i32 = 150;
 const TILE_HEIGHT: i32 = 110;
 const TILE_COLUMNS: i32 = 5;
 
+/// Checkpoint tracing for diagnosing this crate's first-ever real launch on
+/// Windows (see `summaries/windows-github-actions-ci.md`) — writes straight
+/// to a file with an explicit `sync_all()` after every line, since a
+/// GitHub Actions run redirecting the process's own stdout/stderr came back
+/// completely empty even on a crash, consistent with a termination abrupt
+/// enough to skip normal stream flushing. Kept permanently (not stripped out
+/// once the current bug is found) per explicit direction — cheap, and
+/// useful again if `browser-windows-winui` ever regresses on real Windows.
+pub fn trace(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("winui-trace.log") {
+        let _ = writeln!(f, "{msg}");
+        let _ = f.sync_all();
+    }
+}
+
 pub struct AppState {
     window: Window,
     address_bar: TextBox,
@@ -1231,6 +1247,16 @@ unsafe extern "system" fn subclass_proc(
     _subclass_id: usize,
     ref_data: usize,
 ) -> LRESULT {
+    // TEMPORARY, same diagnostic purpose as main.rs's trace() — see that
+    // file's comment. Logs every single window message this subclass
+    // receives, to tell whether the app's first-ever real-Windows crash
+    // (which the trace in main.rs proved happens *after* a fully successful
+    // startup — window built, page added, activated) happens before this
+    // subclass receives any message at all (pointing at WinUI 3's own
+    // Composition/rendering pipeline, independent of our message handling)
+    // or during a specific one (pointing at our own handling of it).
+    crate::trace(&format!("subclass_proc: msg=0x{msg:04X} wparam={} lparam={}", wparam.0, lparam.0));
+
     let app = unsafe { &*(ref_data as *const Rc<AppState>) };
 
     match msg {

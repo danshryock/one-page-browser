@@ -120,11 +120,22 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    style termination, which explicitly skips the usual CRT/unwind cleanup). Registered a Windows Error
    Reporting local dump for the exe next — also came back empty (`WerSvc` confirmed running, WER not
    disabled, but still no `.dmp` written for this specific crash), and this runner has no `cdb`/`windbg` on
-   `PATH` to attach a debugger directly either. Switched strategy again: added temporary checkpoint tracing
-   directly in `browser-windows-winui/src/main.rs` (`trace(...)`, writing straight to a file with an explicit
-   `sync_all()` after every line — survives an abrupt fast-fail in a way buffered stdio doesn't) at each step
-   of `main()`/`run()`, so the resulting `winui-trace.log` will show exactly how far startup got before the
-   crash, regardless of whether the crash itself gives any information at all. Not yet run.
+   `PATH` to attach a debugger directly either. Switched strategy again: added checkpoint tracing (`trace(...)`,
+   in `browser-windows-winui/src/lib.rs` — writes straight to a file with an explicit `sync_all()` after every
+   line, since it survives an abrupt fast-fail in a way buffered stdio doesn't) at each step of `main()`/
+   `run()`. **Kept permanently rather than stripped out once the bug is found**, per explicit direction — it's
+   cheap, and useful again if this crate ever regresses on real Windows.
+
+   The resulting `winui-trace.log` was a real breakthrough: **every** checkpoint through `run()` succeeded —
+   `Application::new`, `build_window_and_app`, `add_page`, `activate`, and the callback returning `Ok` — meaning
+   the window is genuinely built, the page loads, and the window activates cleanly. The crash happens *after*
+   all of that, somewhere inside WinUI 3's own message pump (`Application::Start`'s internals, which we don't
+   control directly). Added the same tracing to the very top of `subclass_proc` (the `SetWindowSubclass`-based
+   `WNDPROC` handling `WM_KEYDOWN`/`WM_DESTROY`/`WM_NCDESTROY` — see this file's module doc comment on why that
+   exists) to log every window message it receives, which will show whether the crash happens before the
+   subclass sees any message at all (pointing at WinUI 3's own Composition/rendering pipeline — GitHub Actions'
+   basic virtual display adapter is a real, previously-documented source of WinUI3/Composition crashes on CI,
+   worth checking next if this comes back empty too) or during handling of a specific one. Not yet run.
 
 This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the
 real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine. It
