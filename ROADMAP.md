@@ -113,10 +113,22 @@ toolbar (back/forward/reload), an address bar with working state and Enter-to-na
 missing `KeyDown`/`Window::Closed` that forced a raw `HWND` subclass workaround), and a single `WebView2`
 page, reusing `browser_core::resolve_address_input`. Ran through ~40 real render cycles (one per keystroke)
 with no crash. The `WebView2` content area itself stayed blank — the same pre-existing issue seen in the
-comparison test, believed to be this eval VM image's WebView2 Runtime, not an app bug. Still to build, roughly
-in order: multi-page support (`PageManager`/`RenderEngine` integration — the biggest open design question,
-since `windows-reactor`'s hooks need a pattern for a *dynamic* list of independently-stateful pages, not yet
-researched), the switcher overlay, settings/profile/keybindings overlays, and the custom title bar.
+comparison test, believed to be this eval VM image's WebView2 Runtime, not an app bug.
+
+**Multi-page hosting** is done next and also verified running in the VM: an arbitrary number of pages, each
+with its own independently-alive `WebView` (added/switched via a minimal page-button row — the real switcher
+grid is still to come). The design question was real: `windows-reactor` has no `Visibility`-style
+show/hide modifier at all (checked by reading its source), so `winio-winui3`'s per-page-`Grid`-with-
+`Visibility::Collapsed` approach doesn't translate. Solved by keeping every loaded page's `webview(..)`
+element permanently mounted (each `.with_key(page_id)`, the same identity mechanism
+`crates/samples/reactor/samples/examples/tab_view_add_button.rs` uses for a dynamic tab list, so the
+reconciler never tears down a page's `WebView2` control just because it's not currently shown) and stacking
+them all in one `Grid` cell, active page last so it paints on top — real WinUI 3 `Grid` behavior, not a hack.
+Added a second page, switched back and forth, no crash either direction.
+
+Still to build, roughly in order: the real switcher overlay (search + tiles, wiring `browser_core::PageManager`
+in for real — the minimal page-button row so far doesn't use it), settings/profile/keybindings overlays, and
+the custom title bar.
 
 Repo is pushed to `danshryock/one-page-browser` (`git@github.com:danshryock/one-page-browser.git`), with `gh`
 installed and authenticated on this dev machine — real job logs are pulled via `gh run view --log-failed`/the
