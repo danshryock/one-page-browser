@@ -32,5 +32,14 @@ anyhow = "1"
 windows-reactor = { git = "https://github.com/microsoft/windows-rs" }
 windows-webview = { git = "https://github.com/microsoft/windows-rs", features = ["reactor"] }
 
-[target.'cfg(all(target_os = "windows", target_env = "msvc"))'.build-dependencies]
+# Deliberately NOT target-gated like the two deps above, despite being
+# windows-only at runtime — see build.rs's doc comment for why: a
+# `#[cfg(target_os = "windows")]` written inside build.rs's own source
+# reflects the HOST build.rs compiles for, not the crate's actual
+# `--target`, so gating this dependency's *use* that way silently no-ops
+# during cross-compilation (cargo-xwin's host is still Linux) even though
+# Cargo correctly includes the dependency itself for a windows-msvc target.
+# Real bug hit once already: the cross-compiled .exe was missing
+# `Microsoft.WindowsAppRuntime.Bootstrap.dll` because of exactly this.
+[build-dependencies]
 windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs" }
