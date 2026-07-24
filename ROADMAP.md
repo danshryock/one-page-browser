@@ -122,11 +122,12 @@ thoroughly as practically possible from this environment:
   `crates/browser-windows-winui/src/lib.rs`'s `trace()`, kept permanently rather than removed).
 - Forcing WARP (software) rendering via `d3dconfig` (confirmed actually applied) made no difference, ruling
   out a simple GPU-driver theory.
-- **Eight bisection binaries** (`crates/browser-windows-winui/src/bin/*_smoke_test.rs`) — a bare window,
+- **Nine bisection binaries** (`crates/browser-windows-winui/src/bin/*_smoke_test.rs`) — a bare window,
   the custom title bar alone, `WebView2` alone, HWND subclassing alone, three combinations of those up to all
-  of them together, `HistoryStore` with real queries run and displayed, and finally the real app's *exact*
-  construction order/timing — **all survived cleanly**, several going well past the exact point the real app
-  crashes at. Every real, plausible suspect this codebase's own code offers has been tested and ruled out.
+  of them together, `HistoryStore` with real queries run and displayed, the real app's *exact* construction
+  order/timing, and finally a `libsql`-free `MemoryHistoryStore` (see below) in that same exact order —
+  **all survived cleanly**, several going well past the exact point the real app crashes at. Every real,
+  plausible suspect this codebase's own code offers has been tested and ruled out.
 - **A genuine crash dump**, finally captured and analyzed locally (`minidump-stackwalk`, no Windows machine
   needed): the crashing thread's entire stack lives inside Microsoft's own `combase.dll`/`ucrtbase.dll`/
   `KERNELBASE.dll` — `browser-windows-winui.exe`'s own module is loaded but appears **nowhere** in any thread's
@@ -138,8 +139,13 @@ thoroughly as practically possible from this environment:
   libsql's local backend is never actually async (confirmed by reading its source), so tokio's reactor/thread
   machinery (already about as minimal as tokio gets, but still unnecessary) was dead weight regardless of
   whether it was implicated in the crash (it wasn't — the `HistoryStore` bisection binary ruled it out before
-  this change). A real simplification either way; all 79 `browser-core` tests and all 20 `browser-linux-gtk3`
-  GTK tests still pass.
+  this change). A real simplification either way.
+- Also abstracted `HistoryStore` behind a new `HistoryBackend` trait (`record_visit`/`search`/
+  `search_similar`), additive to `HistoryStore`'s own unchanged inherent methods, and added
+  `MemoryHistoryStore`: a genuine `libsql`-free implementation (a `Vec` behind a `RefCell`, no SQL) mirroring
+  `HistoryStore`'s exact behavior. Not implicated either (the ninth bisection binary above ruled it out), but
+  a real, tested (7 new tests) alternative now available for future use beyond this investigation. All 86
+  `browser-core` tests and all 20 `browser-linux-gtk3` GTK tests pass.
 
 This is being left as a well-documented, open environment-compatibility issue rather than chased further —
 doing so would need Microsoft's own private symbols or a live debugger on a matching machine, beyond what's

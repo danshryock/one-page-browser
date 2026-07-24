@@ -402,7 +402,8 @@ jobs:
       # `minimal_smoke_test`, which never touches browser_core's history
       # code at all, links the same libsql-ffi and survived) — it tests
       # whether *calling* MemoryHistoryStore's code path specifically,
-      # rather than libsql's, changes anything.
+      # rather than libsql's, changes anything. CONFIRMED (first real run):
+      # also survived, real queries and all. Nine for nine.
       - name: Launch MemoryHistoryStore WinUI 3 smoke test
         shell: pwsh
         run: |

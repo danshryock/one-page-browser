@@ -357,15 +357,20 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    `browser_core` history code at all and still survived cleanly. That already answers "does `libsql-ffi`
    merely being present in the binary matter" (no). What this ninth binary actually isolates is narrower but
    still real: whether *calling* `MemoryHistoryStore`'s code path specifically, instead of libsql's, changes
-   anything. Not yet run.
+   anything.
+
+   **Ran it — also survived**, real queries and all ("found 2 entries" via `MemoryHistoryStore`'s own manual
+   substring search). Nine for nine now: every individual piece, every combination, the exact real-app
+   construction order, and now a `libsql`-free history backend too, all survive cleanly.
 
    ### Where this leaves things
 
-   Eight independent bisection binaries — a bare window, custom title bar, `WebView2`, HWND subclass, three
-   combinations up to all of them, `browser_core`'s `HistoryStore` (with real queries), and finally the real
-   app's exact construction order/timing — **all survived cleanly**, several going well past the exact point
-   the real app crashes at. Every real, plausible suspect this codebase's own code offers has been tested and
-   ruled out, individually and combined. The crash dump closes the loop: the fault lives entirely inside
+   Nine independent bisection binaries — a bare window, custom title bar, `WebView2`, HWND subclass, three
+   combinations up to all of them, `browser_core`'s `HistoryStore` (with real queries), the exact real-app
+   construction order/timing, and finally a `libsql`-free `MemoryHistoryStore` in that same exact order —
+   **all survived cleanly**, several going well past the exact point the real app crashes at. Every real,
+   plausible suspect this codebase's own code offers has been tested and ruled out, individually and
+   combined. The crash dump closes the loop: the fault lives entirely inside
    Microsoft's own system DLLs, with zero frames from this codebase anywhere in any thread's stack. Tokio's
    own footprint was independently confirmed minimal and has been removed entirely from `browser_core` as a
    real simplification either way, and `HistoryStore` is now abstracted behind a `HistoryBackend` trait with
