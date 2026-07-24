@@ -246,7 +246,8 @@ jobs:
       # surface rendering underneath/near a custom-drawn, DWM-extended title
       # bar region is a real, previously documented tricky pairing for WinUI
       # 3 apps in general, independent of this CI environment. Still no HWND
-      # subclassing.
+      # subclassing. CONFIRMED (first real run): also survived cleanly —
+      # every checkpoint logged, no crash.
       - name: Launch titlebar+WebView2 combination smoke test
         shell: pwsh
         run: |
@@ -270,6 +271,38 @@ jobs:
             Write-Host "titlebar_webview2_smoke_test exited on its own within 8 seconds (exit code $($proc.ExitCode) / $hex)"
           } else {
             Write-Host "titlebar_webview2_smoke_test is still running after 8 seconds — did NOT crash"
+            Stop-Process -Id $proc.Id -Force
+          }
+
+      # Sixth and final combination round: title bar + WebView2 + HWND
+      # subclassing, all three together — the last remaining
+      # pairwise/triple combination of the real window's genuinely unusual
+      # pieces of code before concluding the crash needs the real app's full
+      # complexity (many controls/overlays at once, multiple pages/
+      # WebView2s) rather than any subset tested so far.
+      - name: Launch full-combination (titlebar+WebView2+subclass) smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Get-ChildItem -Recurse -Filter "full_combo_smoke_test.exe" -Path target |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) {
+            Write-Error "full_combo_smoke_test.exe not found under target/ after build"
+            exit 1
+          }
+
+          $proc = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 8
+
+          Write-Host "--- full-combo-smoke-trace.log ---"
+          Get-Content "$env:GITHUB_WORKSPACE\full-combo-smoke-trace.log" -ErrorAction SilentlyContinue
+          Write-Host "-----------------------------------"
+
+          if ($proc.HasExited) {
+            $hex = "0x{0:X8}" -f $proc.ExitCode
+            Write-Host "full_combo_smoke_test exited on its own within 8 seconds (exit code $($proc.ExitCode) / $hex)"
+          } else {
+            Write-Host "full_combo_smoke_test is still running after 8 seconds — did NOT crash"
             Stop-Process -Id $proc.Id -Force
           }
 
@@ -452,6 +485,7 @@ jobs:
             webview2-smoke-trace.log
             subclass-smoke-trace.log
             titlebar-webview2-smoke-trace.log
+            full-combo-smoke-trace.log
           if-no-files-found: ignore
 
       # Raw dumps, for offline analysis if `cdb` wasn't available on this

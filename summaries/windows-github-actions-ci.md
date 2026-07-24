@@ -229,7 +229,14 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    most likely to interact badly: `SetExtendsContentIntoTitleBar`/`SetTitleBar` *and* an embedded `WebView2`
    together (a `WebView2` surface rendering underneath/near a custom-drawn, DWM-extended title bar region is a
    real, previously documented tricky pairing for WinUI 3 apps in general, independent of this CI
-   environment) — still no HWND subclassing. Not yet run.
+   environment) — still no HWND subclassing.
+
+   **Ran it — also survived cleanly**, every checkpoint through `Activate`/`run() returned Ok`, no crash. The
+   pairwise combination isn't it either. Added a sixth binary, `full_combo_smoke_test.rs`: title bar +
+   `WebView2` + `SetWindowSubclass` `WNDPROC` interception, all three together — the last remaining
+   combination of the real window's genuinely unusual pieces of code before concluding the crash needs the
+   real app's full complexity (many controls/overlays at once, multiple pages/`WebView2`s) rather than any
+   subset tested so far. Not yet run.
 
 This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the
 real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine. It
