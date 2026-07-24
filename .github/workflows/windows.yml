@@ -61,24 +61,33 @@ jobs:
       # via PackageDependency::initialize_version(WindowsAppSDKVersion::V2)
       # (see browser-windows-winui/src/main.rs's comment on that call) —
       # skipping this produces a "Class not registered" error at runtime.
-      # UNVERIFIED: this exact install step hasn't been run for real yet (no
-      # GitHub remote was configured for this repo when it was written — see
-      # summaries/windows-ci-and-macos-scaffold.md). GitHub's windows-latest
-      # image may already bundle a compatible Windows App SDK via its Visual
-      # Studio workloads, in which case this becomes a no-op; if the aka.ms
-      # redirect below is stale by the time this actually runs, that's the
-      # first thing to fix. `continue-on-error` so a failure here doesn't
-      # block the build step from at least being attempted — the smoke-test
-      # step further down will fail clearly (and visibly) if the runtime
-      # genuinely isn't present.
+      #
+      # First real run (see summaries/windows-github-actions-ci.md's "Update"
+      # section) showed this step reporting "success" while the app still
+      # crashed at launch with
+      # STATUS_DLL_NOT_FOUND (0xC000027B) — a loader-level failure before any
+      # of our own code runs, consistent with the installer silently failing:
+      # `Start-Process -Wait` alone doesn't surface the child process's own
+      # exit code, so a failed install looked identical to a successful one
+      # in the log. This version captures and prints that exit code, and logs
+      # whether the AppX package actually landed, so the next failure (if
+      # any) is diagnosable from this step's own output instead of inferred
+      # from a cryptic crash three steps later.
       - name: Install Windows App SDK runtime (v2.x)
-        continue-on-error: true
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $installer = "$env:RUNNER_TEMP\windowsappruntimeinstall-x64.exe"
           Invoke-WebRequest -Uri "https://aka.ms/windowsappsdk/2.0/latest/windowsappruntimeinstall-x64.exe" -OutFile $installer
-          Start-Process -FilePath $installer -ArgumentList "--quiet" -Wait
+          $proc = Start-Process -FilePath $installer -ArgumentList "--quiet" -Wait -PassThru
+          Write-Host "installer exit code: $($proc.ExitCode)"
+
+          $pkg = Get-AppxPackage -Name "*WindowsAppRuntime*"
+          if ($pkg) {
+            $pkg | Format-List Name, Version, InstallLocation
+          } else {
+            Write-Warning "no WindowsAppRuntime AppX package found after running the installer"
+          }
 
       - name: Build (native MSVC — no cargo-xwin needed on a real Windows runner)
         run: cargo build -p browser-windows-winui --target x86_64-pc-windows-msvc --verbose

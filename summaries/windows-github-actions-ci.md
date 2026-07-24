@@ -82,12 +82,33 @@ instead of just skipping it silently.
 
 ## Honest limitations / what's unverified
 
-- **Nothing in `.github/workflows/windows.yml` has actually run yet.** No GitHub remote is connected to this
-  repo yet (the user will create and configure one later) — everything here is written defensively from
-  documentation and first-hand reading of this repo's own runtime requirements (see
-  `crates/browser-windows-winui/src/main.rs`'s `PackageDependency::initialize_version` comment and
-  `winio-winui3`'s vendored bootstrap source for the Windows App SDK v2.x requirement), not from an actual
-  observed CI run. The Windows App SDK install step in particular is the most likely thing to need real
-  iteration once it actually runs against a live runner image.
 - No macOS workflow yet — planned as a separate, later piece once a `browser-macos-appkit` crate exists to
-  build/smoke-test.
+  build/smoke-test. (Update: this shipped — see `summaries/macos-appkit-scaffold.md` and
+  `.github/workflows/macos.yml`, which passed completely on its first real run.)
+
+## Update: first real runs, once the repo was pushed
+
+The repo was pushed to `danshryock/one-page-browser` and this workflow ran for real. Two real bugs surfaced
+and were fixed, neither related to anything speculative above — both were genuine mistakes, found via actual
+job logs (`gh run view --log-failed` / the Actions API), not guessed at:
+
+1. **`test-core` and the winui build both failed with the same root cause**: `.cargo/config.toml`'s `[env]`
+   table set `CC_x86_64_pc_windows_msvc`/`AR_x86_64_pc_windows_msvc` to this dev machine's local clang-cl/
+   llvm-lib paths (`/usr/lib/llvm-21/bin/...`, needed for `cargo-xwin`'s cross-compile here). `[env]` entries
+   apply unconditionally regardless of host OS — so the native `windows-latest` runner inherited that
+   Linux-only path too, and every build touching `libsql-ffi` (i.e. anything depending on `browser-core`)
+   failed with `failed to find tool "/usr/lib/llvm-21/bin/clang-cl"`. Fixed by moving those two lines out of
+   the repo-tracked `.cargo/config.toml` into `~/.cargo/config.toml` (this machine's global Cargo config,
+   never checked into the repo) — the correct place for "where a tool happens to live on this specific box."
+   After this fix, `test-core` passed fully and the winui build step itself succeeded.
+2. **`build-and-smoke-winui`'s launch step then failed differently**: the app crashed immediately with exit
+   code `-1073741189` (`0xC000027B`, `STATUS_DLL_NOT_FOUND` — a Windows loader failure before any of our own
+   code runs). The likely cause: the "Install Windows App SDK runtime" step's `Start-Process ... -Wait`
+   never checked the installer's own exit code, so a silently-failed install looked identical to a
+   successful one in the log — this diagnosis is the strongest lead so far but not yet confirmed, since the
+   install step's own log showed no output either way. The workflow now captures and prints the installer's
+   exit code plus whether a `WindowsAppRuntime` AppX package actually landed (`Get-AppxPackage`), so the next
+   run's log will directly confirm or rule this out rather than requiring another inference chain.
+
+This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the
+real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine.
