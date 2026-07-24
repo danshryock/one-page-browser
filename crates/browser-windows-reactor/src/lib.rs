@@ -57,11 +57,15 @@
 #![cfg(all(target_os = "windows", target_env = "msvc"))]
 
 mod engine;
+mod shortcuts;
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use browser_core::{domain_of, resolve_address_input, HistoryEntry, HistoryStore, PageManager, Profile, Settings, HOME_URL};
+use browser_core::{
+    domain_of, launch_new_profile_process, list_profile_names, resolve_address_input, Action, HistoryEntry, HistoryStore,
+    KeyChord, Keybindings, PageManager, Profile, Settings, HOME_URL,
+};
 use engine::ReactorWebViewEngine;
 use windows_reactor::*;
 use windows_webview::{webview, WebView};
@@ -83,10 +87,6 @@ pub fn trace(msg: &str) {
 struct Shared {
     history: HistoryStore,
     settings: RefCell<Settings>,
-    // Not read yet — needed once the settings/profile-picker overlays land
-    // (see ROADMAP.md's task list): Settings::save and
-    // launch_new_profile_process both take a &Profile.
-    #[allow(dead_code)]
     profile: Profile,
 }
 
@@ -101,6 +101,18 @@ enum Tile {
     History { url: String, title: String, domain: String },
 }
 
+/// Mutually exclusive, mirroring `browser-windows-winui`'s
+/// close_switcher/close_settings/close_profile_picker/close_keybindings —
+/// opening any one of these closes whichever else was open.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Overlay {
+    None,
+    Switcher,
+    Settings,
+    Profile,
+    Keybindings,
+}
+
 fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     trace("app: render start");
     let core = cx.use_ref(PageManager::<ReactorWebViewEngine>::new(shared.settings.borrow().max_loaded_pages));
@@ -109,8 +121,19 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     let active_id_ref = cx.use_ref(active_id.clone());
     *active_id_ref.borrow_mut() = active_id.clone();
     let (address, set_address) = cx.use_state(String::from(HOME_URL));
-    let (switcher_open, set_switcher_open) = cx.use_state(false);
+    let (overlay, set_overlay) = cx.use_state(Overlay::None);
     let (search_query, set_search_query) = cx.use_state(String::new());
+
+    let (start_page_draft, set_start_page_draft) = cx.use_state(String::new());
+    let (engine_index_draft, set_engine_index_draft) = cx.use_state(-1i32);
+    let (unlimited_draft, set_unlimited_draft) = cx.use_state(true);
+    let (limit_draft, set_limit_draft) = cx.use_state(String::new());
+
+    let (new_profile_draft, set_new_profile_draft) = cx.use_state(String::new());
+
+    let keybindings = cx.use_ref(Keybindings::load(&shared.profile));
+    let (listening_for, set_listening_for) = cx.use_state(Option::<Action>::None);
+    let (new_binding_text, set_new_binding_text) = cx.use_state(String::new());
 
     // Bootstrap: open the start page on the very first render (core starts
     // empty — there's no separate "startup" hook, so this just runs
@@ -135,7 +158,7 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         let set_active_id = set_active_id.clone();
         let active_id_ref = active_id_ref.clone();
         let set_address = set_address.clone();
-        let set_switcher_open = set_switcher_open.clone();
+        let set_overlay = set_overlay.clone();
         let bump = bump.clone();
         move |id: String| {
             ensure_engine_loaded(&core, &id);
@@ -144,7 +167,7 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
             set_active_id.call(id.clone());
             let url = core.borrow().page(&id).map(|p| p.current_url()).unwrap_or_default();
             set_address.call(if url.is_empty() { HOME_URL.to_string() } else { url });
-            set_switcher_open.call(false);
+            set_overlay.call(Overlay::None);
             bump.invoke(());
         }
     });
@@ -154,11 +177,11 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         let set_active_id = set_active_id.clone();
         let active_id_ref = active_id_ref.clone();
         let set_address = set_address.clone();
-        let set_switcher_open = set_switcher_open.clone();
+        let set_overlay = set_overlay.clone();
         let bump = bump.clone();
         move |url: String| {
             do_add_page(&core, &url, &set_active_id, &active_id_ref, &set_address);
-            set_switcher_open.call(false);
+            set_overlay.call(Overlay::None);
             bump.invoke(());
         }
     });
@@ -211,14 +234,161 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         }
     };
 
-    let toggle_switcher = {
-        let set_switcher_open = set_switcher_open.clone();
+    let open_switcher: Callback<()> = Callback::new({
+        let set_overlay = set_overlay.clone();
         let set_search_query = set_search_query.clone();
-        move || {
+        move |()| {
             set_search_query.call(String::new());
-            set_switcher_open.call(!switcher_open);
+            set_overlay.call(Overlay::Switcher);
+        }
+    });
+    let toggle_switcher = {
+        let set_overlay = set_overlay.clone();
+        let open_switcher = open_switcher.clone();
+        move || {
+            if overlay == Overlay::Switcher {
+                set_overlay.call(Overlay::None);
+            } else {
+                open_switcher.invoke(());
+            }
         }
     };
+
+    let close_any_overlay: Callback<()> = Callback::new({
+        let set_overlay = set_overlay.clone();
+        move |()| set_overlay.call(Overlay::None)
+    });
+
+    let open_settings: Callback<()> = Callback::new({
+        let shared = Rc::clone(shared);
+        let set_overlay = set_overlay.clone();
+        let set_start_page_draft = set_start_page_draft.clone();
+        let set_engine_index_draft = set_engine_index_draft.clone();
+        let set_unlimited_draft = set_unlimited_draft.clone();
+        let set_limit_draft = set_limit_draft.clone();
+        move |()| {
+            let settings = shared.settings.borrow();
+            set_start_page_draft.call(settings.start_page.clone());
+            let idx = settings
+                .search_engines
+                .iter()
+                .position(|e| e.name == settings.default_search_engine)
+                .map(|i| i as i32)
+                .unwrap_or(-1);
+            set_engine_index_draft.call(idx);
+            match settings.max_loaded_pages {
+                Some(n) => {
+                    set_unlimited_draft.call(false);
+                    set_limit_draft.call(n.to_string());
+                }
+                None => {
+                    set_unlimited_draft.call(true);
+                    set_limit_draft.call(String::new());
+                }
+            }
+            drop(settings);
+            set_overlay.call(Overlay::Settings);
+        }
+    });
+
+    let save_settings: Callback<()> = Callback::new({
+        let shared = Rc::clone(shared);
+        let core = core.clone();
+        let set_overlay = set_overlay.clone();
+        let bump = bump.clone();
+        let start_page_draft = start_page_draft.clone();
+        let limit_draft = limit_draft.clone();
+        move |()| {
+            let new_limit = if unlimited_draft { None } else { limit_draft.parse::<usize>().ok().map(|n| n.max(1)) };
+            {
+                let mut settings = shared.settings.borrow_mut();
+                settings.start_page = start_page_draft.clone();
+                if let Some(engine) = settings.search_engines.get(engine_index_draft.max(0) as usize) {
+                    settings.default_search_engine = engine.name.clone();
+                }
+                settings.max_loaded_pages = new_limit;
+            }
+            let evicted = core.borrow_mut().set_max_loaded_pages(new_limit);
+            for id in evicted {
+                core.borrow_mut().take_engine(&id);
+            }
+            if let Err(err) = shared.settings.borrow().save(&shared.profile) {
+                eprintln!("failed to save settings: {err}");
+            }
+            set_overlay.call(Overlay::None);
+            bump.invoke(());
+        }
+    });
+
+    let open_profile: Callback<()> = Callback::new({
+        let set_overlay = set_overlay.clone();
+        let set_new_profile_draft = set_new_profile_draft.clone();
+        move |()| {
+            set_new_profile_draft.call(String::new());
+            set_overlay.call(Overlay::Profile);
+        }
+    });
+
+    let create_and_open_profile: Callback<()> = Callback::new({
+        let set_overlay = set_overlay.clone();
+        let new_profile_draft = new_profile_draft.clone();
+        move |()| {
+            let name = new_profile_draft.trim();
+            if !name.is_empty() {
+                if let Err(err) = launch_new_profile_process(name) {
+                    eprintln!("failed to launch a new process for profile {name:?}: {err}");
+                }
+            }
+            set_overlay.call(Overlay::None);
+        }
+    });
+
+    let open_keybindings: Callback<()> = Callback::new({
+        let set_overlay = set_overlay.clone();
+        let set_listening_for = set_listening_for.clone();
+        move |()| {
+            set_listening_for.call(None);
+            set_overlay.call(Overlay::Keybindings);
+        }
+    });
+
+    // Runs whatever `action` means — the shared target of every global
+    // keyboard-accelerator dispatch built below. Mirrors
+    // `browser-windows-winui`'s `dispatch_action`: Bookmarks/EditUrl/reader
+    // mode aren't implemented on this front end either yet.
+    let dispatch_action: Callback<Action> = Callback::new({
+        let core = core.clone();
+        let active_id = active_id.clone();
+        let close_page = close_page.clone();
+        let open_switcher = open_switcher.clone();
+        let open_settings = open_settings.clone();
+        let open_profile = open_profile.clone();
+        move |action: Action| {
+            use render_engine::RenderEngine;
+            match action {
+                Action::OpenSwitcher => open_switcher.invoke(()),
+                Action::ClosePage => close_page.invoke(active_id.clone()),
+                Action::Reload => {
+                    if let Some(e) = core.borrow().page(&active_id).and_then(|p| p.engine.as_ref()) {
+                        let _ = e.reload();
+                    }
+                }
+                Action::GoBack => {
+                    if let Some(e) = core.borrow().page(&active_id).and_then(|p| p.engine.as_ref()) {
+                        let _ = e.go_back();
+                    }
+                }
+                Action::GoForward => {
+                    if let Some(e) = core.borrow().page(&active_id).and_then(|p| p.engine.as_ref()) {
+                        let _ = e.go_forward();
+                    }
+                }
+                Action::OpenSettings => open_settings.invoke(()),
+                Action::OpenProfilePicker => open_profile.invoke(()),
+                Action::ToggleBookmark | Action::OpenBookmarks | Action::EditUrl | Action::ToggleReaderMode => {}
+            }
+        }
+    });
 
     let toolbar = grid((
         Element::from(button("\u{25c0}").on_click(with_active(|e| {
@@ -247,12 +417,30 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         )
         .grid_column(3),
         Element::from(button("\u{229e}").on_click(toggle_switcher)).grid_column(4),
+        Element::from(button("\u{2699}").on_click({
+            let open_settings = open_settings.clone();
+            move || open_settings.invoke(())
+        }))
+        .grid_column(5),
+        Element::from(button("\u{1f464}").on_click({
+            let open_profile = open_profile.clone();
+            move || open_profile.invoke(())
+        }))
+        .grid_column(6),
+        Element::from(button("\u{2328}").on_click({
+            let open_keybindings = open_keybindings.clone();
+            move || open_keybindings.invoke(())
+        }))
+        .grid_column(7),
     ))
     .columns([
         GridLength::Auto,
         GridLength::Auto,
         GridLength::Auto,
         GridLength::STAR,
+        GridLength::Auto,
+        GridLength::Auto,
+        GridLength::Auto,
         GridLength::Auto,
     ])
     .column_spacing(8.0)
@@ -272,8 +460,9 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     }
     let content = grid(page_elements);
 
-    let switcher = if switcher_open {
-        Some(switcher_overlay(
+    let overlay_element: Option<Element> = match overlay {
+        Overlay::None => None,
+        Overlay::Switcher => Some(Element::from(switcher_overlay(
             &core,
             &shared,
             &search_query,
@@ -281,17 +470,73 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
             switch_to.clone(),
             add_page_and_switch.clone(),
             close_page.clone(),
-        ))
-    } else {
-        None
+        ))),
+        Overlay::Settings => Some(settings_overlay(
+            &shared,
+            &start_page_draft,
+            set_start_page_draft.clone(),
+            engine_index_draft,
+            set_engine_index_draft.clone(),
+            unlimited_draft,
+            set_unlimited_draft.clone(),
+            &limit_draft,
+            set_limit_draft.clone(),
+            save_settings.clone(),
+            close_any_overlay.clone(),
+        )),
+        Overlay::Profile => Some(profile_overlay(
+            &shared,
+            &new_profile_draft,
+            set_new_profile_draft.clone(),
+            create_and_open_profile.clone(),
+            close_any_overlay.clone(),
+        )),
+        Overlay::Keybindings => Some(keybindings_overlay(
+            &shared,
+            &core,
+            &keybindings,
+            listening_for,
+            set_listening_for.clone(),
+            &new_binding_text,
+            set_new_binding_text.clone(),
+            &bump,
+            close_any_overlay.clone(),
+        )),
     };
+
+    // Global shortcuts: Escape always closes whichever overlay is open (a
+    // fixed convention, not user-configurable — same as
+    // `browser-windows-winui`'s hardcoded Escape handling), plus one
+    // `KeyboardAccelerator` per currently-bound `KeyChord` across every
+    // `Action`. A real, working replacement for `winio-winui3`'s raw
+    // `HWND`-subclass `WM_KEYDOWN` dispatch (see this module's doc
+    // comment) — `windows-reactor` has actual global-shortcut support.
+    let mut accelerators: Vec<KeyboardAccelerator> = Vec::new();
+    if let Some(accel) = shortcuts::chord_to_accelerator(&KeyChord::new(false, false, false, "Escape"), {
+        let close_any_overlay = close_any_overlay.clone();
+        move || close_any_overlay.invoke(())
+    }) {
+        accelerators.push(accel);
+    }
+    for &action in Action::ALL {
+        for chord in keybindings.borrow().bindings_for(action) {
+            let dispatch_action = dispatch_action.clone();
+            if let Some(accel) = shortcuts::chord_to_accelerator(chord, move || dispatch_action.invoke(action)) {
+                accelerators.push(accel);
+            }
+        }
+    }
 
     trace("app: render end");
     let mut rows = vec![Element::from(toolbar).grid_row(0), Element::from(content).grid_row(1)];
-    if let Some(switcher) = switcher {
-        rows.push(Element::from(switcher).grid_row(1));
+    if let Some(overlay_element) = overlay_element {
+        rows.push(overlay_element.grid_row(1));
     }
-    grid(rows).rows([GridLength::Auto, GridLength::STAR]).into()
+    let mut root: Element = grid(rows).rows([GridLength::Auto, GridLength::STAR]).into();
+    for accel in accelerators {
+        root = root.keyboard_accelerator(accel);
+    }
+    root
 }
 
 /// Allocates a fresh page id, inserts an empty `ReactorWebViewEngine` (its
@@ -488,6 +733,195 @@ fn tile_element(tile: &Tile) -> Element {
     .width(150.0)
     .height(110.0)
     .padding(Thickness::uniform(10.0))
+    .into()
+}
+
+/// Mirrors `browser-windows-winui`'s settings overlay: start page, search
+/// engine, loaded-page limit. Draft values (the panel's own local reactor
+/// state) rather than editing `shared.settings` directly, so Cancel really
+/// discards — the same reasoning as `winio-winui3`'s copy-into-textboxes
+/// approach in `open_settings`, just via state instead of imperative
+/// `SetText` calls.
+#[allow(clippy::too_many_arguments)]
+fn settings_overlay(
+    shared: &Rc<Shared>,
+    start_page: &str,
+    set_start_page: SetState<String>,
+    engine_index: i32,
+    set_engine_index: SetState<i32>,
+    unlimited: bool,
+    set_unlimited: SetState<bool>,
+    limit_text: &str,
+    set_limit_text: SetState<String>,
+    on_save: Callback<()>,
+    on_cancel: Callback<()>,
+) -> Element {
+    let engine_names: Vec<String> = shared.settings.borrow().search_engines.iter().map(|e| e.name.clone()).collect();
+    vstack((
+        Element::from(text_block("Start page")),
+        Element::from(text_box(start_page.to_string()).on_text_changed(set_start_page)),
+        Element::from(text_block("Search engine")),
+        Element::from(ComboBox::new(engine_names).selected_index(engine_index).on_selection_changed(set_engine_index)),
+        Element::from(check_box(unlimited).content("Unlimited loaded pages").on_checked(set_unlimited)),
+        Element::from(text_block("Loaded pages limit")),
+        Element::from(text_box(limit_text.to_string()).enabled(!unlimited).on_text_changed(set_limit_text)),
+        Element::from(
+            hstack((
+                Element::from(button("Cancel").on_click(move || on_cancel.invoke(()))),
+                Element::from(button("Save").on_click(move || on_save.invoke(()))),
+            ))
+            .spacing(8.0),
+        ),
+    ))
+    .spacing(8.0)
+    .width(360.0)
+    .margin(Thickness::uniform(16.0))
+    .into()
+}
+
+/// Mirrors `browser-windows-winui`'s profile picker: existing profiles
+/// (rebuilt from `list_profile_names()` fresh every time this overlay
+/// renders — cheap, and picks up a profile created in an earlier visit),
+/// the current one marked and closing the picker instead of launching a
+/// duplicate process of itself, plus a field to create a new one.
+fn profile_overlay(
+    shared: &Rc<Shared>,
+    new_profile_text: &str,
+    set_new_profile_text: SetState<String>,
+    on_create: Callback<()>,
+    on_cancel: Callback<()>,
+) -> Element {
+    let current_profile = shared.profile.name.clone();
+    let rows: Vec<Element> = list_profile_names()
+        .into_iter()
+        .map(|name| {
+            let is_current = name == current_profile;
+            let label = if is_current { format!("{name} (current)") } else { name.clone() };
+            let on_cancel = on_cancel.clone();
+            Element::from(button(label).on_click(move || {
+                if is_current {
+                    on_cancel.invoke(());
+                } else if let Err(err) = launch_new_profile_process(&name) {
+                    eprintln!("failed to launch a new process for profile {name:?}: {err}");
+                } else {
+                    on_cancel.invoke(());
+                }
+            }))
+        })
+        .collect();
+
+    vstack((
+        Element::from(text_block("Profiles").bold()),
+        Element::from(vstack(rows).spacing(4.0)),
+        Element::from(text_box(new_profile_text.to_string()).placeholder_text("New profile name\u{2026}").on_text_changed(set_new_profile_text)),
+        Element::from(
+            hstack((
+                Element::from(button("Cancel").on_click({
+                    let on_cancel = on_cancel.clone();
+                    move || on_cancel.invoke(())
+                })),
+                Element::from(button("Create & Open").on_click(move || on_create.invoke(()))),
+            ))
+            .spacing(8.0),
+        ),
+    ))
+    .spacing(8.0)
+    .width(360.0)
+    .margin(Thickness::uniform(16.0))
+    .into()
+}
+
+/// Mirrors `browser-windows-winui`'s keybindings editor: one row per
+/// `Action::ALL`, each showing its label, current chords as removable tags,
+/// and either an "Add binding" button or (while `listening_for == Some
+/// (action)`) a text entry to type the new chord in `"Ctrl+Shift+P"` format
+/// — see `shortcuts::parse_chord`'s doc comment for why text entry rather
+/// than live key capture.
+#[allow(clippy::too_many_arguments)]
+fn keybindings_overlay(
+    shared: &Rc<Shared>,
+    core: &HookRef<PageManager<ReactorWebViewEngine>>,
+    keybindings: &HookRef<Keybindings>,
+    listening_for: Option<Action>,
+    set_listening_for: SetState<Option<Action>>,
+    new_binding_text: &str,
+    set_new_binding_text: SetState<String>,
+    bump: &Callback<()>,
+    on_close: Callback<()>,
+) -> Element {
+    let _ = core; // reserved: a future revision may show per-action conflicts
+    let mut rows: Vec<Element> = Vec::new();
+    for &action in Action::ALL {
+        let chords = keybindings.borrow().bindings_for(action).to_vec();
+        let mut row: Vec<Element> = vec![Element::from(text_block(action.label()).width(200.0))];
+        for chord in chords {
+            let keybindings = keybindings.clone();
+            let shared = Rc::clone(shared);
+            let bump = bump.clone();
+            let chord_for_click = chord.clone();
+            row.push(Element::from(button(format!("{chord} \u{d7}")).on_click(move || {
+                let mut remaining = keybindings.borrow().bindings_for(action).to_vec();
+                remaining.retain(|c| c != &chord_for_click);
+                keybindings.borrow_mut().set_bindings(action, remaining);
+                if let Err(err) = keybindings.borrow().save(&shared.profile) {
+                    eprintln!("failed to save keybindings: {err}");
+                }
+                bump.invoke(());
+            })));
+        }
+        if listening_for == Some(action) {
+            let commit: Callback<()> = Callback::new({
+                let keybindings = keybindings.clone();
+                let shared = Rc::clone(shared);
+                let bump = bump.clone();
+                let set_listening_for = set_listening_for.clone();
+                let set_new_binding_text = set_new_binding_text.clone();
+                let new_binding_text = new_binding_text.to_string();
+                move |()| {
+                    if let Some(chord) = shortcuts::parse_chord(&new_binding_text) {
+                        let mut chords = keybindings.borrow().bindings_for(action).to_vec();
+                        if !chords.contains(&chord) {
+                            chords.push(chord);
+                        }
+                        keybindings.borrow_mut().set_bindings(action, chords);
+                        if let Err(err) = keybindings.borrow().save(&shared.profile) {
+                            eprintln!("failed to save keybindings: {err}");
+                        }
+                    }
+                    set_listening_for.call(None);
+                    set_new_binding_text.call(String::new());
+                    bump.invoke(());
+                }
+            });
+            row.push(Element::from(
+                text_box(new_binding_text.to_string())
+                    .placeholder_text("e.g. Ctrl+Shift+P")
+                    .on_text_changed(set_new_binding_text.clone())
+                    .keyboard_accelerator(KeyboardAccelerator::new(VirtualKey::Enter, VirtualKeyModifiers::None, {
+                        let commit = commit.clone();
+                        move || commit.invoke(())
+                    })),
+            ));
+            row.push(Element::from(button("OK").on_click(move || commit.invoke(()))));
+        } else {
+            let set_listening_for = set_listening_for.clone();
+            let set_new_binding_text = set_new_binding_text.clone();
+            row.push(Element::from(button("Add binding").on_click(move || {
+                set_new_binding_text.call(String::new());
+                set_listening_for.call(Some(action));
+            })));
+        }
+        rows.push(Element::from(hstack(row).spacing(4.0)));
+    }
+
+    vstack((
+        Element::from(text_block("Keybindings").bold()),
+        Element::from(vstack(rows).spacing(4.0)),
+        Element::from(hstack((Element::from(button("Close").on_click(move || on_close.invoke(()))),)).spacing(8.0)),
+    ))
+    .spacing(8.0)
+    .width(480.0)
+    .margin(Thickness::uniform(16.0))
     .into()
 }
 

@@ -141,10 +141,26 @@ squares (needs a border/background per tile), and clicking through `grid_view`'s
 verified interactively (no visible keyboard-focus indicator inside the control after tabbing into it — Tab
 navigation *into* the toolbar/overlay controls around it works fine).
 
-Still to build, roughly in order: settings/profile/keybindings overlays, and the custom title bar. Also
-worth trying once the keybindings overlay is underway: `KeyboardAccelerator` (already used for the address
-bar's Enter-to-navigate) might let real global shortcuts work without `winio-winui3`'s raw `HWND`-subclass
-workaround entirely.
+**Settings, profile picker, and keybindings overlays are done**, plus a real architectural win: global keyboard
+shortcuts now go through `windows-reactor`'s `KeyboardAccelerator` (new `shortcuts.rs`: converts
+`browser_core::KeyChord` to/from it) attached to the root element, entirely replacing the need for
+`winio-winui3`'s raw `HWND`-subclass `WM_KEYDOWN` dispatch (`browser-windows-winui`'s
+`install_hwnd_subclass`/`subclass_proc`) — a real simplification, not just a workaround swap. Verified in the
+VM: the settings overlay opens pre-filled from real `Settings` (start page, search engine, loaded-page limit),
+Escape closes it via the new global accelerator (not a button), and `Ctrl+T` opens the switcher via the
+keyboard shortcut alone, matching `Keybindings::default()` — the actual test of whether
+`KeyboardAccelerator`-based dispatch works as a real replacement. The keybindings editor itself renders every
+default binding correctly (removable tags, "Add binding" per action). One honest, deliberate gap:
+`windows-reactor` has no generic "capture the next keypress" API (only `.keyboard_accelerator(..)` for
+*known* combinations — checked by reading `element.rs`/`widget.rs`), so the editor's "add a new binding" flow
+uses a text field (`"Ctrl+Shift+P"` format, parsed by `shortcuts::parse_chord`) instead of
+`browser-windows-winui`'s live "press keys…" capture — reintroducing a raw `HWND` subclass just for that one
+feature would undercut the point of moving off `winio-winui3` in the first place.
+
+Still to build: the custom title bar (`ExtendsContentIntoTitleBar` equivalent — not yet checked whether
+`windows-reactor` exposes this) and the external-link-launch chooser window
+(`browser-windows-winui::show_external_link_chooser`'s equivalent). Feature parity is otherwise close; see
+`summaries/windows-github-actions-ci.md` for the full incremental build log.
 
 Repo is pushed to `danshryock/one-page-browser` (`git@github.com:danshryock/one-page-browser.git`), with `gh`
 installed and authenticated on this dev machine — real job logs are pulled via `gh run view --log-failed`/the
