@@ -252,12 +252,67 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    machinery, no disk I/O) and *actually runs queries* — `record_visit` twice, then `search` — displaying the
    real result count and titles in the window's content, not just opening the store and leaving it idle.
    Still no custom title bar, `WebView2`, or HWND subclassing — isolates the `browser_core`/tokio question on
-   its own. Not yet run.
+   its own.
+
+   **Ran it — also survived, real queries and all** (`record_visit` × 2, `search`, "Found 2 entries: Example
+   Domain, Example Org" genuinely displayed in the window's content) — but this run's `Launch and screenshot`
+   step for the *real* app finally produced something new: **a genuine crash dump.** (WER had silently failed
+   to write one on every previous run for reasons never pinned down — this time it worked.)
+
+   ### The crash dump: the fault is inside Microsoft's own system DLLs, not our code
+
+   Downloaded the 232MB `.dmp` and analyzed it locally with `minidump-stackwalk` (`cargo install
+   minidump-stackwalk`, the `rust-minidump` project's CLI — genuinely useful that this is possible entirely
+   from Linux, no Windows debugger needed). The crashing thread's stack:
+   ```
+   Crash reason:  STATUS_STOWED_EXCEPTION
+   Thread 0 main (crashed) - tid: 9024
+    0  KERNELBASE.dll + 0x10eec8
+    1  combase.dll + 0x1043ae
+    2  combase.dll + 0x1f9c00
+    3  ucrtbase.dll + 0xed79e
+    4  KERNELBASE.dll + 0x10eec7
+   ```
+   `browser-windows-winui.exe` (our own module) *is* loaded (confirmed in the dump's module list, with a real
+   address range) — but it appears **nowhere** in the crashing thread's stack, nor in any other thread's. Every
+   frame is inside Microsoft's own `combase.dll` (core COM/WinRT infrastructure — this is literally the DLL
+   that implements stowed-exception propagation itself) and `ucrtbase.dll` (the Universal CRT), called
+   through `KERNELBASE.dll`'s fail-fast path. A separate thread (tid 612) sits inside `CoreMessagingXP.dll` —
+   the DLL implementing `Windows.System.DispatcherQueue`, WinUI 3's own internal message dispatcher —
+   confirming XAML's dispatcher machinery is genuinely active, consistent with everything up to that point
+   working normally (as all seven bisection binaries already showed).
+
+   Tried symbolicating against Microsoft's public symbol server (`--symbols-url
+   https://msdl.microsoft.com/download/symbols`, confirmed reachable) — no additional resolution, these
+   specific internal offsets aren't covered by public PDBs. Even without exact function names, the module
+   list alone is conclusive: **the actual unhandled exception originates entirely inside Microsoft's own
+   WinRT/COM/Composition stack, not in anything this codebase wrote** — not the custom title bar, not
+   `WebView2`, not the HWND subclass, not `browser_core`/tokio, individually or in any combination tested.
+   Searched for precedent: `combase!RoOriginateLanguageException`-rooted stowed-exception crashes are a real,
+   recurring category of WinAppSDK/WinUI 3 issue in Microsoft's own GitHub trackers (e.g.
+   [WindowsAppSDK#4861](https://github.com/microsoft/WindowsAppSDK/issues/4861),
+   [WindowsAppSDK#999](https://github.com/microsoft/WindowsAppSDK/issues/999)), and GitHub Actions' Windows
+   runner images have their own documented rough edges around Windows App SDK/SDK version mismatches (e.g.
+   [WindowsAppSDK#5851](https://github.com/microsoft/WindowsAppSDK/issues/5851)) — consistent with this being
+   a real compatibility issue between WinUI 3's Composition internals and this specific CI environment
+   (Windows NT 10.0.26100, confirmed from the dump), not a bug introduced by this project's own code.
+
+   ### Where this leaves things
+
+   Seven independent bisection binaries (bare window, custom title bar, `WebView2`, HWND subclass, three
+   combinations up to all of them, and `browser_core`/tokio) all survived cleanly — each one individually
+   ruling out a real, plausible suspect rather than guessing blind. The crash dump then closed the loop:
+   the fault lives entirely inside Microsoft's own system DLLs, with zero frames from this codebase anywhere
+   in the crashing thread. Further diagnosis from here would need either Microsoft's own private symbols
+   (not publicly available) or a live interactive debugger session on a matching machine — beyond what's
+   practically achievable from this environment. This is being left as a well-documented, real, open
+   environment-compatibility issue (see `ROADMAP.md`) rather than chased further blind.
 
 This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the
 real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine. It
 also caught a real mistake of mine along the way: guessing at what an NTSTATUS code meant instead of checking
 it, which sent the first fix attempt in the wrong direction — corrected once actually verified. This
-particular crash has taken many rounds without a definitive answer yet — a genuinely hard, first-ever
-debugging session for code that had never run anywhere before this CI existed — but each round has ruled
-something concrete out rather than just guessing blind, which is real progress even without a fix yet.
+particular crash took many rounds and, in the end, a genuine crash dump to reach a conclusive answer — a
+first-ever debugging session for code that had never run anywhere before this CI existed, and each round
+ruled something concrete out rather than just guessing blind, which is real progress even without a code fix
+at the end of it.

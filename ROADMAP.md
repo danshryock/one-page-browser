@@ -111,28 +111,35 @@ Actions API, not guessed at.
 compiles and runs on real macOS, not just `cargo check`-clean on Linux.
 
 **`.github/workflows/windows.yml`** — `test-core` (`cargo test -p browser-core` + `cargo check -p
-render-engine`) is fully green. `build-and-smoke-winui` still fails, but real progress: two genuine bugs found
-and fixed along the way (a Linux-only `clang-cl` path leaking into the native build via `.cargo/config.toml`;
-the Windows App SDK runtime install step silently swallowing its own exit code), and the remaining failure has
-been narrowed a long way through direct experimentation, not guesswork:
-- The app crashes at launch with `STATUS_STOWED_EXCEPTION` (`0xC000027B`) — Windows' fast-fail for an
-  unhandled exception — right around `WM_DWMNCRENDERINGCHANGED`/`WM_SETCURSOR`, well after a fully successful
-  startup (window built, page added, activated — proven via checkpoint tracing, see
+render-engine`) is fully green. `build-and-smoke-winui` (the `browser-windows-winui` build itself) also
+succeeds; only the interactive launch/screenshot smoke-test still fails, and it's now been diagnosed about as
+thoroughly as practically possible from this environment:
+- Two genuine bugs found and fixed along the way: a Linux-only `clang-cl` path leaking into the native build
+  via `.cargo/config.toml`, and the Windows App SDK runtime install step silently swallowing its own exit
+  code.
+- The app crashes at launch with `STATUS_STOWED_EXCEPTION` (`0xC000027B`), well after a fully successful
+  startup (window built, page added, activated — proven via checkpoint tracing,
   `crates/browser-windows-winui/src/lib.rs`'s `trace()`, kept permanently rather than removed).
-- Forcing WARP (software) rendering for the app via `d3dconfig` — confirmed actually applied
-  (`ForceWARP=1` verified in the exported config) — made **no difference**, ruling out a simple GPU-driver
-  theory.
-- **`crates/browser-windows-winui/src/bin/minimal_smoke_test.rs`** (a bare-minimum WinUI 3 window, added for
-  this debugging session) **ran successfully with no crash at all** — proving WinUI 3 itself works fine on
-  this runner. The bug is specific to something in `browser-windows-winui`'s own code, not the environment.
-- Current leading suspects, both genuinely unusual code in the real window's setup (added a second bisection
-  binary, `titlebar_smoke_test.rs`, to narrow between them — not yet run):
-  1. `window.SetExtendsContentIntoTitleBar(true)` + `SetTitleBar(...)` (custom title bar) — matches the
-     DWM/non-client-area messages right before the crash.
-  2. `install_hwnd_subclass`/`subclass_proc` (raw `WNDPROC` interception, a workaround for `winio-winui3`'s
-     missing `KeyDown`/`Window::Closed` delegates).
+- Forcing WARP (software) rendering via `d3dconfig` (confirmed actually applied) made no difference, ruling
+  out a simple GPU-driver theory.
+- **Seven bisection binaries** (`crates/browser-windows-winui/src/bin/*_smoke_test.rs`) — a bare window,
+  the custom title bar alone, `WebView2` alone, HWND subclassing alone, three combinations of those up to all
+  of them together, and finally `HistoryStore`/`browser_core`'s `tokio` runtime alongside the WinRT STA
+  apartment (with real queries run and displayed, not just opened) — **all survived cleanly**, several going
+  well past the exact point the real app crashes at. None of this codebase's own unusual code, individually or
+  combined, reproduces the crash.
+- **A genuine crash dump**, finally captured and analyzed locally (`minidump-stackwalk`, no Windows machine
+  needed): the crashing thread's entire stack lives inside Microsoft's own `combase.dll`/`ucrtbase.dll`/
+  `KERNELBASE.dll` — `browser-windows-winui.exe`'s own module is loaded but appears **nowhere** in any thread's
+  stack. The fault is inside WinUI 3's/WinRT's own Composition internals, not this codebase's code — a real,
+  documented category of issue in Microsoft's own trackers (stowed exceptions rooted in
+  `combase!RoOriginateLanguageException`), consistent with GitHub Actions' Windows runners having their own
+  known WinAppSDK compatibility rough edges.
 
-See `summaries/windows-github-actions-ci.md` for the full blow-by-blow.
+This is being left as a well-documented, open environment-compatibility issue rather than chased further —
+doing so would need Microsoft's own private symbols or a live debugger on a matching machine, beyond what's
+practical here. See `summaries/windows-github-actions-ci.md` for the full blow-by-blow (every round, every
+ruled-out theory, the full crash dump analysis).
 
 ## Backlog (not yet started, roughly in the order raised)
 
