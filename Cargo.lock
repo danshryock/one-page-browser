@@ -179,12 +179,12 @@ dependencies = [
  "anyhow",
  "bytes",
  "directories",
+ "futures-executor",
  "libsql",
  "percent-encoding",
  "render-engine",
  "serde",
  "serde_json",
- "tokio",
 ]
 
 [[package]]

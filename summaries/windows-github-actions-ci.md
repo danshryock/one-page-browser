@@ -297,15 +297,47 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    a real compatibility issue between WinUI 3's Composition internals and this specific CI environment
    (Windows NT 10.0.26100, confirmed from the dump), not a bug introduced by this project's own code.
 
+   ### Follow-up: is tokio itself really clean, and does exact construction order matter?
+
+   Asked directly whether `browser_core`'s `tokio` usage could still be implicated, and whether a Microsoft-
+   provided or custom alternative could replace it. Checking the actual code first (`history.rs`): the tokio
+   runtime was already about as minimal as tokio gets —
+   `tokio::runtime::Builder::new_current_thread().build()` with **no** `.enable_io()`/`.enable_time()`/
+   `.enable_all()` call, and the crate itself only enables tokio's bare `"rt"` feature
+   (`default-features = false`). No thread pool, no I/O driver (no IOCP handle setup on Windows), no timers —
+   just a bare task executor on the calling thread.
+
+   Reading libsql's own source (`local/impls.rs`) settled the bigger question: for the local (embedded)
+   backend used here, `Connection::execute`/`query` are `async fn`s that just directly call the synchronous
+   SQLite FFI (`self.conn.execute(sql, params)`, no `.await` inside) — the `async` wrapper exists purely for
+   API uniformity with libsql's separate remote/HTTP backend, which presumably does need real async I/O.
+   Every one of these futures completes on its very first poll; there is nothing for a real async runtime to
+   actually schedule. That makes `futures_executor::block_on` — a single free function, no runtime object, no
+   reactor, no threads, already resolved transitively via libsql itself so no new dependency — an exact,
+   honest fit, and **replaced tokio in `browser_core` entirely** (`history.rs`'s `HistoryStore` struct no
+   longer even stores a runtime handle). Verified: all 79 `browser-core` tests and all 20 headless
+   `browser-linux-gtk3` GTK tests still pass, and all three build targets (native Linux, `x86_64-pc-windows-
+   gnu`, `cargo build-windows-winui`) still succeed. Not implicated by the crash dump evidence above, but a
+   real simplification regardless — dead-weight reactor/threading machinery that was never doing anything.
+
+   Also added an eighth bisection binary, `exact_order_smoke_test.rs`: none of the previous seven matched the
+   real `build_window_and_app`'s *exact* construction order (content + custom title bar → `HistoryStore` with
+   real queries → `WebView2` → HWND subclass → `Activate`, mirroring where each piece actually happens
+   relative to the others, including `WebView2` only being created after the window/history/subclass setup
+   the way `add_page` really does it). Tests whether the specific interleaving — not any single piece in
+   isolation — matters. Not yet run.
+
    ### Where this leaves things
 
    Seven independent bisection binaries (bare window, custom title bar, `WebView2`, HWND subclass, three
    combinations up to all of them, and `browser_core`/tokio) all survived cleanly — each one individually
    ruling out a real, plausible suspect rather than guessing blind. The crash dump then closed the loop:
    the fault lives entirely inside Microsoft's own system DLLs, with zero frames from this codebase anywhere
-   in the crashing thread. Further diagnosis from here would need either Microsoft's own private symbols
-   (not publicly available) or a live interactive debugger session on a matching machine — beyond what's
-   practically achievable from this environment. This is being left as a well-documented, real, open
+   in the crashing thread. Tokio's own footprint was independently confirmed minimal and has now been removed
+   entirely as a real simplification, and an eighth test targets exact construction-order/timing as the one
+   remaining untested variable. Further diagnosis beyond that would need either Microsoft's own private
+   symbols (not publicly available) or a live interactive debugger session on a matching machine — beyond
+   what's practically achievable from this environment. This is being left as a well-documented, real, open
    environment-compatibility issue (see `ROADMAP.md`) rather than chased further blind.
 
 This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the

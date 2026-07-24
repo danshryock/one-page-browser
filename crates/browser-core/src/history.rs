@@ -3,11 +3,24 @@
 //! separate view (this browser has no tabs by design; the switcher is
 //! already the one navigation hub).
 //!
-//! `libsql`'s `Connection::execute`/`query` are `async fn`s, but every visit
-//! here is a local SQLite call — effectively CPU-bound, not real async I/O —
-//! so `HistoryStore` just owns a single-threaded `tokio` runtime and blocks
-//! on each call. Keeps every call site in both frontends synchronous, the
-//! same way `Settings::load`/`save` already do blocking file I/O.
+//! `libsql`'s `Connection::execute`/`query` are `async fn`s, but for the
+//! local (embedded) backend used here they're not real async I/O at all —
+//! confirmed by reading libsql's own source (`local/impls.rs`): each one is
+//! a synchronous SQLite FFI call with no `.await` point that ever actually
+//! yields, wrapped in `async fn` purely for API uniformity with libsql's
+//! separate remote/HTTP backend. So every call always completes on its very
+//! first poll — there's nothing here for a real async runtime (a reactor,
+//! a thread pool, task scheduling across polls) to actually do. Blocking on
+//! each call via `futures_executor::block_on` (a plain function, no runtime
+//! object, no I/O/timer driver, no threads — just polls the future to
+//! completion) reflects that accurately, keeping every call site in both
+//! frontends synchronous the same way `Settings::load`/`save` already do
+//! blocking file I/O. (Previously used a single-threaded `tokio` runtime for
+//! this same purpose — replaced during the `browser-windows-winui` Windows
+//! CI launch-crash investigation: not implicated by that investigation's own
+//! bisection testing, but removing it was a legitimate simplification
+//! either way, since tokio's reactor/threading machinery was always dead
+//! weight for a workload that's never actually asynchronous.)
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -41,7 +54,6 @@ pub struct HistoryStore {
     /// `Connection` doesn't own the database file handle itself.
     _db: libsql::Database,
     conn: libsql::Connection,
-    rt: tokio::runtime::Runtime,
 }
 
 impl HistoryStore {
@@ -91,16 +103,15 @@ impl HistoryStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let rt = tokio::runtime::Builder::new_current_thread().build()?;
         let builder = libsql::Builder::new_local(&path).encryption_config(libsql::EncryptionConfig::new(
             libsql::Cipher::Aes256Cbc,
             bytes::Bytes::copy_from_slice(passphrase.as_bytes()),
         ));
-        let db = rt.block_on(builder.build())?;
+        let db = futures_executor::block_on(builder.build())?;
         let conn = db.connect()?;
-        rt.block_on(conn.execute_batch(SCHEMA_SQL))?;
-        migrate_add_embedding_column(&conn, &rt);
-        Ok(Self { _db: db, conn, rt })
+        futures_executor::block_on(conn.execute_batch(SCHEMA_SQL))?;
+        migrate_add_embedding_column(&conn);
+        Ok(Self { _db: db, conn })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -114,12 +125,11 @@ impl HistoryStore {
     /// `open_encrypted`, never touches encryption at all — no need for this
     /// one to vary by platform.
     fn open_at(path: &Path) -> anyhow::Result<Self> {
-        let rt = tokio::runtime::Builder::new_current_thread().build()?;
-        let db = rt.block_on(libsql::Builder::new_local(path).build())?;
+        let db = futures_executor::block_on(libsql::Builder::new_local(path).build())?;
         let conn = db.connect()?;
-        rt.block_on(conn.execute_batch(SCHEMA_SQL))?;
-        migrate_add_embedding_column(&conn, &rt);
-        Ok(Self { _db: db, conn, rt })
+        futures_executor::block_on(conn.execute_batch(SCHEMA_SQL))?;
+        migrate_add_embedding_column(&conn);
+        Ok(Self { _db: db, conn })
     }
 
     /// Opens a history store that never touches disk at all — nothing to
@@ -148,7 +158,7 @@ impl HistoryStore {
         let domain = domain_of(url);
         let now = now_unix();
         let embedding_literal = embedding::to_sql_literal(&embedding::embed(title));
-        self.rt.block_on(self.conn.execute(
+        futures_executor::block_on(self.conn.execute(
             "INSERT INTO history (url, domain, title, first_visited_at, visited_at, visit_count, embedding) \
              VALUES (?1, ?2, ?3, ?4, ?4, 1, vector32(?5)) \
              ON CONFLICT(url) DO UPDATE SET \
@@ -169,12 +179,12 @@ impl HistoryStore {
     /// change which rows come back.
     pub fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<HistoryEntry>> {
         let pattern = format!("%{query}%");
-        let mut rows = self.rt.block_on(self.conn.query(
+        let mut rows = futures_executor::block_on(self.conn.query(
             "SELECT url, domain, title, first_visited_at, visited_at, visit_count FROM history \
              WHERE url LIKE ?1 OR title LIKE ?1 ORDER BY visited_at DESC LIMIT ?2",
             libsql::params![pattern, limit as i64],
         ))?;
-        collect_entries(&self.rt, &mut rows)
+        collect_entries(&mut rows)
     }
 
     /// Entries whose *title* is lexically similar to `query`'s, by cosine
@@ -192,7 +202,7 @@ impl HistoryStore {
     /// "the N closest regardless of how close."
     pub fn search_similar(&self, query: &str, limit: usize) -> anyhow::Result<Vec<HistoryEntry>> {
         let embedding_literal = embedding::to_sql_literal(&embedding::embed(query));
-        let mut rows = self.rt.block_on(self.conn.query(
+        let mut rows = futures_executor::block_on(self.conn.query(
             "SELECT url, domain, title, first_visited_at, visited_at, visit_count, \
                     vector_distance_cos(embedding, vector32(?1)) AS distance \
              FROM history \
@@ -200,16 +210,16 @@ impl HistoryStore {
              ORDER BY distance ASC LIMIT ?2",
             libsql::params![embedding_literal, limit as i64],
         ))?;
-        collect_entries(&self.rt, &mut rows)
+        collect_entries(&mut rows)
     }
 }
 
 /// Shared by `search`/`search_similar`: both select the same six columns in
 /// the same order (an extra trailing `distance` column from
 /// `search_similar`'s query is simply never read here).
-fn collect_entries(rt: &tokio::runtime::Runtime, rows: &mut libsql::Rows) -> anyhow::Result<Vec<HistoryEntry>> {
+fn collect_entries(rows: &mut libsql::Rows) -> anyhow::Result<Vec<HistoryEntry>> {
     let mut entries = Vec::new();
-    while let Some(row) = rt.block_on(rows.next())? {
+    while let Some(row) = futures_executor::block_on(rows.next())? {
         entries.push(HistoryEntry {
             url: row.get(0)?,
             domain: row.get(1)?,
@@ -231,8 +241,8 @@ fn collect_entries(rt: &tokio::runtime::Runtime, rows: &mut libsql::Rows) -> any
 /// opened at least once after this migration was added) — there's no
 /// portable way to check for a column's existence up front that's simpler
 /// than just trying to add it.
-fn migrate_add_embedding_column(conn: &libsql::Connection, rt: &tokio::runtime::Runtime) {
-    let _ = rt.block_on(conn.execute("ALTER TABLE history ADD COLUMN embedding BLOB", ()));
+fn migrate_add_embedding_column(conn: &libsql::Connection) {
+    let _ = futures_executor::block_on(conn.execute("ALTER TABLE history ADD COLUMN embedding BLOB", ()));
 }
 
 fn now_unix() -> i64 {
@@ -345,10 +355,9 @@ mod tests {
             .join(format!("claude-browser-test-history-pre-migration-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         {
-            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-            let db = rt.block_on(libsql::Builder::new_local(&path).build()).unwrap();
+            let db = futures_executor::block_on(libsql::Builder::new_local(&path).build()).unwrap();
             let conn = db.connect().unwrap();
-            rt.block_on(conn.execute_batch(
+            futures_executor::block_on(conn.execute_batch(
                 "CREATE TABLE history (
                     url TEXT PRIMARY KEY,
                     domain TEXT NOT NULL,
@@ -359,7 +368,7 @@ mod tests {
                 );",
             ))
             .unwrap();
-            rt.block_on(conn.execute(
+            futures_executor::block_on(conn.execute(
                 "INSERT INTO history (url, domain, title, first_visited_at, visited_at, visit_count) \
                  VALUES ('https://example.com/old', 'example.com', 'Old Entry', 100, 100, 1)",
                 (),
