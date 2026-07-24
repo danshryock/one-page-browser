@@ -145,7 +145,13 @@ jobs:
 
           if ($proc.HasExited) {
             $hex = "0x{0:X8}" -f $proc.ExitCode
-            Write-Error "browser-windows-winui exited on its own within 8 seconds (exit code $($proc.ExitCode) / $hex) — see stdout/stderr above, and the logs/dumps uploaded as artifacts"
+
+            # Gather every diagnostic *before* the Write-Error below: with
+            # $ErrorActionPreference = "Stop" (set at the top of this script),
+            # Write-Error throws a terminating error immediately — anything
+            # placed after it never runs. (A real bug in an earlier version
+            # of this exact step: the dump-analysis code below used to come
+            # *after* Write-Error and silently never executed.)
 
             # WER can take a moment to finish writing the dump after the
             # process actually dies.
@@ -166,6 +172,7 @@ jobs:
               Write-Host "no crash dump was generated in $dumpFolder"
             }
 
+            Write-Error "browser-windows-winui exited on its own within 8 seconds (exit code $($proc.ExitCode) / $hex) — see stdout/stderr and crash dump analysis above, and the logs/dumps uploaded as artifacts"
             exit 1
           }
 
