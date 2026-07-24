@@ -236,7 +236,23 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    `WebView2` + `SetWindowSubclass` `WNDPROC` interception, all three together — the last remaining
    combination of the real window's genuinely unusual pieces of code before concluding the crash needs the
    real app's full complexity (many controls/overlays at once, multiple pages/`WebView2`s) rather than any
-   subset tested so far. Not yet run.
+   subset tested so far.
+
+   **Ran it — also survived, and this trace went further than any before it**: past `WM_SETCURSOR` (the real
+   crash point) into `WM_NCHITTEST`/`WM_NCMOUSEMOVE`/`WM_MOUSELEAVE` — messages the real app's crash trace
+   never even reaches — with no crash at all. None of the real window's genuinely unusual XAML/subclassing
+   code, individually or in any combination up to all three, reproduces the crash.
+
+   That's conclusive enough to redirect: **none of the seven binaries so far touch `browser_core` at all.**
+   The real app's `build_window_and_app` calls `HistoryStore::open(&profile)`, which opens a real libsql
+   database and spins up its own `tokio::runtime::Runtime` (`browser_core::history`'s `self.rt.block_on(...)`
+   calls) — mixing that multi-threaded async runtime with the WinRT single-threaded STA apartment
+   (`init_apartment(ApartmentType::SingleThreaded)`) is a genuinely plausible, previously untested crash
+   source. Added `historystore_smoke_test.rs`: uses `HistoryStore::open_in_memory()` (same real libsql/tokio
+   machinery, no disk I/O) and *actually runs queries* — `record_visit` twice, then `search` — displaying the
+   real result count and titles in the window's content, not just opening the store and leaving it idle.
+   Still no custom title bar, `WebView2`, or HWND subclassing — isolates the `browser_core`/tokio question on
+   its own. Not yet run.
 
 This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the
 real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine. It

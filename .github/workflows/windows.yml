@@ -274,12 +274,13 @@ jobs:
             Stop-Process -Id $proc.Id -Force
           }
 
-      # Sixth and final combination round: title bar + WebView2 + HWND
-      # subclassing, all three together — the last remaining
-      # pairwise/triple combination of the real window's genuinely unusual
-      # pieces of code before concluding the crash needs the real app's full
-      # complexity (many controls/overlays at once, multiple pages/
-      # WebView2s) rather than any subset tested so far.
+      # Sixth combination round: title bar + WebView2 + HWND subclassing, all
+      # three together — the last remaining pairwise/triple combination of
+      # the real window's genuinely unusual pieces of code. CONFIRMED (first
+      # real run): also survived, its trace going well *past* the exact
+      # message sequence the real app crashes at (through WM_NCHITTEST/
+      # WM_NCMOUSEMOVE/WM_MOUSELEAVE, messages the real crash never reaches)
+      # with no crash at all.
       - name: Launch full-combination (titlebar+WebView2+subclass) smoke test
         shell: pwsh
         run: |
@@ -303,6 +304,44 @@ jobs:
             Write-Host "full_combo_smoke_test exited on its own within 8 seconds (exit code $($proc.ExitCode) / $hex)"
           } else {
             Write-Host "full_combo_smoke_test is still running after 8 seconds — did NOT crash"
+            Stop-Process -Id $proc.Id -Force
+          }
+
+      # Seventh round — a genuinely different suspect: none of the six
+      # binaries above touch browser_core at all. The real app's
+      # build_window_and_app calls HistoryStore::open(&profile), which opens
+      # a real libsql database and spins up its own tokio::runtime::Runtime
+      # (browser_core::history's self.rt.block_on(...) calls) — mixing that
+      # multi-threaded async runtime with the WinRT single-threaded STA
+      # apartment is a genuinely plausible, previously untested crash source.
+      # Uses HistoryStore::open_in_memory() (same real libsql/tokio
+      # machinery, no disk I/O) and *actually runs queries* (record_visit,
+      # then search), displaying the real result in the window's content —
+      # not just opening the store and leaving it idle. Still no custom
+      # title bar, WebView2, or HWND subclassing.
+      - name: Launch HistoryStore/tokio WinUI 3 smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Get-ChildItem -Recurse -Filter "historystore_smoke_test.exe" -Path target |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) {
+            Write-Error "historystore_smoke_test.exe not found under target/ after build"
+            exit 1
+          }
+
+          $proc = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 8
+
+          Write-Host "--- historystore-smoke-trace.log ---"
+          Get-Content "$env:GITHUB_WORKSPACE\historystore-smoke-trace.log" -ErrorAction SilentlyContinue
+          Write-Host "-------------------------------------"
+
+          if ($proc.HasExited) {
+            $hex = "0x{0:X8}" -f $proc.ExitCode
+            Write-Host "historystore_smoke_test exited on its own within 8 seconds (exit code $($proc.ExitCode) / $hex)"
+          } else {
+            Write-Host "historystore_smoke_test is still running after 8 seconds — did NOT crash"
             Stop-Process -Id $proc.Id -Force
           }
 
@@ -486,6 +525,7 @@ jobs:
             subclass-smoke-trace.log
             titlebar-webview2-smoke-trace.log
             full-combo-smoke-trace.log
+            historystore-smoke-trace.log
           if-no-files-found: ignore
 
       # Raw dumps, for offline analysis if `cdb` wasn't available on this
