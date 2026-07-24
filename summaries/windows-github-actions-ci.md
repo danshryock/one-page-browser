@@ -209,10 +209,20 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    `render-engine/src/winui.rs`) navigated to a real URL — still no `install_hwnd_subclass`, no custom title
    bar. `WebView2` is a much heavier native control than anything tried so far, backed by a real Edge WebView2
    process with its own runtime/user-data-folder requirements — a genuinely plausible independent crash source
-   this debugging pass hadn't considered until ruling out the other two. If this one also survives, that
-   leaves `install_hwnd_subclass`/`subclass_proc` (the raw `WNDPROC` interception, still untested in isolation)
-   as the last remaining suspect from the real window's genuinely unusual code, or some combination of pieces
-   none of these three isolated tests captures. Not yet run.
+   this debugging pass hadn't considered until ruling out the other two.
+
+   **Ran it — also survived cleanly.** Every checkpoint through `run() returned Ok`, no crash. `WebView2` alone
+   isn't the cause either.
+
+   Added a fourth bisection binary, `subclass_smoke_test.rs`: identical to `minimal_smoke_test` plus *only*
+   `SetWindowSubclass`-based `WNDPROC` interception — the technique `lib.rs`'s `install_hwnd_subclass`/
+   `subclass_proc` uses as a workaround for `winio-winui3`'s missing `KeyDown`/`Window::Closed` delegates.
+   Reimplemented standalone (those functions are private to `lib.rs`, unreachable from a separate `src/bin/`
+   binary crate) but the same shape: subclass the raw `HWND`, forward every message to `DefSubclassProc`
+   unmodified, reclaim the boxed state on `WM_NCDESTROY`. This is the last of the real window's genuinely
+   unusual pieces of code left untested in isolation — if it also survives, none of the four individually
+   reproduces the crash, meaning it's some combination of pieces, or something in the real window's full
+   complexity (many controls/overlays at once) that none of these isolated tests captures. Not yet run.
 
 This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the
 real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine. It

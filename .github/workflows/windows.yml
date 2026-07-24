@@ -173,6 +173,8 @@ jobs:
       # a real Edge WebView2 process with its own runtime/user-data-folder
       # requirements. Mirrors that construction directly (still no HWND
       # subclassing, no custom title bar) and navigates to a real URL.
+      # CONFIRMED (first real run): also survived cleanly, every checkpoint
+      # through `run() returned Ok`, no crash — ruling out WebView2 alone too.
       - name: Launch WebView2 WinUI 3 smoke test (no subclassing/titlebar)
         shell: pwsh
         run: |
@@ -196,6 +198,45 @@ jobs:
             Write-Host "webview2_smoke_test exited on its own within 8 seconds (exit code $($proc.ExitCode) / $hex)"
           } else {
             Write-Host "webview2_smoke_test is still running after 8 seconds — did NOT crash"
+            Stop-Process -Id $proc.Id -Force
+          }
+
+      # Fourth and last bisection round for the real window's individually
+      # unusual pieces of code: minimal_smoke_test, titlebar_smoke_test, and
+      # webview2_smoke_test all survived cleanly, ruling out a bare window,
+      # the custom title bar, and WebView2 each in isolation. This one adds
+      # *only* SetWindowSubclass-based WNDPROC interception (the technique
+      # lib.rs's install_hwnd_subclass/subclass_proc uses as a workaround for
+      # winio-winui3's missing KeyDown/Window::Closed delegates — see that
+      # module's doc comment), reimplemented standalone since those functions
+      # are private to lib.rs and not reachable from a separate src/bin/
+      # binary crate. If this also survives, none of the four individual
+      # pieces reproduces the crash alone, meaning it's some combination, or
+      # something in the real window's full complexity (many controls/
+      # overlays at once) that these isolated tests don't capture.
+      - name: Launch HWND-subclass WinUI 3 smoke test (no titlebar/WebView2)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Get-ChildItem -Recurse -Filter "subclass_smoke_test.exe" -Path target |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) {
+            Write-Error "subclass_smoke_test.exe not found under target/ after build"
+            exit 1
+          }
+
+          $proc = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 8
+
+          Write-Host "--- subclass-smoke-trace.log ---"
+          Get-Content "$env:GITHUB_WORKSPACE\subclass-smoke-trace.log" -ErrorAction SilentlyContinue
+          Write-Host "--------------------------------"
+
+          if ($proc.HasExited) {
+            $hex = "0x{0:X8}" -f $proc.ExitCode
+            Write-Host "subclass_smoke_test exited on its own within 8 seconds (exit code $($proc.ExitCode) / $hex)"
+          } else {
+            Write-Host "subclass_smoke_test is still running after 8 seconds — did NOT crash"
             Stop-Process -Id $proc.Id -Force
           }
 
@@ -376,6 +417,7 @@ jobs:
             minimal-smoke-trace.log
             titlebar-smoke-trace.log
             webview2-smoke-trace.log
+            subclass-smoke-trace.log
           if-no-files-found: ignore
 
       # Raw dumps, for offline analysis if `cdb` wasn't available on this
