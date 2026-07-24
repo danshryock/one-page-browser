@@ -220,9 +220,16 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
    Reimplemented standalone (those functions are private to `lib.rs`, unreachable from a separate `src/bin/`
    binary crate) but the same shape: subclass the raw `HWND`, forward every message to `DefSubclassProc`
    unmodified, reclaim the boxed state on `WM_NCDESTROY`. This is the last of the real window's genuinely
-   unusual pieces of code left untested in isolation — if it also survives, none of the four individually
-   reproduces the crash, meaning it's some combination of pieces, or something in the real window's full
-   complexity (many controls/overlays at once) that none of these isolated tests captures. Not yet run.
+   unusual pieces of code left untested in isolation.
+
+   **Ran it — also survived, and its trace is the most telling one yet**: it received the *exact same message
+   sequence* the real app's own trace shows, all the way through `WM_SETCURSOR` (`0x0020`) fired twice — the
+   precise point the real app crashes at — and then just kept running past it. So it isn't any single piece
+   in isolation. Added a fifth binary, `titlebar_webview2_smoke_test.rs`, testing the specific combination
+   most likely to interact badly: `SetExtendsContentIntoTitleBar`/`SetTitleBar` *and* an embedded `WebView2`
+   together (a `WebView2` surface rendering underneath/near a custom-drawn, DWM-extended title bar region is a
+   real, previously documented tricky pairing for WinUI 3 apps in general, independent of this CI
+   environment) — still no HWND subclassing. Not yet run.
 
 This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the
 real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine. It
