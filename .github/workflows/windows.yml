@@ -97,13 +97,13 @@ jobs:
 
       # Bisection: does *any* WinUI 3 app crash at first paint on this
       # runner (a genuine environment/WinUI 3 limitation), or is it specific
-      # to something in browser-windows-winui's own code — most likely
-      # `install_hwnd_subclass`/`subclass_proc`, the one piece of genuinely
-      # unusual unsafe code sitting directly in the window's message path,
-      # built as a workaround for winio-winui3 bindings gaps (see lib.rs's
-      # module doc comment)? `minimal_smoke_test` (src/bin/) does the bare
-      # minimum: init, bootstrap, one Window, Activate() — no subclassing, no
-      # controls, no WebView2 — to isolate that.
+      # to something in browser-windows-winui's own code? `minimal_smoke_test`
+      # (src/bin/) does the bare minimum: init, bootstrap, one Window,
+      # Activate() — no subclassing, no custom title bar, no controls, no
+      # WebView2. CONFIRMED (first real run): it survived past 8 seconds —
+      # every checkpoint through `run() returned Ok` logged, process still
+      # running, no crash — proving WinUI 3 itself works fine on this runner.
+      # The bug is specific to something in this crate's own code.
       - name: Launch minimal WinUI 3 smoke test (no subclassing/controls)
         shell: pwsh
         run: |
@@ -127,6 +127,43 @@ jobs:
             Write-Host "minimal_smoke_test exited on its own within 8 seconds (exit code $($proc.ExitCode) / $hex)"
           } else {
             Write-Host "minimal_smoke_test is still running after 8 seconds — did NOT crash"
+            Stop-Process -Id $proc.Id -Force
+          }
+
+      # Second bisection round, now that the fully-minimal test proved WinUI
+      # 3 itself works here: adds *only* `SetExtendsContentIntoTitleBar` +
+      # `SetTitleBar` (the custom title bar the real window uses, lib.rs
+      # around its `SetExtendsContentIntoTitleBar(true)` call) — still no
+      # HWND subclassing. The real app's trace ended right at
+      # `WM_DWMNCRENDERINGCHANGED`/`WM_SETCURSOR`, exactly the non-client-
+      # area/DWM interaction this feature depends on, making it at least as
+      # plausible a suspect as `install_hwnd_subclass`/`subclass_proc`'s raw
+      # `WNDPROC` interception (the other genuinely unusual piece of code in
+      # this window's setup, a workaround for winio-winui3's missing
+      # KeyDown/Closed delegates — see lib.rs's module doc comment).
+      - name: Launch title-bar WinUI 3 smoke test (no subclassing)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Get-ChildItem -Recurse -Filter "titlebar_smoke_test.exe" -Path target |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) {
+            Write-Error "titlebar_smoke_test.exe not found under target/ after build"
+            exit 1
+          }
+
+          $proc = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 8
+
+          Write-Host "--- titlebar-smoke-trace.log ---"
+          Get-Content "$env:GITHUB_WORKSPACE\titlebar-smoke-trace.log" -ErrorAction SilentlyContinue
+          Write-Host "--------------------------------"
+
+          if ($proc.HasExited) {
+            $hex = "0x{0:X8}" -f $proc.ExitCode
+            Write-Host "titlebar_smoke_test exited on its own within 8 seconds (exit code $($proc.ExitCode) / $hex)"
+          } else {
+            Write-Host "titlebar_smoke_test is still running after 8 seconds — did NOT crash"
             Stop-Process -Id $proc.Id -Force
           }
 
@@ -305,6 +342,7 @@ jobs:
             browser-windows-winui-stderr.log
             winui-trace.log
             minimal-smoke-trace.log
+            titlebar-smoke-trace.log
           if-no-files-found: ignore
 
       # Raw dumps, for offline analysis if `cdb` wasn't available on this

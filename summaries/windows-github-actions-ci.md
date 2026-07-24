@@ -188,10 +188,19 @@ job logs (`gh run view --log-failed` / the Actions API), not guessed at:
 
    Added `crates/browser-windows-winui/src/bin/minimal_smoke_test.rs`: the bare minimum WinUI 3 app (init,
    bootstrap, one plain `Window`, `Activate()`) — no subclassing, no custom title bar, no controls, no
-   `WebView2`. The workflow now builds and launches it (with its own `trace()` log, `minimal-smoke-trace.log`)
-   right after building the full app, non-fatally (informational only, doesn't fail the job either way). If it
-   survives past `WM_SETCURSOR` where the full app dies, that implicates one of the two suspects above rather
-   than a fundamental environment limitation. Not yet run.
+   `WebView2`. The workflow builds and launches it (with its own `trace()` log, `minimal-smoke-trace.log`)
+   right after building the full app, non-fatally.
+
+   **Ran it — conclusive result: `minimal_smoke_test` survived.** Every checkpoint logged through
+   `callback: run() returned Ok`, and the process was still running 8 seconds later — no crash at all. This
+   settles the "is it a fundamental GitHub Actions/no-GPU limitation" question for good: **no, WinUI 3 itself
+   works fine on this runner.** The bug is specific to something in `browser-windows-winui`'s own code, one of
+   the two suspects above.
+
+   Added a second bisection binary, `titlebar_smoke_test.rs`: identical to `minimal_smoke_test` plus *only*
+   `SetExtendsContentIntoTitleBar(true)` + `SetTitleBar(...)` — still no `install_hwnd_subclass`. If this one
+   also survives, that clears the custom title bar and points at the `subclass_proc` `WNDPROC` interception
+   instead; if it reproduces the crash, the custom title bar is confirmed as the cause. Not yet run.
 
 This is exactly the iteration loop the CI was built for: push, get a real failure, read the real log, fix the
 real bug, repeat — each round taking a couple of minutes rather than needing a physical Windows machine. It

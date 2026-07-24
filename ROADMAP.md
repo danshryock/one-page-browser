@@ -102,25 +102,37 @@ build/run instructions.
 
 ## Next
 
-Repo is now pushed to `danshryock/one-page-browser` (`git@github.com:danshryock/one-page-browser.git`).
-`.github/workflows/windows.yml` has already run for real once (on the push to `master`) — both jobs failed on
-their first real run, which is expected for code that had never actually executed anywhere but this dev
-machine's own local builds:
-- `test-core`: `cargo test -p browser-core` itself failed (not yet diagnosed — needs the real job log, which
-  needs an authenticated `gh`/API call this session doesn't have set up; see below).
-- `build-and-smoke-winui`: the `cargo build -p browser-windows-winui --target x86_64-pc-windows-msvc` step
-  failed (also not yet diagnosed).
+Repo is pushed to `danshryock/one-page-browser` (`git@github.com:danshryock/one-page-browser.git`), with `gh`
+installed and authenticated on this dev machine — real job logs are pulled via `gh run view --log-failed`/the
+Actions API, not guessed at.
 
-`.github/workflows/macos.yml` (new) has been written and pushed, mirroring the Windows workflow's
-`test-core`/`build-and-smoke-*` shape — its first run doubles as `browser-macos-appkit`'s first-ever real
-compile (see "Done" above — it's never been built anywhere before this).
+**`.github/workflows/macos.yml`** has passed completely on every run so far, including the full
+`build-and-smoke-appkit` job (build + launch + screenshot) — genuine confirmation `browser-macos-appkit`
+compiles and runs on real macOS, not just `cargo check`-clean on Linux.
 
-To actually debug either workflow's failures, real job logs are needed — GitHub's Actions log endpoints
-(both the whole-run `.../logs` zip and the per-job `.../jobs/{id}/logs`) return 403 to unauthenticated
-requests even for this public repo. `gh` (the GitHub CLI) isn't installed on this dev machine and installing
-it needs `sudo` (no passwordless sudo here) — so either the user installs+authenticates `gh` here (`sudo
-apt-get install -y gh && gh auth login`), or logs get pulled some other way, before the actual Windows/macOS
-CI failures can be diagnosed and fixed.
+**`.github/workflows/windows.yml`** — `test-core` (`cargo test -p browser-core` + `cargo check -p
+render-engine`) is fully green. `build-and-smoke-winui` still fails, but real progress: two genuine bugs found
+and fixed along the way (a Linux-only `clang-cl` path leaking into the native build via `.cargo/config.toml`;
+the Windows App SDK runtime install step silently swallowing its own exit code), and the remaining failure has
+been narrowed a long way through direct experimentation, not guesswork:
+- The app crashes at launch with `STATUS_STOWED_EXCEPTION` (`0xC000027B`) — Windows' fast-fail for an
+  unhandled exception — right around `WM_DWMNCRENDERINGCHANGED`/`WM_SETCURSOR`, well after a fully successful
+  startup (window built, page added, activated — proven via checkpoint tracing, see
+  `crates/browser-windows-winui/src/lib.rs`'s `trace()`, kept permanently rather than removed).
+- Forcing WARP (software) rendering for the app via `d3dconfig` — confirmed actually applied
+  (`ForceWARP=1` verified in the exported config) — made **no difference**, ruling out a simple GPU-driver
+  theory.
+- **`crates/browser-windows-winui/src/bin/minimal_smoke_test.rs`** (a bare-minimum WinUI 3 window, added for
+  this debugging session) **ran successfully with no crash at all** — proving WinUI 3 itself works fine on
+  this runner. The bug is specific to something in `browser-windows-winui`'s own code, not the environment.
+- Current leading suspects, both genuinely unusual code in the real window's setup (added a second bisection
+  binary, `titlebar_smoke_test.rs`, to narrow between them — not yet run):
+  1. `window.SetExtendsContentIntoTitleBar(true)` + `SetTitleBar(...)` (custom title bar) — matches the
+     DWM/non-client-area messages right before the crash.
+  2. `install_hwnd_subclass`/`subclass_proc` (raw `WNDPROC` interception, a workaround for `winio-winui3`'s
+     missing `KeyDown`/`Window::Closed` delegates).
+
+See `summaries/windows-github-actions-ci.md` for the full blow-by-blow.
 
 ## Backlog (not yet started, roughly in the order raised)
 
