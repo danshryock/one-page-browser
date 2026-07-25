@@ -210,11 +210,22 @@ don't work," "the page never renders") led to a careful re-diagnosis, not just a
   `ReactorWebViewEngine::navigate()`/`go_back()`/`go_forward()`/`reload()` were silently returning `Ok(())`
   when the webview wasn't ready yet, instead of a real error — meaning "successfully navigated" and
   "silently did nothing because not ready" were indistinguishable in logs, which got in the way of this
-  exact diagnosis. Fixed to return a real error instead. The underlying blank-page cause itself is still
-  open: it matches the same symptom seen throughout this VM's testing (believed to be this eval image's
-  `WebView2` Runtime, a separate component from the Windows App SDK), but since it was also reported on a
-  real machine, that explanation needs to be confirmed rather than assumed — worth checking whether the
-  WebView2 Runtime (not just Edge) is actually present there.
+  exact diagnosis. Fixed to return a real error instead. **Update**: the user confirmed `WebView2` itself
+  works fine on their machine (other `WebView2` apps run there), ruling out "runtime missing/broken" —
+  meaning the real explanation is a genuine initialization failure, not an absent dependency. The most
+  likely cause, given `WebView2`'s well-documented behavior for unpackaged apps: it defaults its user data
+  folder to a location *next to the executable*, which silently fails if that location isn't writable
+  (Program Files, a network share — every VM test this session ran the exe from exactly such a UNC path).
+  `windows-webview`'s reactor bridge makes this worse to diagnose: it doesn't bind
+  `CoreWebView2InitializedEventArgs`'s `Exception` property at all (checked by reading its generated
+  bindings — the vtable has no method beyond the `IInspectable` base), so a real initialization failure and
+  "never even tried" look identical from our code's perspective. Fixed by setting the documented
+  `WEBVIEW2_USER_DATA_FOLDER` override (in `main.rs`, before `bootstrap()` — must happen before the first
+  `WebView2` control initializes) to `%LOCALAPPDATA%\claude-browser\webview2`, a location guaranteed
+  writable by the current user regardless of where the exe lives. Not yet verified running (the VM's
+  interactive session became unreliable after ~12 hours of continuous use — window/focus issues, not a
+  code problem — so this fix is verified by compiling/reasoning about `WebView2`'s documented behavior, not
+  by a fresh screenshot yet).
 
 See `summaries/windows-github-actions-ci.md` for the full incremental build log.
 
