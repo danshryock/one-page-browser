@@ -1,3 +1,17 @@
+// Without this, rustc's default console subsystem gives this process a
+// real, visible console window in addition to the WinUI 3 window — seen
+// throughout manual testing as a black window titled with the exe's path,
+// sitting behind the actual app window. That extra window is a real,
+// reproducible source of focus/activation weirdness: mouse clicks on the
+// WinUI window were observed to reliably knock it out of the foreground
+// (confirmed still alive and unminimized via Task View every time —
+// `dispatch_action` never firing for the click, while the exact same
+// action fired correctly moments earlier via a keyboard accelerator),
+// while `keyboard` input kept working throughout. Suppressing the console
+// subsystem entirely removes the second window and whatever
+// activation/z-order interaction it was causing.
+#![windows_subsystem = "windows"]
+
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
 fn main() -> anyhow::Result<()> {
     browser_windows_reactor::trace("main: start");

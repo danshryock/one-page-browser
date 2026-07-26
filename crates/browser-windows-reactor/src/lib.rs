@@ -376,8 +376,21 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
 
     // Runs whatever `action` means — the shared target of every global
     // keyboard-accelerator dispatch built below. Mirrors
-    // `browser-windows-winui`'s `dispatch_action`: Bookmarks/EditUrl/reader
-    // mode aren't implemented on this front end either yet.
+    // `browser-windows-winui`'s `dispatch_action`: Bookmarks/reader mode
+    // aren't implemented on this front end either yet, same as there.
+    //
+    // `EditUrl` (Ctrl+L) is different from those: it's not merely unbuilt,
+    // it isn't *buildable* with what `windows-reactor` currently exposes.
+    // Focusing the address bar programmatically needs a `Focus()`-style
+    // call on the live `TextBox`, but neither `TextBox`
+    // (`widgets/text_box.rs`) nor `Element`/`Widget` expose any focus
+    // method, and there's no way to get a raw handle to the underlying
+    // XAML element from application code either (checked directly — the
+    // only place that ever touches a real `UIElement` for a mounted
+    // control is `host.rs`'s own reconciler, which doesn't hand it back
+    // out). So this dispatches correctly (confirmed via `trace` — Ctrl+L
+    // reliably reaches this match arm) but has nothing it *can* do yet:
+    // a real crate gap, not a missing feature on this end.
     let dispatch_action: Callback<Action> = Callback::new({
         let core = core.clone();
         let active_id = active_id.clone();
@@ -408,6 +421,8 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
                 }
                 Action::OpenSettings => open_settings.invoke(()),
                 Action::OpenProfilePicker => open_profile.invoke(()),
+                // EditUrl: see this closure's doc comment — not implementable
+                // with the crate's current API surface, not just unbuilt.
                 Action::ToggleBookmark | Action::OpenBookmarks | Action::EditUrl | Action::ToggleReaderMode => {}
             }
         }
@@ -463,13 +478,31 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     .column_spacing(8.0)
     .margin(Thickness::uniform(8.0));
 
-    // Real WinUI 3 `Microsoft.UI.Xaml.Controls.TitleBar`, hosting the
-    // toolbar in its `Content` slot — the reactor-native equivalent of
+    // Real WinUI 3 `Microsoft.UI.Xaml.Controls.TitleBar`, giving a native
+    // draggable custom title bar — the reactor-native equivalent of
     // `browser-windows-winui`'s manual `window.SetExtendsContentIntoTitleBar
-    // (true)` + `window.SetTitleBar(&toolbar)`. Gives a real draggable
-    // custom title bar area with the toolbar embedded in it, using the
-    // platform's own title-bar control instead of a plain content row.
-    let title_bar = Element::from(TitleBar::new("claude-browser").content(toolbar));
+    // (true)` + `window.SetTitleBar(...)`.
+    //
+    // The toolbar is deliberately *not* hosted in `TitleBar`'s `.content()`
+    // slot — an earlier version of this code did exactly that, and real
+    // testing in the dockur/windows VM found every click on that content
+    // (the address bar, the settings gear, all of it) silently did nothing:
+    // no `dispatch_action` ever fired for a button in there, confirmed via
+    // this module's own `trace` log, while the same actions fired
+    // correctly through `KeyboardAccelerator`s in the same session.
+    // `windows-reactor`'s `host.rs` wires whatever's in this slot up via
+    // `Window.SetTitleBar(element)`, which marks that element as the
+    // draggable caption region; real WinUI apps that put interactive
+    // controls inside a custom title bar have to separately register
+    // non-client hit-test passthrough rectangles
+    // (`InputNonClientPointerSource.SetRegionRects`) so clicks still reach
+    // them — `windows-reactor` doesn't do that anywhere in its own source
+    // (checked directly), so anything placed in `.content()` here is
+    // click-dead. Keeping `TitleBar` for the native drag/window-chrome area
+    // but rendering the toolbar as an ordinary row right below it sidesteps
+    // the problem entirely instead of fighting non-client hit testing from
+    // a crate that doesn't expose it.
+    let title_bar = Element::from(TitleBar::new("claude-browser"));
 
     // Every *loaded* page's webview stays mounted (see this module's doc
     // comment on why); the active one is pushed last so it paints on top.
@@ -548,11 +581,15 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     }
 
     trace("app: render end");
-    let mut rows = vec![title_bar.grid_row(0), Element::from(content).grid_row(1)];
+    let mut rows = vec![
+        title_bar.grid_row(0),
+        Element::from(toolbar).grid_row(1),
+        Element::from(content).grid_row(2),
+    ];
     if let Some(overlay_element) = overlay_element {
-        rows.push(overlay_element.grid_row(1));
+        rows.push(overlay_element.grid_row(2));
     }
-    let mut root: Element = grid(rows).rows([GridLength::Auto, GridLength::STAR]).into();
+    let mut root: Element = grid(rows).rows([GridLength::Auto, GridLength::Auto, GridLength::STAR]).into();
     for accel in accelerators {
         root = root.keyboard_accelerator(accel);
     }

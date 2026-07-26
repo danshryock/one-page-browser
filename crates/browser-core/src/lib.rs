@@ -26,7 +26,7 @@ pub use profile::{
 };
 pub use settings::{SearchEngine, Settings, Theme};
 
-pub const HOME_URL: &str = "about:blank";
+pub const HOME_URL: &str = "https://www.google.com";
 
 const PALETTE: &[&str] = &[
     "#3b6fd4", "#d4573b", "#3bd46f", "#8f3bd4", "#d4a63b", "#3bc7d4",

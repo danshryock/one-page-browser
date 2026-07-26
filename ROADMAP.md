@@ -193,39 +193,68 @@ itself unconditional rather than target-gated.
 section within the settings overlay (per explicit request — a worse fit as a separate entry point than in
 `browser-windows-winui`, where the extra toolbar icon made more sense). Two bug reports ("keyboard shortcuts
 don't work," "the page never renders") led to a careful re-diagnosis, not just a guess:
-- **Shortcuts**: confirmed working correctly via a rigorous retest in the VM (`Ctrl+T`, `Escape`,
-  address-bar Enter-to-navigate all fire — verified via trace logging, not assumption). The one *reported*
-  failure during testing turned out to be a testing artifact (not enough time for the newly-launched window
-  to claim real focus before sending input — confirmed by the fact keystrokes were landing on the launching
-  `cmd` window instead, visible in its own command history). There is one real, current, documented gap
-  though: `windows-webview`'s reactor bridge (`webview()`) doesn't expose the underlying `Controller` object,
-  so there's no way to wire up `Controller::on_accelerator_key_pressed` — meaning shortcuts genuinely won't
-  fire while keyboard focus is *inside* the `WebView2` content area itself (a real WinUI 3/WebView2
-  integration requirement, not specific to this codebase — see `shortcuts.rs`'s doc comment). If a user's
-  focus ends up there (plausible if they click into a blank/not-yet-rendered page trying to interact with
-  it), shortcuts won't reach the app until focus moves back out.
-- **Blank page**: root-caused to `on_ready` (the callback `windows-webview`'s `webview()` calls once
-  `WebView2` actually initializes) never firing — confirmed via trace logging showing zero occurrences
-  across a full navigate attempt. Also found and fixed a real bug in `engine.rs` along the way:
-  `ReactorWebViewEngine::navigate()`/`go_back()`/`go_forward()`/`reload()` were silently returning `Ok(())`
-  when the webview wasn't ready yet, instead of a real error — meaning "successfully navigated" and
-  "silently did nothing because not ready" were indistinguishable in logs, which got in the way of this
-  exact diagnosis. Fixed to return a real error instead. **Update**: the user confirmed `WebView2` itself
-  works fine on their machine (other `WebView2` apps run there), ruling out "runtime missing/broken" —
-  meaning the real explanation is a genuine initialization failure, not an absent dependency. The most
-  likely cause, given `WebView2`'s well-documented behavior for unpackaged apps: it defaults its user data
-  folder to a location *next to the executable*, which silently fails if that location isn't writable
-  (Program Files, a network share — every VM test this session ran the exe from exactly such a UNC path).
-  `windows-webview`'s reactor bridge makes this worse to diagnose: it doesn't bind
-  `CoreWebView2InitializedEventArgs`'s `Exception` property at all (checked by reading its generated
-  bindings — the vtable has no method beyond the `IInspectable` base), so a real initialization failure and
-  "never even tried" look identical from our code's perspective. Fixed by setting the documented
-  `WEBVIEW2_USER_DATA_FOLDER` override (in `main.rs`, before `bootstrap()` — must happen before the first
-  `WebView2` control initializes) to `%LOCALAPPDATA%\claude-browser\webview2`, a location guaranteed
-  writable by the current user regardless of where the exe lives. Not yet verified running (the VM's
-  interactive session became unreliable after ~12 hours of continuous use — window/focus issues, not a
-  code problem — so this fix is verified by compiling/reasoning about `WebView2`'s documented behavior, not
-  by a fresh screenshot yet).
+- **Blank page — real root cause found and fixed**: `on_ready` (the callback `windows-webview`'s
+  `webview()` calls once `WebView2` actually initializes) never fired, in *any* build, for the entire
+  session up to this point — confirmed by re-reading every trace log captured so far and finding zero
+  occurrences, ever, not just in one bad run. Decisive proof came from checking `tasklist` for
+  `msedgewebview2.exe`: zero instances, meaning `EnsureCoreWebView2Async()` (called by
+  `windows-webview`'s `reactor.rs`) never even got the browser process off the ground, regardless of the
+  `WEBVIEW2_USER_DATA_FOLDER` fix below. Root cause: the XAML `WebView2` control loads
+  `Microsoft.Web.WebView2.Core.dll` at runtime — per `windows-reactor-setup`'s own docs, this WinRT
+  projection assembly is *not* present on the machine by default (unlike the COM-only
+  `webview2loader.dll` the Evergreen runtime does supply), and is deployed only by that crate's
+  `as_self_contained()` path, never by `as_framework_dependent()` — the one this build actually uses.
+  Switching to `as_self_contained()` isn't a drop-in fix either: its own package staging shells out to
+  `%SystemRoot%\System32\curl.exe`/`tar.exe`, which only exist when build.rs *runs* on a real Windows
+  machine, not here, where it runs on this Linux host during `cargo xwin build` cross-compilation. Fixed
+  by adding `deploy_webview2_core_dll()` to `build.rs`: fetches the same `Microsoft.Web.WebView2` NuGet
+  package (pinned to the same version `windows-reactor-setup` uses) via Linux-native `curl`, extracts
+  `Microsoft.Web.WebView2.Core.dll` via `unzip` (a `.nupkg` is just a zip), and copies it next to the exe
+  — cached locally so it's only fetched once. **Verified working**: redeployed to the dockur/windows VM,
+  and for the first time all session, `on_ready: page 0 WebView2 ready` appeared in the trace log, six
+  `msedgewebview2.exe` processes were running, and `https://www.google.com` (see below) rendered as a
+  real page — logo, search box, nav links, all real, confirmed via screenshot.
+  Two smaller, real fixes made along the way while chasing this (neither was the actual blocker, but both
+  are genuine bugs):
+  - `ReactorWebViewEngine::navigate()`/`go_back()`/`go_forward()`/`reload()` (`engine.rs`) were silently
+    returning `Ok(())` when the webview wasn't ready yet, instead of a real error — masking "successfully
+    navigated" and "silently did nothing" as indistinguishable in logs. Fixed to return a real error.
+  - `WEBVIEW2_USER_DATA_FOLDER` set to `%LOCALAPPDATA%\claude-browser\webview2` (`main.rs`) — a real,
+    documented `WebView2` behavior (default user-data folder next to the exe fails silently on
+    unwritable paths like a UNC share), worth keeping, but not what was actually blocking rendering.
+  `HOME_URL` (`browser-core/src/lib.rs`) changed from `about:blank` to `https://www.google.com` — a real
+  page to actually exercise rendering against, not just prove `WebView2` initializes.
+- **Shortcuts**: confirmed working correctly via a rigorous retest in the VM (`Ctrl+T`, `Escape` all fire
+  — verified via trace logging, not assumption, across multiple fresh launches). One specific action,
+  `EditUrl` (`Ctrl+L`), *does* dispatch correctly (`dispatch_action: fired for EditUrl` traced reliably)
+  but has an intentionally-empty handler — not a bug, a real crate-level gap: focusing a control
+  programmatically needs a `Focus()`-style call neither `TextBox` nor `Element`/`Widget` expose anywhere
+  in `windows-reactor` (checked directly), and there's no way to get a raw handle to the underlying XAML
+  element from application code either. Documented in `lib.rs`'s `dispatch_action` doc comment rather than
+  silently left alongside genuinely-unbuilt features (bookmarks, reader mode).
+  There is still one *real*, documented, narrower gap: `windows-webview`'s reactor bridge (`webview()`)
+  doesn't expose the underlying `Controller` object, so there's no way to wire up
+  `Controller::on_accelerator_key_pressed` — meaning shortcuts genuinely won't fire while keyboard focus
+  is *inside* the `WebView2` content area itself (a real WinUI 3/WebView2 integration requirement, not
+  specific to this codebase — see `shortcuts.rs`'s doc comment).
+- **Toolbar was click-dead**: found by testing an actual toolbar click (the Settings gear icon) and
+  seeing zero `dispatch_action` trace, ever, while the same action fired instantly via a keyboard
+  accelerator moments earlier. Root cause: the toolbar was hosted inside `TitleBar::new(...)
+  .content(toolbar)` (`lib.rs`) — `windows-reactor`'s `host.rs` wires that slot up via
+  `Window.SetTitleBar(element)`, which marks it as the draggable caption region; real WinUI apps that put
+  interactive controls there need to separately register non-client hit-test passthrough rectangles
+  (`InputNonClientPointerSource.SetRegionRects`), which `windows-reactor` doesn't do anywhere in its own
+  source (checked directly). Fixed by moving the toolbar out of `.content()` into its own ordinary grid
+  row, right below a `TitleBar` that now hosts only the native drag/window-chrome area.
+- Also found and fixed a real, separate bug while investigating the click issue: the binary had no
+  `#![windows_subsystem = "windows"]` attribute, so it launched with a visible console window attached
+  (visible throughout manual testing as a black window titled with the exe's path) in addition to the
+  actual WinUI 3 window. Added the attribute; confirmed via Task View that only one window exists now.
+- **Still open, deprioritized per explicit direction**: clicking anywhere on the app window (toolbar or
+  content) still reliably knocks it out of the foreground in VM testing — confirmed still alive and
+  unminimized via Task View every time, just not topmost — even after both fixes above. Keyboard-driven
+  interaction is unaffected and confirmed reliable. Root cause not yet identified; set aside for now to
+  focus on rendering, not because it's resolved.
 
 See `summaries/windows-github-actions-ci.md` for the full incremental build log.
 
