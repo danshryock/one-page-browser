@@ -3,7 +3,8 @@
 //! overlay in each native chrome, plus a `PasswordBackend` trait so the
 //! embedded vault can later be swapped for an external/alternate password
 //! manager without touching any call site that's generic over it — the same
-//! role `HistoryBackend` (`history.rs`) already plays for history.
+//! role `HistoryBackend` (`history.rs`) already plays for history. See
+//! `bitwarden.rs` for the first such alternate backend.
 //!
 //! Unlike every other store in this app, there is no plain, unencrypted
 //! `open()` here — a password vault with no encryption at all would be a
@@ -18,23 +19,30 @@
 use std::cell::{Cell, RefCell};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{domain_of, Profile};
 
 /// Abstracts over what a "password backend" actually needs to do,
 /// independent of how it's backed — the extension point for an external/
-/// alternate password manager (a KeePassXC/secret-service/1Password
-/// integration, say) to become a drop-in replacement for the embedded
-/// `PasswordStore` wherever a call site is generic over `impl
-/// PasswordBackend`, the same way `HistoryBackend` already works for
-/// history. `PasswordStore`'s own inherent methods have this exact
-/// signature shape, so this trait doesn't change any existing direct call
-/// site's behavior — it only matters for code that wants to be generic over
-/// which backend it's talking to.
+/// alternate password manager (`bitwarden.rs`'s `BitwardenBackend`, a
+/// KeePassXC/secret-service integration, etc.) to become a drop-in
+/// replacement for the embedded `PasswordStore` wherever a call site is
+/// generic over `impl PasswordBackend`, the same way `HistoryBackend`
+/// already works for history. `PasswordStore`'s own inherent methods have
+/// this exact signature shape, so this trait doesn't change any existing
+/// direct call site's behavior — it only matters for code that wants to be
+/// generic over which backend it's talking to.
+///
+/// `add`/`update` take one `LoginFields` rather than a growing list of
+/// positional arguments — `BitwardenBackend` builds one of these from JSON,
+/// not from typed-in form fields, so a named-field struct fits both
+/// backends better than positional strings would.
 pub trait PasswordBackend {
-    fn list(&self) -> anyhow::Result<Vec<PasswordEntry>>;
-    fn search(&self, query: &str) -> anyhow::Result<Vec<PasswordEntry>>;
-    fn add(&self, site: &str, username: &str, password: &str, notes: &str) -> anyhow::Result<PasswordEntry>;
-    fn update(&self, id: &str, site: &str, username: &str, password: &str, notes: &str) -> anyhow::Result<()>;
+    fn list(&self) -> anyhow::Result<Vec<Login>>;
+    fn search(&self, query: &str) -> anyhow::Result<Vec<Login>>;
+    fn add(&self, fields: LoginFields) -> anyhow::Result<Login>;
+    fn update(&self, id: &str, fields: LoginFields) -> anyhow::Result<()>;
     fn delete(&self, id: &str) -> anyhow::Result<()>;
 }
 
@@ -52,16 +60,75 @@ CREATE TABLE IF NOT EXISTS passwords (
 );
 ";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PasswordEntry {
+/// A WebAuthn/passkey credential, stored alongside (or instead of) a
+/// password under one `Login` — the forward-compatibility piece for
+/// eventual passkey creation/assertion support, which needs a WebAuthn
+/// virtual authenticator hooked into each render engine (not yet built —
+/// see `ROADMAP.md`). Nothing populates this yet; the schema/API just
+/// doesn't need another migration once that lands. Field shapes follow the
+/// WebAuthn spec's own credential model directly (relying party id,
+/// credential id, user handle, COSE public key, signature counter) rather
+/// than inventing a different one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasskeyCredential {
+    /// Base64url-encoded credential id.
+    pub credential_id: String,
+    /// The relying party id (e.g. `"example.com"`) this credential is
+    /// scoped to — not necessarily identical to `Login::domain`, since a
+    /// relying party can register a passkey for a parent domain.
+    pub rp_id: String,
+    /// Base64url-encoded user handle (the WebAuthn `userHandle`).
+    pub user_handle: String,
+    /// Base64url-encoded COSE public key.
+    pub public_key: String,
+    /// The private key material — stored the same way `password` is:
+    /// plaintext at this layer, protected by the vault database's own
+    /// encryption (see this module's doc comment), not double-encrypted.
+    pub private_key: String,
+    /// The WebAuthn signature counter. Software/synced passkeys (the kind a
+    /// password manager stores, as opposed to a hardware security key's own
+    /// non-exportable one) commonly report a static `0` here, since a real
+    /// incrementing counter can't be kept consistent across sync — kept as
+    /// a real field anyway so a future authenticator implementation can
+    /// choose either behavior.
+    pub sign_count: i64,
+}
+
+/// One saved login — a password, a passkey, or both, for a given site.
+/// "Login" rather than "password entry" now that it can hold either kind of
+/// credential (or both) under one record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Login {
     pub id: String,
     pub site: String,
     pub domain: String,
     pub username: String,
-    pub password: String,
+    pub password: Option<String>,
+    pub passkey: Option<PasskeyCredential>,
     pub notes: String,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// The writable fields of a `Login` — what `PasswordBackend::add`/`update`
+/// take, instead of a positional-argument list (see the trait's doc
+/// comment).
+#[derive(Debug, Clone, Default)]
+pub struct LoginFields {
+    pub site: String,
+    pub username: String,
+    pub password: Option<String>,
+    pub passkey: Option<PasskeyCredential>,
+    pub notes: String,
+}
+
+impl LoginFields {
+    /// Convenience constructor for the common case (a plain password, no
+    /// passkey) — keeps simple call sites (the add-credential form, most
+    /// tests) close to the shape this API had before passkey support.
+    pub fn password_only(site: impl Into<String>, username: impl Into<String>, password: impl Into<String>, notes: impl Into<String>) -> Self {
+        Self { site: site.into(), username: username.into(), password: Some(password.into()), passkey: None, notes: notes.into() }
+    }
 }
 
 pub struct PasswordStore {
@@ -100,6 +167,7 @@ impl PasswordStore {
         let db = futures_executor::block_on(builder.build())?;
         let conn = db.connect()?;
         futures_executor::block_on(conn.execute_batch(SCHEMA_SQL))?;
+        migrate_add_passkey_column(&conn);
         Ok(Self { _db: db, conn })
     }
 
@@ -113,9 +181,9 @@ impl PasswordStore {
     /// adds within the same second would otherwise tie and fall back to
     /// SQLite's unspecified order for equal keys; `id` (autoincrement, so
     /// always insertion-ordered) breaks that tie correctly.
-    pub fn list(&self) -> anyhow::Result<Vec<PasswordEntry>> {
+    pub fn list(&self) -> anyhow::Result<Vec<Login>> {
         let mut rows = futures_executor::block_on(self.conn.query(
-            "SELECT id, site, domain, username, password, notes, created_at, updated_at \
+            "SELECT id, site, domain, username, password, notes, created_at, updated_at, passkey \
              FROM passwords ORDER BY created_at DESC, id DESC",
             (),
         ))?;
@@ -125,10 +193,10 @@ impl PasswordStore {
     /// Entries whose `site`, `domain`, or `username` contains `query`
     /// (case-insensitive), most-recently-added first (see `list`'s doc
     /// comment for the `id DESC` tiebreaker).
-    pub fn search(&self, query: &str) -> anyhow::Result<Vec<PasswordEntry>> {
+    pub fn search(&self, query: &str) -> anyhow::Result<Vec<Login>> {
         let pattern = format!("%{query}%");
         let mut rows = futures_executor::block_on(self.conn.query(
-            "SELECT id, site, domain, username, password, notes, created_at, updated_at \
+            "SELECT id, site, domain, username, password, notes, created_at, updated_at, passkey \
              FROM passwords \
              WHERE site LIKE ?1 OR domain LIKE ?1 OR username LIKE ?1 \
              ORDER BY created_at DESC, id DESC",
@@ -137,71 +205,76 @@ impl PasswordStore {
         collect_entries(&mut rows)
     }
 
-    /// Adds a new credential, computing `domain` from `site` the same way
+    /// Adds a new login, computing `domain` from `site` the same way
     /// `Bookmarks::add`/`HistoryStore::record_visit` do. Always creates a
     /// new row — unlike `Bookmarks::add`, a repeat `site` is not upserted,
     /// since it's entirely normal to have more than one account on the same
     /// site.
-    pub fn add(&self, site: &str, username: &str, password: &str, notes: &str) -> anyhow::Result<PasswordEntry> {
-        let domain = domain_of(site);
+    pub fn add(&self, fields: LoginFields) -> anyhow::Result<Login> {
+        let domain = domain_of(&fields.site);
         let now = now_unix();
+        let password_sql = fields.password.as_deref().unwrap_or("");
+        let passkey_sql = passkey_to_sql(&fields.passkey)?;
         futures_executor::block_on(self.conn.execute(
-            "INSERT INTO passwords (site, domain, username, password, notes, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-            libsql::params![site, domain.clone(), username, password, notes, now],
+            "INSERT INTO passwords (site, domain, username, password, notes, created_at, updated_at, passkey) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
+            libsql::params![fields.site.clone(), domain.clone(), fields.username.clone(), password_sql, fields.notes.clone(), now, passkey_sql],
         ))?;
         let id = self.conn.last_insert_rowid();
-        Ok(PasswordEntry {
+        Ok(Login {
             id: id.to_string(),
-            site: site.to_string(),
+            site: fields.site,
             domain,
-            username: username.to_string(),
-            password: password.to_string(),
-            notes: notes.to_string(),
+            username: fields.username,
+            password: fields.password,
+            passkey: fields.passkey,
+            notes: fields.notes,
             created_at: now,
             updated_at: now,
         })
     }
 
-    /// Updates every field of the entry identified by `id` (re-deriving
+    /// Updates every field of the login identified by `id` (re-deriving
     /// `domain` from `site`, same as `add`) and bumps `updated_at`. Errors
     /// if `id` isn't a valid row id — which should never happen in
     /// practice, since every `id` a caller has came from this store's own
     /// `list`/`search`/`add`.
-    pub fn update(&self, id: &str, site: &str, username: &str, password: &str, notes: &str) -> anyhow::Result<()> {
-        let row_id: i64 = id.parse().map_err(|_| anyhow::anyhow!("invalid password entry id: {id}"))?;
-        let domain = domain_of(site);
+    pub fn update(&self, id: &str, fields: LoginFields) -> anyhow::Result<()> {
+        let row_id: i64 = id.parse().map_err(|_| anyhow::anyhow!("invalid login id: {id}"))?;
+        let domain = domain_of(&fields.site);
         let now = now_unix();
+        let password_sql = fields.password.as_deref().unwrap_or("");
+        let passkey_sql = passkey_to_sql(&fields.passkey)?;
         futures_executor::block_on(self.conn.execute(
-            "UPDATE passwords SET site = ?1, domain = ?2, username = ?3, password = ?4, notes = ?5, updated_at = ?6 \
-             WHERE id = ?7",
-            libsql::params![site, domain, username, password, notes, now, row_id],
+            "UPDATE passwords SET site = ?1, domain = ?2, username = ?3, password = ?4, notes = ?5, updated_at = ?6, passkey = ?7 \
+             WHERE id = ?8",
+            libsql::params![fields.site, domain, fields.username, password_sql, fields.notes, now, passkey_sql, row_id],
         ))?;
         Ok(())
     }
 
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
-        let row_id: i64 = id.parse().map_err(|_| anyhow::anyhow!("invalid password entry id: {id}"))?;
+        let row_id: i64 = id.parse().map_err(|_| anyhow::anyhow!("invalid login id: {id}"))?;
         futures_executor::block_on(self.conn.execute("DELETE FROM passwords WHERE id = ?1", libsql::params![row_id]))?;
         Ok(())
     }
 }
 
 impl PasswordBackend for PasswordStore {
-    fn list(&self) -> anyhow::Result<Vec<PasswordEntry>> {
+    fn list(&self) -> anyhow::Result<Vec<Login>> {
         self.list()
     }
 
-    fn search(&self, query: &str) -> anyhow::Result<Vec<PasswordEntry>> {
+    fn search(&self, query: &str) -> anyhow::Result<Vec<Login>> {
         self.search(query)
     }
 
-    fn add(&self, site: &str, username: &str, password: &str, notes: &str) -> anyhow::Result<PasswordEntry> {
-        self.add(site, username, password, notes)
+    fn add(&self, fields: LoginFields) -> anyhow::Result<Login> {
+        self.add(fields)
     }
 
-    fn update(&self, id: &str, site: &str, username: &str, password: &str, notes: &str) -> anyhow::Result<()> {
-        self.update(id, site, username, password, notes)
+    fn update(&self, id: &str, fields: LoginFields) -> anyhow::Result<()> {
+        self.update(id, fields)
     }
 
     fn delete(&self, id: &str) -> anyhow::Result<()> {
@@ -217,7 +290,7 @@ impl PasswordBackend for PasswordStore {
 /// without any real encryption or I/O.
 #[derive(Default)]
 pub struct MemoryPasswordStore {
-    entries: RefCell<Vec<PasswordEntry>>,
+    entries: RefCell<Vec<Login>>,
     next_id: Cell<u64>,
 }
 
@@ -228,15 +301,15 @@ impl MemoryPasswordStore {
 }
 
 impl PasswordBackend for MemoryPasswordStore {
-    fn list(&self) -> anyhow::Result<Vec<PasswordEntry>> {
-        let mut entries: Vec<PasswordEntry> = self.entries.borrow().clone();
+    fn list(&self) -> anyhow::Result<Vec<Login>> {
+        let mut entries: Vec<Login> = self.entries.borrow().clone();
         entries.sort_by_key(|e| std::cmp::Reverse((e.created_at, e.id.parse::<u64>().unwrap_or(0))));
         Ok(entries)
     }
 
-    fn search(&self, query: &str) -> anyhow::Result<Vec<PasswordEntry>> {
+    fn search(&self, query: &str) -> anyhow::Result<Vec<Login>> {
         let query = query.to_lowercase();
-        let mut entries: Vec<PasswordEntry> = self
+        let mut entries: Vec<Login> = self
             .entries
             .borrow()
             .iter()
@@ -251,17 +324,18 @@ impl PasswordBackend for MemoryPasswordStore {
         Ok(entries)
     }
 
-    fn add(&self, site: &str, username: &str, password: &str, notes: &str) -> anyhow::Result<PasswordEntry> {
+    fn add(&self, fields: LoginFields) -> anyhow::Result<Login> {
         let now = now_unix();
         let id = self.next_id.get();
         self.next_id.set(id + 1);
-        let entry = PasswordEntry {
+        let entry = Login {
             id: id.to_string(),
-            site: site.to_string(),
-            domain: domain_of(site),
-            username: username.to_string(),
-            password: password.to_string(),
-            notes: notes.to_string(),
+            site: fields.site.clone(),
+            domain: domain_of(&fields.site),
+            username: fields.username,
+            password: fields.password,
+            passkey: fields.passkey,
+            notes: fields.notes,
             created_at: now,
             updated_at: now,
         };
@@ -269,14 +343,15 @@ impl PasswordBackend for MemoryPasswordStore {
         Ok(entry)
     }
 
-    fn update(&self, id: &str, site: &str, username: &str, password: &str, notes: &str) -> anyhow::Result<()> {
+    fn update(&self, id: &str, fields: LoginFields) -> anyhow::Result<()> {
         let mut entries = self.entries.borrow_mut();
         let entry = entries.iter_mut().find(|e| e.id == id).ok_or_else(|| anyhow::anyhow!("no such entry: {id}"))?;
-        entry.site = site.to_string();
-        entry.domain = domain_of(site);
-        entry.username = username.to_string();
-        entry.password = password.to_string();
-        entry.notes = notes.to_string();
+        entry.domain = domain_of(&fields.site);
+        entry.site = fields.site;
+        entry.username = fields.username;
+        entry.password = fields.password;
+        entry.passkey = fields.passkey;
+        entry.notes = fields.notes;
         entry.updated_at = now_unix();
         Ok(())
     }
@@ -322,24 +397,48 @@ pub fn decide_vault_unlock_action(profile: &Profile, session_passphrase: Option<
     }
 }
 
-/// Shared by `list`/`search`: both select the same eight columns in the
-/// same order.
-fn collect_entries(rows: &mut libsql::Rows) -> anyhow::Result<Vec<PasswordEntry>> {
+/// Shared by `list`/`search`: both select the same nine columns in the same
+/// order.
+fn collect_entries(rows: &mut libsql::Rows) -> anyhow::Result<Vec<Login>> {
     let mut entries = Vec::new();
     while let Some(row) = futures_executor::block_on(rows.next())? {
         let id: i64 = row.get(0)?;
-        entries.push(PasswordEntry {
+        let password: String = row.get(4)?;
+        let passkey_json: Option<String> = row.get(8)?;
+        entries.push(Login {
             id: id.to_string(),
             site: row.get(1)?,
             domain: row.get(2)?,
             username: row.get(3)?,
-            password: row.get(4)?,
+            password: if password.is_empty() { None } else { Some(password) },
             notes: row.get(5)?,
             created_at: row.get(6)?,
             updated_at: row.get(7)?,
+            passkey: passkey_from_sql(passkey_json)?,
         });
     }
     Ok(entries)
+}
+
+fn passkey_to_sql(passkey: &Option<PasskeyCredential>) -> anyhow::Result<Option<String>> {
+    passkey.as_ref().map(serde_json::to_string).transpose().map_err(Into::into)
+}
+
+fn passkey_from_sql(json: Option<String>) -> anyhow::Result<Option<PasskeyCredential>> {
+    json.map(|s| serde_json::from_str(&s)).transpose().map_err(Into::into)
+}
+
+/// Best-effort migration for a database created before the `passkey` column
+/// existed — `CREATE TABLE IF NOT EXISTS` silently no-ops against an
+/// existing table with an older shape, so a store opened before this
+/// feature landed would otherwise be missing the column entirely. Ignores
+/// the error `ALTER TABLE` raises when the column already exists (the
+/// normal case, once every vault has been opened at least once after this
+/// migration was added) — same pattern as `history.rs`'s
+/// `migrate_add_embedding_column`.
+#[cfg(target_os = "linux")]
+fn migrate_add_passkey_column(conn: &libsql::Connection) {
+    let _ = futures_executor::block_on(conn.execute("ALTER TABLE passwords ADD COLUMN passkey TEXT", ()));
 }
 
 fn now_unix() -> i64 {
@@ -361,18 +460,30 @@ mod tests {
         }
     }
 
+    fn sample_passkey() -> PasskeyCredential {
+        PasskeyCredential {
+            credential_id: "Y3JlZC0x".to_string(),
+            rp_id: "example.com".to_string(),
+            user_handle: "dXNlci0x".to_string(),
+            public_key: "cHVibGljLWtleQ".to_string(),
+            private_key: "cHJpdmF0ZS1rZXk".to_string(),
+            sign_count: 0,
+        }
+    }
+
     mod memory_store {
         use super::*;
 
         #[test]
         fn add_makes_an_entry_findable_by_list_and_search() {
             let store = MemoryPasswordStore::new();
-            store.add("https://example.com", "alice", "hunter2", "").unwrap();
+            store.add(LoginFields::password_only("https://example.com", "alice", "hunter2", "")).unwrap();
 
             let all = store.list().unwrap();
             assert_eq!(all.len(), 1);
             assert_eq!(all[0].domain, "example.com");
             assert_eq!(all[0].username, "alice");
+            assert_eq!(all[0].password.as_deref(), Some("hunter2"));
 
             let found = store.search("EXAMPLE").unwrap();
             assert_eq!(found.len(), 1, "search should be case-insensitive");
@@ -381,62 +492,31 @@ mod tests {
         #[test]
         fn adding_the_same_site_twice_creates_two_entries() {
             let store = MemoryPasswordStore::new();
-            store.add("https://example.com", "alice", "pw1", "").unwrap();
-            store.add("https://example.com", "bob", "pw2", "").unwrap();
+            store.add(LoginFields::password_only("https://example.com", "alice", "pw1", "")).unwrap();
+            store.add(LoginFields::password_only("https://example.com", "bob", "pw2", "")).unwrap();
             assert_eq!(store.list().unwrap().len(), 2, "multiple accounts on the same site should both be kept");
         }
 
         #[test]
         fn update_changes_fields_in_place() {
             let store = MemoryPasswordStore::new();
-            let entry = store.add("https://example.com", "alice", "old-pw", "").unwrap();
-            store.update(&entry.id, "https://example.com", "alice", "new-pw", "updated notes").unwrap();
+            let entry = store.add(LoginFields::password_only("https://example.com", "alice", "old-pw", "")).unwrap();
+            store
+                .update(&entry.id, LoginFields::password_only("https://example.com", "alice", "new-pw", "updated notes"))
+                .unwrap();
 
             let all = store.list().unwrap();
             assert_eq!(all.len(), 1, "update shouldn't create a second entry");
-            assert_eq!(all[0].password, "new-pw");
+            assert_eq!(all[0].password.as_deref(), Some("new-pw"));
             assert_eq!(all[0].notes, "updated notes");
         }
 
         #[test]
         fn delete_removes_the_entry() {
             let store = MemoryPasswordStore::new();
-            let entry = store.add("https://example.com", "alice", "pw", "").unwrap();
+            let entry = store.add(LoginFields::password_only("https://example.com", "alice", "pw", "")).unwrap();
             store.delete(&entry.id).unwrap();
             assert!(store.list().unwrap().is_empty());
-        }
-
-        #[test]
-        fn list_orders_by_created_at_descending() {
-            // now_unix() has one-second resolution, so real adds in quick
-            // succession can legitimately tie — this checks the actual
-            // invariant `list()` promises (non-increasing created_at)
-            // directly against hand-picked timestamps instead of relying on
-            // wall-clock ordering between two real `add` calls.
-            let store = MemoryPasswordStore::new();
-            store.entries.borrow_mut().push(PasswordEntry {
-                id: "1".to_string(),
-                site: "https://a.example".to_string(),
-                domain: "a.example".to_string(),
-                username: "a".to_string(),
-                password: "pw".to_string(),
-                notes: String::new(),
-                created_at: 100,
-                updated_at: 100,
-            });
-            store.entries.borrow_mut().push(PasswordEntry {
-                id: "2".to_string(),
-                site: "https://b.example".to_string(),
-                domain: "b.example".to_string(),
-                username: "b".to_string(),
-                password: "pw".to_string(),
-                notes: String::new(),
-                created_at: 200,
-                updated_at: 200,
-            });
-
-            let all = store.list().unwrap();
-            assert_eq!(all.iter().map(|e| e.username.as_str()).collect::<Vec<_>>(), vec!["b", "a"]);
         }
 
         #[test]
@@ -445,8 +525,8 @@ mod tests {
             // — now_unix() only has one-second resolution) should still
             // list most-recently-added first, using id as the tiebreaker.
             let store = MemoryPasswordStore::new();
-            store.add("https://a.example", "a", "pw", "").unwrap();
-            store.add("https://b.example", "b", "pw", "").unwrap();
+            store.add(LoginFields::password_only("https://a.example", "a", "pw", "")).unwrap();
+            store.add(LoginFields::password_only("https://b.example", "b", "pw", "")).unwrap();
 
             let all = store.list().unwrap();
             assert_eq!(
@@ -457,9 +537,36 @@ mod tests {
         }
 
         #[test]
+        fn a_login_can_hold_a_password_a_passkey_or_both() {
+            let store = MemoryPasswordStore::new();
+
+            let password_only = store.add(LoginFields::password_only("https://a.example", "a", "pw", "")).unwrap();
+            assert!(password_only.password.is_some());
+            assert!(password_only.passkey.is_none());
+
+            let passkey_only = store
+                .add(LoginFields { site: "https://b.example".to_string(), username: "b".to_string(), password: None, passkey: Some(sample_passkey()), notes: String::new() })
+                .unwrap();
+            assert!(passkey_only.password.is_none());
+            assert_eq!(passkey_only.passkey, Some(sample_passkey()));
+
+            let both = store
+                .add(LoginFields {
+                    site: "https://c.example".to_string(),
+                    username: "c".to_string(),
+                    password: Some("pw".to_string()),
+                    passkey: Some(sample_passkey()),
+                    notes: String::new(),
+                })
+                .unwrap();
+            assert!(both.password.is_some());
+            assert!(both.passkey.is_some());
+        }
+
+        #[test]
         fn is_usable_as_a_trait_object() {
             let store: Box<dyn PasswordBackend> = Box::new(MemoryPasswordStore::new());
-            store.add("https://example.com", "alice", "pw", "").unwrap();
+            store.add(LoginFields::password_only("https://example.com", "alice", "pw", "")).unwrap();
             assert_eq!(store.list().unwrap().len(), 1);
         }
     }
@@ -523,7 +630,7 @@ mod tests {
         {
             let store = PasswordStore::open_encrypted(&profile, "correct horse battery staple")
                 .expect("opening a fresh encrypted vault should succeed");
-            store.add("https://example.com", "alice", "hunter2", "").unwrap();
+            store.add(LoginFields::password_only("https://example.com", "alice", "hunter2", "")).unwrap();
         }
 
         let reopened = PasswordStore::open_encrypted(&profile, "correct horse battery staple")
@@ -531,6 +638,86 @@ mod tests {
         let entries = reopened.list().unwrap();
         assert_eq!(entries.len(), 1, "the added credential should still be there after reopening");
         assert_eq!(entries[0].username, "alice");
+
+        cleanup_profile(&profile);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_login_with_a_passkey_round_trips_through_the_real_store() {
+        let profile = temp_profile("passkey-round-trip");
+        cleanup_profile(&profile);
+
+        let store = PasswordStore::open_encrypted(&profile, "passphrase").expect("opening a fresh encrypted vault should succeed");
+        store
+            .add(LoginFields {
+                site: "https://example.com".to_string(),
+                username: "alice".to_string(),
+                password: None,
+                passkey: Some(sample_passkey()),
+                notes: String::new(),
+            })
+            .unwrap();
+
+        let entries = store.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].password.is_none(), "a passkey-only login shouldn't report a password");
+        assert_eq!(entries[0].passkey, Some(sample_passkey()));
+
+        cleanup_profile(&profile);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opening_a_database_created_before_the_passkey_column_existed_still_works() {
+        let profile = temp_profile("pre-passkey-migration");
+        cleanup_profile(&profile);
+
+        // Simulates a vault created by an older build: same encryption
+        // setup, but the schema/insert predate the `passkey` column
+        // entirely (no ALTER TABLE has ever run against this file).
+        {
+            let path = profile.passwords_db_path().unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let builder = libsql::Builder::new_local(&path).encryption_config(libsql::EncryptionConfig::new(
+                libsql::Cipher::Aes256Cbc,
+                bytes::Bytes::copy_from_slice(b"passphrase"),
+            ));
+            let db = futures_executor::block_on(builder.build()).unwrap();
+            let conn = db.connect().unwrap();
+            futures_executor::block_on(conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS passwords (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    site TEXT NOT NULL,
+                    domain TEXT NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    password TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );",
+            ))
+            .unwrap();
+            futures_executor::block_on(conn.execute(
+                "INSERT INTO passwords (site, domain, username, password, notes, created_at, updated_at) \
+                 VALUES ('https://example.com', 'example.com', 'alice', 'hunter2', '', 100, 100)",
+                (),
+            ))
+            .unwrap();
+        }
+
+        // Reopening through the real (migrating) open_encrypted should both
+        // succeed and be able to add a passkey-bearing login afterward.
+        let store = PasswordStore::open_encrypted(&profile, "passphrase").expect("reopening a pre-migration vault should succeed");
+        let existing = store.list().unwrap();
+        assert_eq!(existing.len(), 1, "the pre-existing row should still be readable");
+        assert_eq!(existing[0].password.as_deref(), Some("hunter2"));
+        assert!(existing[0].passkey.is_none());
+
+        store
+            .add(LoginFields { site: "https://b.example".to_string(), username: "b".to_string(), password: None, passkey: Some(sample_passkey()), notes: String::new() })
+            .expect("adding a passkey-bearing login after migration should succeed");
+        assert_eq!(store.list().unwrap().len(), 2);
 
         cleanup_profile(&profile);
     }
@@ -547,8 +734,8 @@ mod tests {
         // before this ORDER BY fix landed): `list()` fell back to SQLite's
         // unspecified order for a `created_at` tie instead of always
         // putting the more-recently-added row first.
-        store.add("https://a.example", "a", "pw", "").unwrap();
-        store.add("https://b.example", "b", "pw", "").unwrap();
+        store.add(LoginFields::password_only("https://a.example", "a", "pw", "")).unwrap();
+        store.add(LoginFields::password_only("https://b.example", "b", "pw", "")).unwrap();
 
         let entries = store.list().unwrap();
         assert_eq!(

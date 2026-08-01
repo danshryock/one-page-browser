@@ -642,6 +642,101 @@ fn password_vault_reuses_an_already_known_passphrase_with_no_second_prompt() {
     });
 }
 
+/// A fake local server standing in for `bw serve`, tracking a single
+/// locked/unlocked flag so a test can exercise the real locked → unlock →
+/// unlocked transition `rebuild_passwords_list` renders. Shuts down (via
+/// `Server::unblock`) when dropped — same technique as `browser-core`'s own
+/// `bitwarden.rs` tests, just not shared code (different crates).
+struct FakeBitwardenServer {
+    server: std::sync::Arc<tiny_http::Server>,
+    join: Option<std::thread::JoinHandle<()>>,
+    base_url: String,
+}
+
+impl Drop for FakeBitwardenServer {
+    fn drop(&mut self) {
+        self.server.unblock();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn spawn_fake_bitwarden_server() -> FakeBitwardenServer {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let unlocked = Arc::new(AtomicBool::new(false));
+    let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("binding a loopback test server should succeed"));
+    let addr = server.server_addr().to_ip().expect("this test server always binds an IP socket, not a unix one");
+    let base_url = format!("http://{addr}");
+    let server_for_thread = Arc::clone(&server);
+    let join = std::thread::spawn(move || {
+        while let Ok(request) = server_for_thread.recv() {
+            let (status, body) = match (request.method().to_string().as_str(), request.url()) {
+                ("GET", "/status") => {
+                    let status_str = if unlocked.load(Ordering::SeqCst) { "unlocked" } else { "locked" };
+                    (200, format!(r#"{{"success":true,"data":{{"template":{{"status":"{status_str}"}}}}}}"#))
+                }
+                ("POST", "/unlock") => {
+                    unlocked.store(true, Ordering::SeqCst);
+                    (200, r#"{"success":true}"#.to_string())
+                }
+                ("GET", "/list/object/items") => (
+                    200,
+                    r#"{"success":true,"data":{"data":[
+                        {"id":"1","type":1,"name":"Fake Bank","notes":"",
+                         "login":{"username":"carol","password":"pw","uris":[{"uri":"https://fakebank.example"}]}}
+                    ]}}"#
+                        .to_string(),
+                ),
+                _ => (404, r#"{"success":false,"message":"not found"}"#.to_string()),
+            };
+            let _ = request.respond(tiny_http::Response::from_string(body).with_status_code(status));
+        }
+    });
+    FakeBitwardenServer { server, join: Some(join), base_url }
+}
+
+#[test]
+fn bitwarden_section_reflects_locked_then_unlocked_state_and_lists_its_items() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("bitwarden-section");
+        let fake_server = spawn_fake_bitwarden_server();
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        // open_passwords() only reaches rebuild_passwords_list (and so the
+        // Bitwarden section) once the *local* vault is past its own setup/
+        // unlock prompt — unrelated to Bitwarden, but a fresh profile has
+        // neither set up yet, so this test's own local vault needs setting
+        // up first (same as `password_vault_setup_add_and_overlay_mutual_exclusion`).
+        assert!(app.try_open_vault_with("local vault passphrase", true), "setting up the local vault should succeed");
+
+        app.open_settings();
+        app.set_bitwarden_fields(true, &fake_server.base_url);
+        app.save_settings();
+
+        app.open_passwords();
+        assert!(
+            app.passwords_list_contains_text("Bitwarden is locked"),
+            "the Bitwarden section should show the locked state before unlocking"
+        );
+        assert!(!app.passwords_list_contains_text("carol"), "a locked Bitwarden shouldn't list any items yet");
+
+        // Drives the real backend the same way `show_bitwarden_unlock_prompt`
+        // would, minus its own GTK widgets — same "drive AppState/backend
+        // methods directly" approach the vault's own tests use.
+        app.bitwarden_backend().expect("Bitwarden should be enabled").unlock("anything").expect("the fake server always accepts unlock");
+
+        app.open_passwords(); // re-renders the list against the now-unlocked fake server
+        assert!(app.passwords_list_contains_text("carol"), "the fake server's item should show up in the Bitwarden section once unlocked");
+        assert!(app.passwords_list_contains_text("fakebank.example"));
+
+        app.close_passwords();
+        cleanup_test_profile(&profile);
+    });
+}
+
 #[test]
 fn edit_url_opens_switcher_with_current_url_selected_not_blanked() {
     run_on_gtk_thread(|| {

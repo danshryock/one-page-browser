@@ -13,8 +13,9 @@ use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use browser_core::{
-    decide_vault_unlock_action, domain_of, list_profile_names, resolve_address_input, Action, Bookmarks, HistoryStore, KeyChord,
-    Keybindings, PageManager, PasswordStore, Profile, Settings, Theme, VaultUnlockAction,
+    decide_vault_unlock_action, domain_of, list_profile_names, resolve_address_input, Action, BitwardenBackend, BitwardenStatus,
+    Bookmarks, HistoryStore, KeyChord, Keybindings, Login, LoginFields, PageManager, PasswordBackend, PasswordStore, Profile, Settings,
+    Theme, VaultUnlockAction,
 };
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
@@ -62,6 +63,8 @@ pub struct AppState {
     limit_spin: gtk::SpinButton,
     light_theme_radio: gtk::RadioButton,
     dark_theme_radio: gtk::RadioButton,
+    bitwarden_check: gtk::CheckButton,
+    bitwarden_url_entry: gtk::Entry,
     /// Holds only the theme-dependent CSS rules (see `theme_css`'s doc
     /// comment) — reloaded by `apply_theme` whenever the theme changes,
     /// unlike the separate, never-reloaded base provider set up once in
@@ -380,6 +383,16 @@ impl AppState {
             Theme::Light => self.light_theme_radio.set_active(true),
             Theme::Dark => self.dark_theme_radio.set_active(true),
         }
+        match &settings.bitwarden_server_url {
+            Some(url) => {
+                self.bitwarden_check.set_active(true);
+                self.bitwarden_url_entry.set_text(url);
+            }
+            None => {
+                self.bitwarden_check.set_active(false);
+                self.bitwarden_url_entry.set_text("");
+            }
+        }
         drop(settings);
         self.refresh_engine_combo();
         self.rebuild_engines_list();
@@ -414,6 +427,13 @@ impl AppState {
                 settings.default_search_engine = id.to_string();
             }
             settings.theme = if self.light_theme_radio.is_active() { Theme::Light } else { Theme::Dark };
+            settings.bitwarden_server_url = if self.bitwarden_check.is_active() {
+                let url = self.bitwarden_url_entry.text().to_string();
+                let url = url.trim();
+                Some(if url.is_empty() { "http://127.0.0.1:8087".to_string() } else { url.to_string() })
+            } else {
+                None
+            };
         }
         let new_limit = if self.unlimited_check.is_active() {
             None
@@ -845,45 +865,45 @@ impl AppState {
     /// A no-op (empty list) if the vault isn't currently unlocked — callers
     /// should only reach this after `try_open_vault_with`/
     /// `show_vault_passphrase_prompt` succeeds.
-    fn rebuild_passwords_list(self: &Rc<Self>) {
-        for child in self.passwords_list_box.children() {
-            self.passwords_list_box.remove(&child);
-        }
+    /// Builds a fresh `BitwardenBackend` from the current settings, if
+    /// Bitwarden integration is enabled. Cheap to construct (no network I/O
+    /// happens until a real call is made), so there's nothing to cache on
+    /// `AppState`: `bw serve` — a separate, already-running process — is
+    /// what actually owns the vault's lock state, not anything here. `pub`
+    /// so tests can unlock a fake `bw serve` directly, the same
+    /// test-facing-only reasoning as `try_open_vault_with`.
+    pub fn bitwarden_backend(&self) -> Option<BitwardenBackend> {
+        self.settings().bitwarden_server_url.clone().map(BitwardenBackend::new)
+    }
 
-        let entries = match &*self.passwords.borrow() {
-            VaultState::Unlocked(store) => store.list().unwrap_or_else(|err| {
-                eprintln!("failed to list password entries: {err}");
-                Vec::new()
-            }),
-            VaultState::Locked | VaultState::NotSetUp => Vec::new(),
-        };
+    /// One row for a `Login` — a label plus a Copy button, and (only for
+    /// entries the local vault owns) a "×" delete button. Bitwarden rows are
+    /// read-only in this overlay for now (see `rebuild_passwords_list`'s doc
+    /// comment) even though `BitwardenBackend::delete` is implemented for
+    /// real — `deletable` is what actually gates the button, not anything
+    /// about the `Login` itself.
+    fn build_login_row(self: &Rc<Self>, entry: &Login, deletable: bool) -> gtk::Box {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
 
-        if entries.is_empty() {
-            let empty_label = gtk::Label::new(Some("No saved passwords yet"));
-            empty_label.set_halign(gtk::Align::Start);
-            self.passwords_list_box.pack_start(&empty_label, false, false, 0);
-        }
-        for entry in entries {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let label_text = format!("{} \u{2014} {}", entry.domain, entry.username);
+        let label = gtk::Label::new(Some(&label_text));
+        label.set_halign(gtk::Align::Start);
+        label.set_hexpand(true);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        row.pack_start(&label, true, true, 0);
 
-            let label_text = format!("{} \u{2014} {}", entry.domain, entry.username);
-            let label = gtk::Label::new(Some(&label_text));
-            label.set_halign(gtk::Align::Start);
-            label.set_hexpand(true);
-            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            row.pack_start(&label, true, true, 0);
-
-            let copy_button = gtk::Button::with_label("Copy");
-            let password = entry.password.clone();
-            copy_button.connect_clicked(move |_| {
-                if let Some(display) = gtk::gdk::Display::default() {
-                    if let Some(clipboard) = gtk::Clipboard::default(&display) {
-                        clipboard.set_text(&password);
-                    }
+        let copy_button = gtk::Button::with_label("Copy");
+        let password = entry.password.clone().unwrap_or_default();
+        copy_button.connect_clicked(move |_| {
+            if let Some(display) = gtk::gdk::Display::default() {
+                if let Some(clipboard) = gtk::Clipboard::default(&display) {
+                    clipboard.set_text(&password);
                 }
-            });
-            row.pack_start(&copy_button, false, false, 0);
+            }
+        });
+        row.pack_start(&copy_button, false, false, 0);
 
+        if deletable {
             let remove_button = gtk::Button::with_label("\u{d7}");
             let app_clone = Rc::clone(self);
             let id = entry.id.clone();
@@ -891,9 +911,98 @@ impl AppState {
                 app_clone.delete_password_entry(&id);
             });
             row.pack_start(&remove_button, false, false, 0);
+        }
 
+        row
+    }
+
+    /// Rebuilds the password manager overlay's list from scratch, as two
+    /// separate sections rather than one list interleaved by timestamp:
+    /// "Saved" (the local vault) and, if Bitwarden integration is enabled,
+    /// "Bitwarden". They're kept separate because their timestamps aren't
+    /// comparable in any meaningful way (Bitwarden's own `revisionDate`
+    /// isn't even fetched — see `bitwarden.rs`), so merging them into one
+    /// sorted list would just be misleading. Bitwarden rows are read-only
+    /// here (Copy only, no delete/edit, and the add-credential form below
+    /// always writes to the local vault) — a deliberate, conservative
+    /// choice for this first pass, not a limitation of `BitwardenBackend`
+    /// itself (its `add`/`update`/`delete` are implemented for real).
+    fn rebuild_passwords_list(self: &Rc<Self>) {
+        for child in self.passwords_list_box.children() {
+            self.passwords_list_box.remove(&child);
+        }
+
+        let local_entries = match &*self.passwords.borrow() {
+            VaultState::Unlocked(store) => store.list().unwrap_or_else(|err| {
+                eprintln!("failed to list password entries: {err}");
+                Vec::new()
+            }),
+            VaultState::Locked | VaultState::NotSetUp => Vec::new(),
+        };
+
+        let saved_title = gtk::Label::new(Some("Saved"));
+        saved_title.set_halign(gtk::Align::Start);
+        saved_title.style_context().add_class("tile-subtitle");
+        self.passwords_list_box.pack_start(&saved_title, false, false, 0);
+        if local_entries.is_empty() {
+            let empty_label = gtk::Label::new(Some("No saved passwords yet"));
+            empty_label.set_halign(gtk::Align::Start);
+            self.passwords_list_box.pack_start(&empty_label, false, false, 0);
+        }
+        for entry in &local_entries {
+            let row = self.build_login_row(entry, true);
             self.passwords_list_box.pack_start(&row, false, false, 0);
         }
+
+        if let Some(backend) = self.bitwarden_backend() {
+            let bitwarden_title = gtk::Label::new(Some("Bitwarden"));
+            bitwarden_title.set_halign(gtk::Align::Start);
+            bitwarden_title.style_context().add_class("tile-subtitle");
+            self.passwords_list_box.pack_start(&bitwarden_title, false, false, 0);
+
+            match backend.status() {
+                Err(err) => {
+                    let label = gtk::Label::new(Some(&format!("Could not connect (is `bw serve` running?): {err}")));
+                    label.set_halign(gtk::Align::Start);
+                    label.set_line_wrap(true);
+                    self.passwords_list_box.pack_start(&label, false, false, 0);
+                }
+                Ok(BitwardenStatus::Locked) => {
+                    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                    let label = gtk::Label::new(Some("Bitwarden is locked"));
+                    label.set_halign(gtk::Align::Start);
+                    label.set_hexpand(true);
+                    row.pack_start(&label, true, true, 0);
+                    let unlock_button = gtk::Button::with_label("Unlock");
+                    let app_clone = Rc::clone(self);
+                    unlock_button.connect_clicked(move |_| {
+                        show_bitwarden_unlock_prompt(Rc::clone(&app_clone));
+                    });
+                    row.pack_start(&unlock_button, false, false, 0);
+                    self.passwords_list_box.pack_start(&row, false, false, 0);
+                }
+                Ok(BitwardenStatus::Unlocked) => match backend.list() {
+                    Ok(entries) if entries.is_empty() => {
+                        let label = gtk::Label::new(Some("No Bitwarden items"));
+                        label.set_halign(gtk::Align::Start);
+                        self.passwords_list_box.pack_start(&label, false, false, 0);
+                    }
+                    Ok(entries) => {
+                        for entry in &entries {
+                            let row = self.build_login_row(entry, false);
+                            self.passwords_list_box.pack_start(&row, false, false, 0);
+                        }
+                    }
+                    Err(err) => {
+                        let label = gtk::Label::new(Some(&format!("Failed to list Bitwarden items: {err}")));
+                        label.set_halign(gtk::Align::Start);
+                        label.set_line_wrap(true);
+                        self.passwords_list_box.pack_start(&label, false, false, 0);
+                    }
+                },
+            }
+        }
+
         self.passwords_list_box.show_all();
     }
 
@@ -921,9 +1030,13 @@ impl AppState {
         let username = self.new_password_username_entry.text().to_string();
         let password = self.new_password_password_entry.text().to_string();
         let notes = self.new_password_notes_entry.text().to_string();
+        // A blank password field means "no password" (None), not the empty
+        // string as a literal secret — matches how `Login::password` reads
+        // back from storage (see `passwords.rs`'s `collect_entries`).
+        let password = if password.trim().is_empty() { None } else { Some(password) };
 
         let result = match &*self.passwords.borrow() {
-            VaultState::Unlocked(store) => store.add(&site, &username, &password, &notes),
+            VaultState::Unlocked(store) => store.add(LoginFields { site, username, password, passkey: None, notes }),
             VaultState::Locked | VaultState::NotSetUp => return,
         };
         if let Err(err) = result {
@@ -1040,6 +1153,30 @@ impl AppState {
             VaultState::Unlocked(store) => store.list().unwrap_or_default().into_iter().map(|e| e.username).collect(),
             VaultState::Locked | VaultState::NotSetUp => Vec::new(),
         }
+    }
+
+    /// Whether any label anywhere in the password manager overlay's
+    /// rendered list currently displays text containing `needle` — test/
+    /// inspection helper. Walks the widget tree (rows/section titles/status
+    /// messages are nested `Box`/`Label` combinations, not one flat widget
+    /// type) rather than reading `Login`/`VaultState` data directly, since
+    /// this specifically exists to check what `rebuild_passwords_list`
+    /// actually rendered (e.g. the Bitwarden section), not the underlying
+    /// backend state `password_vault_usernames` already covers for the
+    /// local vault.
+    pub fn passwords_list_contains_text(&self, needle: &str) -> bool {
+        fn walk(widget: &gtk::Widget, needle: &str) -> bool {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                if label.text().contains(needle) {
+                    return true;
+                }
+            }
+            if let Some(container) = widget.downcast_ref::<gtk::Container>() {
+                return container.children().iter().any(|child| walk(child, needle));
+            }
+            false
+        }
+        self.passwords_list_box.children().iter().any(|child| walk(child, needle))
     }
 
     /// Bookmarks a URL directly, without needing to open it as a real page
@@ -1571,6 +1708,14 @@ impl AppState {
         self.light_theme_radio.set_active(true);
     }
 
+    /// Sets the settings overlay's Bitwarden checkbox/URL fields — test
+    /// helper for driving a Bitwarden-enable before calling `save_settings`,
+    /// same pattern as `select_light_theme_radio`.
+    pub fn set_bitwarden_fields(&self, enabled: bool, url: &str) {
+        self.bitwarden_check.set_active(enabled);
+        self.bitwarden_url_entry.set_text(url);
+    }
+
     /// The theme-provider's currently loaded CSS — test helper for
     /// confirming `apply_theme` actually reloaded it with the right
     /// theme's rules, not just that `Settings::theme` changed.
@@ -2007,6 +2152,19 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     theme_row.pack_start(&light_theme_radio, false, false, 0);
     settings_box.pack_start(&theme_row, false, false, 0);
 
+    // Bitwarden integration: a checkbox plus its server URL, always shown
+    // side by side (unlike the loaded-pages limit's conditionally-disabled
+    // spin button) since there's only one field to fill in.
+    let bitwarden_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let bitwarden_check = gtk::CheckButton::new();
+    bitwarden_check.set_label("Enable Bitwarden (via bw serve)");
+    let bitwarden_url_entry = gtk::Entry::new();
+    bitwarden_url_entry.set_placeholder_text(Some("http://127.0.0.1:8087"));
+    bitwarden_url_entry.set_hexpand(true);
+    bitwarden_row.pack_start(&bitwarden_check, false, false, 0);
+    bitwarden_row.pack_start(&bitwarden_url_entry, true, true, 0);
+    settings_box.pack_start(&bitwarden_row, false, false, 0);
+
     // Keybindings editor, folded into the settings overlay rather than
     // being its own separate destination — one row per `Action::ALL`,
     // rebuilt from the current `Keybindings` each time settings opens and
@@ -2210,6 +2368,8 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         limit_spin: limit_spin.clone(),
         light_theme_radio: light_theme_radio.clone(),
         dark_theme_radio: dark_theme_radio.clone(),
+        bitwarden_check: bitwarden_check.clone(),
+        bitwarden_url_entry: bitwarden_url_entry.clone(),
         theme_provider: theme_provider.clone(),
         profile_panel: profile_overlay.clone().upcast::<gtk::Widget>(),
         profile_list_box: profile_list_box.clone(),
@@ -2900,5 +3060,93 @@ fn show_vault_passphrase_prompt(app: Rc<AppState>, setup: bool) {
     {
         let try_unlock = Rc::clone(&try_unlock);
         passphrase_entry.connect_activate(move |_| try_unlock());
+    }
+}
+
+/// Shows a small standalone window collecting the Bitwarden account's
+/// master password, to unlock the `bw serve` instance backing
+/// `app.bitwarden_backend()` — entirely separate from, and unrelated to,
+/// this browser's own vault passphrase (`show_vault_passphrase_prompt`).
+/// Retries in place on a wrong password, same shape as that prompt.
+fn show_bitwarden_unlock_prompt(app: Rc<AppState>) {
+    let window = gtk::Window::new(gtk::WindowType::Toplevel);
+    window.set_title("Unlock Bitwarden");
+    window.set_default_size(420, 160);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin(16);
+
+    let prompt_label = gtk::Label::new(Some("Enter your Bitwarden master password to unlock it."));
+    prompt_label.set_line_wrap(true);
+    prompt_label.set_halign(gtk::Align::Start);
+    content.pack_start(&prompt_label, false, false, 0);
+
+    let password_entry = gtk::Entry::new();
+    password_entry.set_visibility(false);
+    password_entry.set_placeholder_text(Some("Bitwarden master password"));
+    content.pack_start(&password_entry, false, false, 0);
+
+    let error_label = gtk::Label::new(None);
+    error_label.set_halign(gtk::Align::Start);
+    content.pack_start(&error_label, false, false, 0);
+
+    let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    button_row.set_halign(gtk::Align::End);
+    let cancel_button = gtk::Button::with_label("Cancel");
+    let confirm_button = gtk::Button::with_label("Unlock");
+    button_row.pack_start(&cancel_button, false, false, 0);
+    button_row.pack_start(&confirm_button, false, false, 0);
+    content.pack_start(&button_row, false, false, 0);
+
+    window.add(&content);
+    window.show_all();
+
+    {
+        let window = window.clone();
+        cancel_button.connect_clicked(move |_| {
+            window.close();
+        });
+    }
+    // Same reasoning as `show_vault_passphrase_prompt`'s equivalent: a real
+    // browser window already exists underneath this one, so closing it
+    // (Cancel, Escape, the WM close button) should just dismiss the prompt,
+    // never quit the app.
+    window.connect_delete_event(|_, _| gtk::glib::Propagation::Proceed);
+
+    let try_unlock: Rc<dyn Fn()> = {
+        let window = window.clone();
+        let password_entry = password_entry.clone();
+        let error_label = error_label.clone();
+        let app = Rc::clone(&app);
+        Rc::new(move || {
+            let password = password_entry.text().to_string();
+            if password.is_empty() {
+                error_label.set_text("Password can't be empty.");
+                return;
+            }
+            let Some(backend) = app.bitwarden_backend() else {
+                error_label.set_text("Bitwarden is no longer enabled in settings.");
+                return;
+            };
+            match backend.unlock(&password) {
+                Ok(()) => {
+                    window.close();
+                    app.rebuild_passwords_list();
+                }
+                Err(err) => {
+                    error_label.set_text(&format!("Couldn't unlock Bitwarden: {err}"));
+                    password_entry.set_text("");
+                    password_entry.grab_focus();
+                }
+            }
+        })
+    };
+    {
+        let try_unlock = Rc::clone(&try_unlock);
+        confirm_button.connect_clicked(move |_| try_unlock());
+    }
+    {
+        let try_unlock = Rc::clone(&try_unlock);
+        password_entry.connect_activate(move |_| try_unlock());
     }
 }

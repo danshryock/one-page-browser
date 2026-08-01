@@ -15,3 +15,6 @@ gtk = "0.18"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 gtk-test = "0.18"
+# Test-only: a fake local server standing in for `bw serve`, same use as in
+# browser-core's own bitwarden.rs tests.
+tiny_http = "0.12"

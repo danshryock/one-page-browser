@@ -19,6 +19,21 @@ libsql = { version = "0.9", default-features = false, features = ["core"] }
 # already resolved transitively via libsql itself (see Cargo.lock), so this
 # adds no new crate to the build.
 futures-executor = "0.3"
+# For `bitwarden.rs`'s `BitwardenBackend`, talking to the `bw` CLI's local
+# `bw serve` REST API (see that module's doc comment). Synchronous by
+# design (no `.await` anywhere) — `PasswordBackend`'s trait methods are all
+# synchronous already, and this only ever talks to a loopback address, so
+# there's no async runtime to gain from and no TLS backend to pick (hence
+# `default-features = false` — this never makes an HTTPS request).
+ureq = { version = "3", default-features = false, features = ["json"] }
+
+[dev-dependencies]
+# Test-only: a tiny real HTTP server standing in for `bw serve` in
+# `bitwarden.rs`'s tests, so the actual request/response parsing gets
+# exercised end-to-end rather than through a mocked trait. Sync, no TLS,
+# small — a good fit for "fake server in a test," not shipped in the real
+# binary.
+tiny_http = "0.12"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `encryption` builds libsql-ffi's bundled SQLite3 Multiple Ciphers via

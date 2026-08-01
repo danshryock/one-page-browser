@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use render_engine::RenderEngine;
 
+mod bitwarden;
 mod bookmarks;
 mod embedding;
 mod history;
@@ -21,10 +22,11 @@ mod passwords;
 mod profile;
 mod settings;
 pub mod testing;
+pub use bitwarden::{BitwardenBackend, BitwardenStatus};
 pub use bookmarks::{Bookmark, Bookmarks};
 pub use history::{HistoryBackend, HistoryEntry, HistoryStore, MemoryHistoryStore};
 pub use keybindings::{Action, KeyChord, Keybindings};
-pub use passwords::{decide_vault_unlock_action, MemoryPasswordStore, PasswordBackend, PasswordEntry, PasswordStore, VaultUnlockAction};
+pub use passwords::{decide_vault_unlock_action, Login, LoginFields, MemoryPasswordStore, PasskeyCredential, PasswordBackend, PasswordStore, VaultUnlockAction};
 pub use profile::{
     launch_new_encrypted_profile_process, launch_new_ephemeral_process, launch_new_profile_process, list_profile_names,
     resolve_ephemeral_requested, resolve_passphrase_setup_requested, resolve_profile_name, resolve_url_argument, Profile,

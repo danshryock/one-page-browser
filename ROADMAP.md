@@ -47,18 +47,32 @@ build/run instructions.
 - Ctrl+Enter in the switcher's search box now forces a brand-new page open even when the typed text matches
   an open page/history entry (plain Enter still switches to a single match, as before). See
   `summaries/ctrl-enter-force-new-page.md`.
-- Password manager: `browser_core::passwords` (a `PasswordEntry` struct, a libsql-encrypted `PasswordStore`,
-  and a `PasswordBackend` trait — same pattern as `HistoryStore`/`HistoryBackend` — so an external/alternate
-  password manager can later be swapped in wherever code is generic over `impl PasswordBackend`) plus a
-  `browser-linux-gtk3` toolbar button and overlay (add/view/copy/delete credentials; no in-page autofill —
-  explicitly out of scope for this pass). The vault always requires a passphrase (no unencrypted mode, unlike
-  every other store in this app) — independent of `HistoryStore`'s own passphrase
-  (`Profile::has_vault_passphrase`/`enable_vault_passphrase`, separate marker file from
-  `Profile::has_passphrase`), but when a profile has both, they share one passphrase value: whichever store
-  gets unlocked first in a session caches the passphrase, and the other one reuses it silently, no second
-  prompt (see `browser_core::decide_vault_unlock_action`). `browser-windows-winui`/`browser-windows-reactor`/
-  `browser-macos-appkit` compile against the new module but have no overlay UI yet — same scope pattern as
-  bookmarks.
+- Password manager: `browser_core::passwords` (a `Login` struct — a password, a passkey, or both under one
+  record, see `PasskeyCredential` — a libsql-encrypted `PasswordStore`, and a `PasswordBackend` trait — same
+  pattern as `HistoryStore`/`HistoryBackend` — so an external/alternate password manager can later be swapped
+  in wherever code is generic over `impl PasswordBackend`) plus a `browser-linux-gtk3` toolbar button and
+  overlay (add/view/copy/delete credentials; no in-page autofill or actual passkey creation/assertion yet —
+  the schema is ready, but that needs a WebAuthn virtual authenticator hooked into each render engine, not
+  built). The vault always requires a passphrase (no unencrypted mode, unlike every other store in this app)
+  — independent of `HistoryStore`'s own passphrase (`Profile::has_vault_passphrase`/`enable_vault_passphrase`,
+  separate marker file from `Profile::has_passphrase`), but when a profile has both, they share one passphrase
+  value: whichever store gets unlocked first in a session caches the passphrase, and the other one reuses it
+  silently, no second prompt (see `browser_core::decide_vault_unlock_action`). `browser-windows-winui`/
+  `browser-windows-reactor`/`browser-macos-appkit` compile against the new module but have no overlay UI yet —
+  same scope pattern as bookmarks.
+- Bitwarden/Vaultwarden integration: `browser_core::bitwarden::BitwardenBackend`, a `PasswordBackend` impl
+  talking to a locally running `bw` CLI's `bw serve` (loopback-only REST API, JSON in/out) — Vaultwarden is
+  wire-compatible with real Bitwarden, so one backend covers both, no separate code path. Checks `/status`
+  itself and surfaces a distinguishable "locked" vs. "unreachable" error rather than assuming some other
+  process already unlocked it; `browser-linux-gtk3`'s password manager overlay renders Bitwarden entries in
+  their own read-only section (Copy only, no delete/edit — `add`/`update`/`delete` are implemented for real
+  against `bw serve`, just not wired to any button yet) alongside the local vault's, with a settings
+  checkbox + URL field (`Settings::bitwarden_server_url`) to enable it and a small "Unlock Bitwarden" prompt
+  when locked. **Caveat, called out in `bitwarden.rs`'s own doc comment**: there was no real `bw serve`
+  instance reachable to verify against while building this — the request/response shapes are this module's
+  best-effort understanding of `bw serve`'s conventions (confirmed synthetically via a fake local HTTP server
+  in its tests), not something confirmed against a live instance; whether `bw`'s login-item JSON exposes
+  FIDO2/passkey data at all is also unverified, so `BitwardenBackend` always reports `passkey: None`.
 - Separate `EditUrl`/`OpenSwitcher` actions (`browser-core` + `browser-linux-gtk3`): Ctrl+L now opens the
   switcher with the current URL preloaded and fully selected (not blanked); Ctrl+T/F1 keep the old
   blank-search behavior. See `summaries/edit-url-vs-new-page-actions.md`.
@@ -391,10 +405,21 @@ still untested).
   overlays is a smaller, separate follow-up.
 - `browser-windows-winui`: unified search/URL bar and bookmarks, matching what `browser-linux-gtk3` now has
   (both landed there only, per scope — see "Done" above).
-- External password manager integration — not attempted: which manager(s) and which integration protocol
-  (native messaging, a browser-extension-equivalent, direct API) is a real design decision, not something
-  to guess at unsupervised. `browser_core::PasswordBackend` (see "Done" above) is the extension point once
-  that decision is made.
+- Other external password managers beyond Bitwarden/Vaultwarden (see "Done" above for that one) — KeePassXC/
+  secret-service, 1Password, etc. Each would be its own `PasswordBackend` impl; no shared "generic external
+  manager" abstraction beyond the trait itself is needed until a second one is actually built.
+- Verify `BitwardenBackend`'s request/response shapes against a real `bw serve` instance — flagged as
+  unverified in its own doc comment, since none was reachable while building it. In particular: whether
+  `bw`'s login-item JSON exposes FIDO2/passkey data at all (`BitwardenBackend` always reports `passkey: None`
+  today, rather than guess), and whether `bw serve`'s in-memory unlocked state genuinely persists across
+  requests to the same process the way this code assumes.
+- Wire `BitwardenBackend::add`/`update`/`delete` (already implemented for real) into
+  `browser-linux-gtk3`'s overlay — today Bitwarden rows are read-only (Copy only) there; the add-credential
+  form always writes to the local vault. Needs a real UI decision (a "save to" picker) before doing this.
+- Actual passkey creation/assertion in pages — the schema (`PasskeyCredential`, see "Done" above) is ready,
+  but this needs a WebAuthn virtual authenticator hooked into `navigator.credentials.create()/get()` at the
+  render-engine layer, differently for WebKitGTK/WebView2/WKWebView — comparable in scope to the in-page
+  autofill item below, not something the schema work alone unblocks.
 - In-page autofill for the password manager (detecting login forms and injecting values into arbitrary
   third-party page DOMs) — needs `render-engine` JS-injection support that doesn't exist yet. Autofill
   correctness varies a lot site-to-site in ways headless fixture-page testing can't validate — this deserves

@@ -31,6 +31,12 @@ pub struct Settings {
     /// How many pages may stay loaded at once. `None` means unlimited.
     pub max_loaded_pages: Option<usize>,
     pub theme: Theme,
+    /// Base URL of a locally running `bw` CLI `bw serve` instance (e.g.
+    /// `"http://127.0.0.1:8087"`) — `None` means Bitwarden integration is
+    /// disabled. See `browser_core::BitwardenBackend`. `#[serde(default)]`
+    /// so a `settings.json` written before this field existed still parses.
+    #[serde(default)]
+    pub bitwarden_server_url: Option<String>,
 }
 
 impl Settings {
@@ -137,6 +143,7 @@ impl Default for Settings {
             // frontend's overlay/tile CSS was written assuming a dark
             // background) for anyone upgrading from before themes existed.
             theme: Theme::Dark,
+            bitwarden_server_url: None,
         }
     }
 }
@@ -171,6 +178,43 @@ mod tests {
         let path = temp_path("missing");
         let _ = std::fs::remove_file(&path); // in case a previous run left it
         assert!(Settings::load_from(&path).is_none());
+    }
+
+    #[test]
+    fn bitwarden_server_url_round_trips_and_defaults_to_none() {
+        let path = temp_path("bitwarden-round-trip");
+        let mut settings = Settings::default();
+        assert_eq!(settings.bitwarden_server_url, None, "Bitwarden integration should be disabled by default");
+
+        settings.bitwarden_server_url = Some("http://127.0.0.1:8087".to_string());
+        settings.save_to(&path).expect("save should succeed");
+        let loaded = Settings::load_from(&path).expect("load should find and parse the file");
+        assert_eq!(loaded.bitwarden_server_url.as_deref(), Some("http://127.0.0.1:8087"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_settings_file_written_before_bitwarden_server_url_existed_still_parses() {
+        let path = temp_path("pre-bitwarden-field");
+        // No `bitwarden_server_url` key at all — simulates a settings.json
+        // written by an older build, before this field was added.
+        std::fs::write(
+            &path,
+            r#"{
+                "start_page": "https://example.com",
+                "search_engines": [],
+                "default_search_engine": "",
+                "max_loaded_pages": null,
+                "theme": "Dark"
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = Settings::load_from(&path).expect("a settings.json missing this field should still parse");
+        assert_eq!(loaded.bitwarden_server_url, None, "a missing field should default to None, not fail to parse");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
