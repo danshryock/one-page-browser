@@ -45,6 +45,15 @@ build-windows-winui = "xwin build --target x86_64-pc-windows-msvc -p browser-win
 # comment).
 build-windows-reactor = "xwin build --target x86_64-pc-windows-msvc -p browser-windows-reactor"
 
+# browser-macos-appkit cross-compiles from Linux via `cargo zigbuild` (like
+# browser-wx's Windows build) plus a macOS SDK for the Apple framework
+# stubs the link step needs — neither of those can be reached through a
+# plain [alias] the way build-windows-winui/build-windows-reactor are
+# (cargo-xwin bundles its own SDK-fetcher; cargo-zigbuild needs Zig on PATH
+# and SDKROOT set up first, which aliases can't do). Use
+# .cargo/build-macos-appkit.sh instead (see README.md's
+# "browser-macos-appkit: building" section).
+
 # browser-core pulls in libsql, whose libsql-ffi dependency compiles a
 # bundled sqlite3.c via cc-rs for *every* target it's built for, including
 # x86_64-pc-windows-msvc. cargo-xwin sets CC/AR for that target to the bare

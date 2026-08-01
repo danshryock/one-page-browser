@@ -84,3 +84,16 @@ Known gaps, documented up front rather than silently left out:
 - `cargo build --target x86_64-pc-windows-gnu --workspace --exclude browser-wx` and `cargo build-windows-winui`:
   both still succeed, confirming the `render-engine`/workspace `Cargo.toml` changes didn't affect either
   existing Windows build path.
+
+## Update: feature parity + real Linux cross-compilation
+
+A later pass brought this crate to feature parity with `browser-windows-reactor`'s scope (multi-page via
+`PageManager<WryEngine>`, switcher/settings/profile overlays, keybindings editor folded into settings,
+`NSMenu`-based global shortcuts, an external-link chooser window — see `ROADMAP.md`'s "Done" entry for the
+full rundown and the honest list of what's still not implemented, e.g. bookmarks/theme). The "no macOS
+toolchain available, never compiled" limitation this file originally documented is also no longer true:
+`cargo zigbuild` plus an unofficial macOS SDK mirror (`.cargo/build-macos-appkit.sh`, see README.md) now
+produces real, linked Mach-O binaries for both `aarch64-apple-darwin` and `x86_64-apple-darwin` from this
+same Linux machine, and every change past this point has been compile-and-link checked that way before
+being pushed — a real improvement over eyeballing `objc2-app-kit`'s generated source, though still not a
+substitute for actually running the app, which still only happens on GitHub's native macOS runners.

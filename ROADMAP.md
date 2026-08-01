@@ -90,15 +90,40 @@ build/run instructions.
   Local VMs (Docker/KVM) were considered and rejected: a local macOS VM would violate Apple's EULA on
   non-Apple hardware, and `cross` only cross-compiles, it doesn't run foreign-OS binaries. See
   `summaries/windows-github-actions-ci.md`.
-- `browser-macos-appkit` (new crate) + `render-engine::macos`: a **minimal scaffold**, not feature parity —
-  a single native `NSWindow` with a toolbar strip (back/forward/reload `NSButton`s + an address-bar
-  `NSTextField`) and a `WKWebView` (via `wry`, embedded as a real AppKit view, no `tao`/`winit`, matching
-  every other front end's "native widget wraps native webview child" pattern), using `objc2`/`objc2-app-kit`.
-  Written and dependency-resolved/`cargo check`-clean on this Linux dev machine, but genuinely **never
-  compiled** — no macOS toolchain is available here, and (per the Windows CI entry above) a local macOS VM
-  isn't an option on this non-Apple hardware either. Needs a real compile pass (on real macOS, or a future
-  `macos-latest` GitHub Actions workflow) before it's trustworthy. See
-  `summaries/macos-appkit-scaffold.md`.
+- `browser-macos-appkit` (new crate) + `render-engine::macos`: brought to feature parity with
+  `browser-windows-reactor`'s scope — multi-page via `PageManager<WryEngine>` (a per-page container `NSView`,
+  shown/hidden on switch, load/unload eviction wired the same way as every other front end), switcher/
+  settings/profile overlays (plain vertical lists rather than a wrapping tile grid — `NSCollectionView` is a
+  much bigger lift than this pass had time for; a real, working simplification, not a stub), keybindings
+  editor folded into settings (same design `browser-windows-reactor` settled on per explicit user feedback),
+  global keyboard shortcuts via real `NSMenu` key equivalents (`shortcuts.rs`; `KeyChord::ctrl` maps to ⌘
+  Command on this platform, not literal Control — see that file's doc comment), and an external-link chooser
+  window. Deliberately *not* `browser-linux-gtk3`'s superset (no bookmarks, light/dark theme, encrypted
+  profiles — matches `browser-windows-winui`/`browser-windows-reactor`'s scope, a consistent bar across every
+  native-chrome-plus-`PageManager` front end, not gtk3's). One genuine improvement over both Windows front
+  ends: `EditUrl` (⌘L) actually works — AppKit's `NSWindow::makeFirstResponder` is a real, unrestricted
+  programmatic-focus API, unlike `windows-reactor`'s crate gap (see `browser-windows-reactor/src/lib.rs`'s
+  `dispatch_action` doc comment) or `winio-winui3`'s equivalent limitation.
+
+  Also now has a real cross-compile story from Linux for the first time (previously: "no macOS toolchain is
+  available here... needs a real compile pass"): `cargo zigbuild` (the same tool `browser-wx`'s Windows
+  cross-build already used) plus an unofficial mirror of Apple's SDK stub files
+  (`joseluisq/macosx-sdks` — a deliberate, discussed choice given the legal gray area of redistributed SDK
+  content, not an oversight; see README.md's "browser-macos-appkit: building" section for the full
+  reasoning) via `.cargo/build-macos-appkit.sh`, mirroring `.zig/`'s existing project-local convention.
+  Confirmed producing real, linked Mach-O binaries for both `aarch64-apple-darwin` and `x86_64-apple-darwin`
+  — every change here is now compile-and-link checked before pushing, not just eyeballed against
+  `objc2-app-kit`'s generated source. There's still no way to *run* a macOS binary from this Linux machine
+  (no Wine-for-macOS equivalent), so real behavioral verification still only happens on GitHub's native
+  macOS runners (see below) — treat runtime behavior as link-checked, not yet proven correct end-to-end.
+
+  `.github/workflows/macos.yml` now matrixes across both architectures on their own native runners —
+  `macos-14` (Apple Silicon, arm64) and `macos-13` (Intel, x64) — rather than cross-arch building one target
+  on the other's runner (would need Rosetta 2 to actually *run* the x64 binary on the arm64 runner, and
+  there's no reverse path for the arm64 binary on the Intel runner at all), plus `cargo test -p
+  browser-macos-appkit` to actually execute `shortcuts.rs`'s chord-conversion unit tests for the first time
+  (previously compile-checked only, via the crate being `#![cfg(target_os = "macos")]`-gated to an empty
+  stub everywhere else). See `summaries/macos-appkit-scaffold.md`.
 
 ## Next
 
@@ -262,9 +287,12 @@ Repo is pushed to `danshryock/one-page-browser` (`git@github.com:danshryock/one-
 installed and authenticated on this dev machine — real job logs are pulled via `gh run view --log-failed`/the
 Actions API, not guessed at.
 
-**`.github/workflows/macos.yml`** has passed completely on every run so far, including the full
-`build-and-smoke-appkit` job (build + launch + screenshot) — genuine confirmation `browser-macos-appkit`
-compiles and runs on real macOS, not just `cargo check`-clean on Linux.
+**`.github/workflows/macos.yml`** passed completely on every run against the original minimal scaffold,
+including the full `build-and-smoke-appkit` job (build + launch + screenshot) — genuine confirmation that
+version compiled and ran on real macOS, not just `cargo check`-clean on Linux. The substantially expanded,
+feature-parity version (multi-page, overlays, `NSMenu` shortcuts — see "Done" above) hasn't been through
+this workflow yet as of this writing: it's compile-and-link checked via the new Linux cross-compile path,
+but real behavior on native macOS hardware is still unconfirmed. Expect real iteration on the first run.
 
 **`.github/workflows/windows.yml`** — `test-core` (`cargo test -p browser-core` + `cargo check -p
 render-engine`) is fully green. `build-and-smoke-winui` (the `browser-windows-winui` build itself) also
@@ -334,9 +362,10 @@ still untested).
 
 ## Backlog (not yet started, roughly in the order raised)
 
-- `browser-macos-appkit`: bring it to feature parity with `browser-linux-gtk3` (switcher grid, settings/
-  bookmarks/keybindings/profile-picker overlays, history integration) — see "Done" above for what exists so
-  far (a minimal single-page scaffold only).
+- `browser-macos-appkit`: bookmarks, light/dark theme, and encrypted profiles — the parts of
+  `browser-linux-gtk3`'s scope neither Windows front end has either (see "Done" above for what's now at
+  parity). A wrapping tile grid (`NSCollectionView`) instead of the current plain-list switcher/profile
+  overlays is a smaller, separate follow-up.
 - `browser-windows-winui`: unified search/URL bar and bookmarks, matching what `browser-linux-gtk3` now has
   (both landed there only, per scope — see "Done" above).
 - External password manager integration — not attempted: which manager(s) and which integration protocol

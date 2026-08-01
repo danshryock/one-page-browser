@@ -305,6 +305,48 @@ The `.cargo/config.toml`'s `[env]` section pins `CC`/`AR` for this target to abs
 `/usr/lib/llvm-21/bin/` so this works from any terminal without needing `clang`/`llvm-lib` on `PATH`
 manually — if your system's LLVM install lives elsewhere, update those paths.
 
+### browser-macos-appkit: building
+
+Also cross-compile-only from this Linux dev machine — no macOS hardware here, and unlike Windows, there's
+no way to *run* a cross-compiled macOS binary locally either (no Wine equivalent). Real verification
+happens on GitHub's native macOS runners (see `.github/workflows/macos.yml`); this local build exists so a
+change can be compile-and-link checked before pushing, not to actually launch the app.
+
+Uses `cargo-zigbuild` again (same tool, same Zig toolchain as `browser-wx`'s Windows build above — one Zig
+install cross-compiles to *any* target it supports, Windows or macOS), plus a macOS SDK for the Apple
+framework `.tbd` stubs (`AppKit`, `WebKit`, `Foundation`, ...) the final link step needs, since Zig itself
+doesn't bundle those.
+
+**On the SDK's provenance**: there's no official, freely-redistributable way to get Apple's SDK — it
+normally comes bundled with Xcode, gated behind an Apple Developer account and a EULA that's squarely
+about *running macOS itself*, not about cross-compiling third-party software against SDK headers/stubs
+from a non-Apple host. This project uses an unofficial community mirror
+([`joseluisq/macosx-sdks`](https://github.com/joseluisq/macosx-sdks)) of just those headers/stubs — common
+practice in OSS cross-compilation CI (`osxcross`, `cargo-zigbuild`'s own docs point at similar mirrors),
+but genuinely a legal gray area, not something Apple has explicitly sanctioned. This was a deliberate,
+discussed choice (not an oversight) — reconsider it if that calculus matters for your use of this repo.
+
+```sh
+cargo install cargo-zigbuild
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+# Zig: see browser-wx's section above — same install works for both.
+
+# SDK: pick a recent release from https://github.com/joseluisq/macosx-sdks/releases
+# (this repo was set up against 14.0) and extract it under .macos-sdk/ (gitignored):
+mkdir -p .macos-sdk
+curl -fsSL -o /tmp/macos-sdk.tar.xz \
+    https://github.com/joseluisq/macosx-sdks/releases/download/14.0/MacOSX14.0.sdk.tar.xz
+tar -C .macos-sdk -xf /tmp/macos-sdk.tar.xz
+
+.cargo/build-macos-appkit.sh aarch64-apple-darwin   # or: x86_64-apple-darwin
+```
+
+Same reasoning as `run-wx-wine.sh` for why this is a script rather than a plain `[alias]`: `cargo-zigbuild`
+needs Zig on `PATH` and `SDKROOT` pointing at the extracted SDK, and Cargo aliases can only substitute
+arguments — they can't search the filesystem or set environment variables first. The script finds both
+under `.zig/`/`.macos-sdk/` automatically (falling back to whatever's already in your environment if those
+directories don't exist), the same way `run-wx-wine.sh` finds Zig.
+
 ## Testing
 
 `browser-core`'s page/tab-management logic (load/unload tracking, the loaded-pages limit) is pure state

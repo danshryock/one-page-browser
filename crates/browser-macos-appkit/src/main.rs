@@ -1,25 +1,33 @@
 #[cfg(target_os = "macos")]
 fn main() -> anyhow::Result<()> {
-    use browser_core::{resolve_profile_name, Profile};
-    use browser_macos_appkit::build_window_and_app;
+    use browser_core::Profile;
+    use browser_macos_appkit::{build_window_and_app, resolve_args, run_chooser};
 
     let args: Vec<String> = std::env::args().collect();
-    let profile = Profile::new(resolve_profile_name(args));
+    let (url, profile_name) = resolve_args(args);
 
-    // External-link chooser (see the other front ends' `--url`-argument
-    // handling) isn't scaffolded here yet — this crate only ever opens
-    // `settings.start_page`, matching its "minimal, single-page" scope (see
-    // lib.rs's module doc comment).
-    let app = build_window_and_app(profile)?;
-    app.run();
-    Ok(())
+    match url {
+        // Matches the other front ends' `--url`-argument handoff: launched
+        // with a URL (e.g. from the OS's "open with"/default-browser
+        // handling) shows the small profile-picker chooser first, rather
+        // than opening the real browser window directly.
+        Some(url) => run_chooser(url, profile_name),
+        None => {
+            let profile = Profile::new(profile_name);
+            let app = build_window_and_app(profile)?;
+            app.run();
+            Ok(())
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
     eprintln!(
         "browser-macos-appkit is a macOS-only binary; nothing to run on this platform. \
-         Build with --target aarch64-apple-darwin/x86_64-apple-darwin on real macOS (see ROADMAP.md — \
-         this crate has no cross-compile story from Linux, unlike browser-windows-winui/win32/nwg)."
+         Build with --target aarch64-apple-darwin/x86_64-apple-darwin on real macOS, or cross-compile \
+         from Linux via .cargo/build-macos-appkit.sh (see README.md's \"browser-macos-appkit: building\" \
+         section) — same as browser-windows-winui/win32/nwg, just still never actually run this way, \
+         since there's no macOS equivalent of running the cross-compiled .exe under Wine."
     );
 }

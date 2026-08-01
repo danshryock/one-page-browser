@@ -9,3 +9,10 @@
 # Windows (see README.md's "browser-wx: building and running" section) -
 # a large, machine-specific binary artifact, not project source.
 /.zig
+
+# macOS SDK (framework .tbd stubs etc.) used by `cargo zigbuild` to
+# cross-compile browser-macos-appkit from Linux (see README.md's
+# "browser-macos-appkit: building" section) - a large (~1.5GB), unofficial
+# mirror of Apple SDK content, not project source. See that section for
+# provenance/licensing notes before assuming this is redistributable.
+/.macos-sdk

@@ -1,13 +1,25 @@
 name: macOS
 
-# Runs on GitHub's real macos-latest runners (genuine Apple hardware,
-# license-compliant — see summaries/windows-github-actions-ci.md's "why not
-# local VMs" section for why this couldn't be a local VM instead). This is
-# also the very first time browser-macos-appkit / render-engine::macos get
+# Runs on GitHub's real macOS runners (genuine Apple hardware, license-
+# compliant — see summaries/windows-github-actions-ci.md's "why not local
+# VMs" section for why this couldn't be a local VM instead). This is also
+# the very first time browser-macos-appkit / render-engine::macos get
 # compiled at all: they were written on a Linux dev machine with no macOS
-# toolchain available, so this workflow doubles as that scaffold's first
+# hardware available, so this workflow doubles as that scaffold's first
 # real correctness check (see summaries/macos-appkit-scaffold.md). Expect
 # this to need real iteration on its first few runs.
+#
+# Matrixed across both architectures Apple ships, each on its own native
+# runner type — macos-14 (Apple Silicon, arm64) and macos-13 (Intel, x64) —
+# rather than cross-arch building one target on the other's runner. That
+# would need Rosetta 2 to actually *run* an x64 binary on the arm64 runner
+# (available there, but not the reverse: macos-13's Intel runner can't run
+# an arm64 binary at all), so two native runners is both simpler and a more
+# realistic test than leaning on translation for half the matrix. This is
+# also how `.cargo/build-macos-appkit.sh` (this repo's Linux cross-compile
+# path — see README.md's "browser-macos-appkit: building" section) targets
+# the same two triples; this workflow is the real, native-hardware check
+# that build is only ever compile-and-link-checked for locally.
 
 # Manual runs (workflow_dispatch) or a pushed tag matching v*.* -- NOT every
 # push to master. See windows.yml's matching comment for why: macOS Actions
@@ -23,8 +35,16 @@ on:
 
 jobs:
   test-core:
-    name: Test browser-core + check render-engine (native macOS)
-    runs-on: macos-latest
+    name: Test browser-core + check render-engine (native macOS, ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            os: macos-14
+          - arch: x64
+            os: macos-13
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -39,15 +59,35 @@ jobs:
       - name: cargo check -p render-engine
         run: cargo check -p render-engine --verbose
 
+      # shortcuts.rs's chord<->NSMenuItem-key-equivalent unit tests — never
+      # run on Linux (the whole crate is `#![cfg(target_os = "macos")]`
+      # gated, so it's an empty stub there), only compile-and-link checked
+      # via `.cargo/build-macos-appkit.sh`'s cross-compile from Linux. This
+      # is genuinely the first time they ever execute.
+      - name: cargo test -p browser-macos-appkit
+        run: cargo test -p browser-macos-appkit --verbose
+
   build-and-smoke-appkit:
-    name: Build + launch browser-macos-appkit (native macOS)
-    runs-on: macos-latest
+    name: Build + launch browser-macos-appkit (native macOS, ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+          - arch: x64
+            os: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build -p browser-macos-appkit --verbose
+        run: cargo build --target ${{ matrix.target }} -p browser-macos-appkit --verbose
 
       # The compiled binary itself, downloadable from the run's Actions
       # summary page — for running locally (a real Mac, or a future macOS
@@ -55,17 +95,19 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: browser-macos-appkit-binary
-          path: target/debug/browser-macos-appkit
+          name: browser-macos-appkit-binary-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/debug/browser-macos-appkit
           if-no-files-found: error
 
-      # macos-latest runners have a real interactive desktop session (like
+      # Both runner types have a real interactive desktop session (like
       # windows-latest, unlike the headless Linux runners), so this can
-      # actually launch the window and screenshot it.
+      # actually launch the window and screenshot it — natively, no Rosetta
+      # involved, since each target only ever runs on its matching arch's
+      # own runner.
       - name: Launch and screenshot
         run: |
           set -euo pipefail
-          bin="target/debug/browser-macos-appkit"
+          bin="target/${{ matrix.target }}/debug/browser-macos-appkit"
           if [ ! -x "$bin" ]; then
             echo "browser-macos-appkit binary not found at $bin after build" >&2
             exit 1
@@ -80,13 +122,13 @@ jobs:
             exit 1
           fi
 
-          screencapture -x browser-macos-appkit-screenshot.png
+          screencapture -x "browser-macos-appkit-screenshot-${{ matrix.arch }}.png"
           kill "$app_pid"
 
       - name: Upload screenshot
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: browser-macos-appkit-screenshot
-          path: browser-macos-appkit-screenshot.png
+          name: browser-macos-appkit-screenshot-${{ matrix.arch }}
+          path: browser-macos-appkit-screenshot-${{ matrix.arch }}.png
           if-no-files-found: ignore
