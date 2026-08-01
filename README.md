@@ -38,6 +38,9 @@ under Wine.
 
 ## Installing dependencies
 
+Everything below is still manual, run-by-hand setup — see `BUILD_AUTOMATION.md` for what's already
+automated, what isn't yet, and the planned scripts that would close the gap.
+
 ### Rust
 
 Install via [rustup](https://rustup.rs):
