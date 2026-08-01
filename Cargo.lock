@@ -132,6 +132,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "browser-chrome-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "browser-core",
+ "render-engine",
+]
+
+[[package]]
 name = "browser-core"
 version = "0.1.0"
 dependencies = [
@@ -162,6 +171,7 @@ name = "browser-macos-appkit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "browser-chrome-core",
  "browser-core",
  "objc2",
  "objc2-app-kit",
@@ -174,6 +184,7 @@ name = "browser-windows-reactor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "browser-chrome-core",
  "browser-core",
  "render-engine",
  "windows-reactor",

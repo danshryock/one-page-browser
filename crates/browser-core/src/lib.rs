@@ -19,6 +19,7 @@ mod history;
 mod keybindings;
 mod profile;
 mod settings;
+pub mod testing;
 pub use bookmarks::{Bookmark, Bookmarks};
 pub use history::{HistoryBackend, HistoryEntry, HistoryStore, MemoryHistoryStore};
 pub use keybindings::{Action, KeyChord, Keybindings};
@@ -282,40 +283,10 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// Trivial `RenderEngine` for testing `PageManager`'s pure bookkeeping
-    /// logic without any real webview/GTK involved — just enough to satisfy
-    /// the trait bound `matching_ids`/`page_matches_query` need.
-    struct MockEngine {
-        url: RefCell<String>,
-    }
-
-    impl MockEngine {
-        fn new(url: &str) -> Self {
-            Self { url: RefCell::new(url.to_string()) }
-        }
-    }
-
-    impl RenderEngine for MockEngine {
-        fn navigate(&self, url: &str) -> anyhow::Result<()> {
-            *self.url.borrow_mut() = url.to_string();
-            Ok(())
-        }
-        fn current_url(&self) -> anyhow::Result<String> {
-            Ok(self.url.borrow().clone())
-        }
-        fn go_back(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn go_forward(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn reload(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn screenshot(&self, callback: Box<dyn Fn(anyhow::Result<Vec<u8>>)>) {
-            callback(Ok(Vec::new()));
-        }
-    }
+    // `MockEngine` now lives in `testing.rs` (not `#[cfg(test)]`-gated
+    // there, since other crates' tests need to import it too — see that
+    // module's doc comment) — reused here rather than duplicated.
+    use crate::testing::MockEngine;
 
     fn insert_page(mgr: &mut PageManager<MockEngine>, url: &str) -> String {
         let id = mgr.allocate_id();

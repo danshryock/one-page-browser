@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 browser-core = { path = "../browser-core" }
+browser-chrome-core = { path = "../browser-chrome-core" }
 # For the RenderEngine trait, so PageManager<ReactorWebViewEngine> (see
 # src/engine.rs) can be reused as-is rather than reinvented. The impl itself
 # stays local to this crate (not in render-engine, alongside WebView2Engine)

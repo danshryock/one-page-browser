@@ -1,0 +1,10 @@
+[package]
+name = "browser-chrome-core"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+browser-core = { path = "../browser-core" }
+render-engine = { path = "../render-engine" }
+anyhow = "1"

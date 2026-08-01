@@ -83,8 +83,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use browser_core::{
-    domain_of, launch_new_profile_process, list_profile_names, resolve_address_input, Action, HistoryEntry, HistoryStore,
-    KeyChord, Keybindings, PageManager, Profile, Settings, HOME_URL,
+    launch_new_profile_process, list_profile_names, resolve_address_input, Action, HistoryStore, KeyChord, Keybindings,
+    PageManager, Profile, Settings, HOME_URL,
 };
 use engine::ReactorWebViewEngine;
 use windows_reactor::*;
@@ -110,16 +110,18 @@ struct Shared {
     profile: Profile,
 }
 
-/// One entry in the switcher's tile grid — mirrors
-/// `browser-windows-winui`'s `rebuild_switcher_grid`: open pages matching
-/// the search query, a trailing "add page" tile, then history matches (only
-/// once there's a query, and only for URLs not already open).
-#[derive(Clone)]
-enum Tile {
-    Open { id: String, title: String, domain: String },
-    Add,
-    History { url: String, title: String, domain: String },
-}
+// The switcher's tile list used to be a local `Tile` enum + hand-copied
+// row-building here — now `browser_chrome_core::{SwitcherRow,
+// build_switcher_rows, activate_row}` (see `ARCHITECTURE.md` §3.2/§4: the
+// exact same decision logic was independently hand-copied in
+// `browser-linux-gtk3`/`browser-macos-appkit` too, and is now unit-tested
+// once, toolkit-free, instead of manually in three places). Also restores
+// the per-page palette `color` this crate's `Tile` never carried (dropped
+// when it was first built, relative to `browser-linux-gtk3`'s tiles) —
+// `SwitcherRow::Open` carries it now, even though `tile_element` below
+// doesn't render it yet (no background-color builder found on
+// `windows-reactor`'s `Element`/`vstack` in the time this pass had;
+// rendering it is a smaller, separate follow-up).
 
 /// Mutually exclusive, mirroring `browser-windows-winui`'s
 /// close_switcher/close_settings/close_profile_picker — opening any one of
@@ -705,41 +707,7 @@ fn switcher_overlay(
     add_page_and_switch: Callback<String>,
     close_page: Callback<String>,
 ) -> Grid {
-    let open_matches = core.borrow().matching_ids(search_query);
-    let mut tiles: Vec<Tile> = Vec::new();
-    {
-        let core = core.borrow();
-        for page in core.pages() {
-            if !open_matches.contains(&page.id) {
-                continue;
-            }
-            let title = page.title.borrow().clone();
-            let title = if title.is_empty() { "New Page".to_string() } else { title };
-            let url = page.current_url();
-            let domain = domain_of(&url);
-            let domain = if page.loaded { domain } else { format!("{domain} \u{b7} unloaded") };
-            tiles.push(Tile::Open { id: page.id.clone(), title, domain });
-        }
-    }
-    tiles.push(Tile::Add);
-
-    if !search_query.trim().is_empty() {
-        let open_urls: Vec<String> = core.borrow().pages().iter().map(|p| p.current_url()).collect();
-        let history_matches: Vec<HistoryEntry> = shared
-            .history
-            .search(search_query, 8)
-            .unwrap_or_else(|err| {
-                eprintln!("history search failed: {err}");
-                Vec::new()
-            })
-            .into_iter()
-            .filter(|entry| !open_urls.contains(&entry.url))
-            .collect();
-        for entry in history_matches {
-            let title = if entry.title.is_empty() { "New Page".to_string() } else { entry.title };
-            tiles.push(Tile::History { url: entry.url, title, domain: format!("{} \u{b7} history", entry.domain) });
-        }
-    }
+    let tiles = browser_chrome_core::build_switcher_rows(&core.borrow(), &shared.history, search_query);
 
     let start_page = shared.settings.borrow().start_page.clone();
     let tiles_for_select = tiles.clone();
@@ -748,11 +716,10 @@ fn switcher_overlay(
         .with_key_selector(tile_key)
         .selected_index(-1)
         .on_selection_changed(move |idx: i32| {
-            let Some(tile) = tiles_for_select.get(idx.max(0) as usize) else { return };
-            match tile {
-                Tile::Open { id, .. } => switch_to.invoke(id.clone()),
-                Tile::Add => add_page_and_switch_for_select.invoke(start_page.clone()),
-                Tile::History { url, .. } => add_page_and_switch_for_select.invoke(url.clone()),
+            let Some(activation) = browser_chrome_core::activate_row(&tiles_for_select, idx.max(0) as usize, &start_page) else { return };
+            match activation {
+                browser_chrome_core::SwitcherActivation::SwitchTo(id) => switch_to.invoke(id),
+                browser_chrome_core::SwitcherActivation::OpenNewPage(url) => add_page_and_switch_for_select.invoke(url),
             }
         });
     let _ = close_page; // reserved for a future close-tile control; not wired yet
@@ -796,19 +763,21 @@ fn switcher_overlay(
     .margin(Thickness::uniform(16.0))
 }
 
-fn tile_key(tile: &Tile) -> String {
+fn tile_key(tile: &browser_chrome_core::SwitcherRow) -> String {
+    use browser_chrome_core::SwitcherRow;
     match tile {
-        Tile::Open { id, .. } => format!("open:{id}"),
-        Tile::Add => "add".to_string(),
-        Tile::History { url, .. } => format!("history:{url}"),
+        SwitcherRow::Open { id, .. } => format!("open:{id}"),
+        SwitcherRow::Add => "add".to_string(),
+        SwitcherRow::History { url, .. } => format!("history:{url}"),
     }
 }
 
-fn tile_element(tile: &Tile) -> Element {
+fn tile_element(tile: &browser_chrome_core::SwitcherRow) -> Element {
+    use browser_chrome_core::SwitcherRow;
     let (title, domain) = match tile {
-        Tile::Open { title, domain, .. } => (title.clone(), domain.clone()),
-        Tile::Add => ("+".to_string(), String::new()),
-        Tile::History { title, domain, .. } => (title.clone(), domain.clone()),
+        SwitcherRow::Open { title, domain, .. } => (title.clone(), domain.clone()),
+        SwitcherRow::Add => ("+".to_string(), String::new()),
+        SwitcherRow::History { title, domain, .. } => (title.clone(), domain.clone()),
     };
     vstack((
         Element::from(text_block(title).bold()),

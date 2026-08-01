@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/render-engine",
     "crates/browser-core",
+    "crates/browser-chrome-core",
     "crates/browser-linux-gtk3",
     "crates/browser-windows-winui",
     "crates/browser-windows-reactor",

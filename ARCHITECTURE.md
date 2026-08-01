@@ -8,25 +8,37 @@ build them) and `ROADMAP.md` (status/what's next) rather than duplicating either
 ## 1. Current layering
 
 ```
-browser-core        pure domain logic: Page/PageManager, Settings, Keybindings, Profile,
-                     HistoryStore, Bookmarks, embedding/vector search. Zero native-UI
-                     dependency. Generic over a RenderEngine impl for testing (mock engine,
-                     no toolkit). 86 unit tests, all toolkit-free.
-                          |
-render-engine        RenderEngine trait (navigate/go_back/go_forward/reload/current_url/
-                     screenshot) + one impl per platform family (linux via WebKitGTK,
-                     windows-gnu via WebView2, macos via WKWebView). This is the one
-                     dimension that's genuinely swappable today.
-                          |
-4 frontend crates    browser-linux-gtk3, browser-windows-{winui,reactor},
-                     browser-macos-appkit. Each owns: window/toolbar construction,
-                     PageManager wiring, switcher/settings/profile-picker overlays,
-                     keybindings editor, and native event → core-call glue.
+browser-core         pure domain logic: Page/PageManager, Settings, Keybindings, Profile,
+                      HistoryStore, Bookmarks, embedding/vector search. Zero native-UI
+                      dependency. Generic over a RenderEngine impl for testing (MockEngine,
+                      no toolkit — exposed via `testing`, see §4). 86 unit tests, toolkit-free.
+                           |
+render-engine         RenderEngine trait (navigate/go_back/go_forward/reload/current_url/
+                      screenshot) + one impl per platform family (linux via WebKitGTK, the
+                      msvc winui.rs backend wrapping WinUI 3's native WebView2 control
+                      directly, macos via WKWebView). The one dimension that's genuinely
+                      swappable today. (windows-gnu's WryEngine was removed along with
+                      browser-windows-win32/nwg — see the scope note below; nothing left
+                      targets that triple.)
+                           |
+browser-chrome-core   NEW (§4/§7): toolkit-agnostic decision logic sitting between
+                      browser-core's raw data and each frontend's native UI — currently
+                      just `switcher` (SwitcherRow/build_switcher_rows/activate_row), unit-
+                      tested with browser_core::testing::MockEngine + MemoryHistoryStore.
+                           |
+4 frontend crates     browser-linux-gtk3, browser-windows-{winui,reactor},
+                      browser-macos-appkit. Each owns: window/toolbar construction,
+                      PageManager wiring, switcher/settings/profile-picker overlays,
+                      keybindings editor, and native event → core-call glue — though the
+                      switcher piece is now `browser-chrome-core`'s job for the two
+                      frontends already migrated (§4).
 ```
 
-`browser-core` (2,522 lines) and `render-engine` (520 lines) are the well-modularized layer — see §2.
-The 4 frontend crates are where the *same* decision logic gets rewritten, in a different native idiom,
-every time a new one is added. See §3 for the evidence.
+`browser-core` (2,522 lines), `render-engine` (520 lines), and the new `browser-chrome-core` are the
+well-modularized layers — see §2/§4. The 4 frontend crates are where the *same* decision logic gets
+rewritten, in a different native idiom, every time a new one is added — less of it than before now that
+`browser-chrome-core` exists, but plenty still remains (settings/keybindings/profile-picker/page-lifecycle).
+See §3 for the evidence.
 
 **Note on scope**: this document was originally written against 7 frontend crates; `browser-windows-win32`,
 `browser-windows-nwg`, and `browser-wx` were deleted afterward to reduce the number of near-duplicate
@@ -242,11 +254,15 @@ no new test infrastructure needed.
   ```
   so every frontend just matches on the result and does native things — the branching itself
   (§3.3, including restoring the Ctrl+Enter escape hatch) runs once, tested once.
-- **`SwitcherModel<E>`**: given `&PageManager<E>`, `&HistoryStore`, and a query string, returns
-  `Vec<SwitcherRow>` (already almost exactly `browser-windows-reactor`'s `Tile`/`browser-macos-appkit`'s
-  `SwitcherRow` — this is mostly a *move*, not a rewrite, plus restoring the dropped `color` field from
-  §3.2). Each frontend's job shrinks to "render this `Vec<SwitcherRow>` as native widgets" + "translate a
-  click on index N into `model.activate(idx)`."
+- ✅ **`SwitcherModel`** — done, as the new `browser-chrome-core` crate's `switcher` module:
+  `build_switcher_rows(&PageManager<E>, &impl HistoryBackend, query) -> Vec<SwitcherRow>` plus
+  `activate_row(&[SwitcherRow], idx, start_page) -> Option<SwitcherActivation>`, restoring the dropped
+  `color` field from §3.2. Generic over `HistoryBackend` (not just `HistoryStore`), so it's tested with
+  `MemoryHistoryStore` — real `MockEngine`/`MemoryHistoryStore`, zero real webview/SQLite I/O, reusing
+  `browser-core`'s own test doubles exactly as planned (see `browser_core::testing`, newly exposed for this
+  — previously private to `browser-core`'s own `#[cfg(test)] mod tests`). `browser-windows-reactor` and
+  `browser-macos-appkit` both migrated to it (their local `Tile`/`SwitcherRow` enums and hand-copied
+  row-building removed entirely); `browser-linux-gtk3`/`browser-windows-winui` not yet migrated.
 - **`SettingsController`**: draft-state handling (start page, search engine index, unlimited/limit), Save/
   Cancel, `String`/`bool`/`Option<usize>` fields only — no native widgets anywhere in this type.
 - **`KeybindingsController`**: add/remove/commit against `Keybindings`, decoupled from *how* the `KeyChord`
@@ -301,9 +317,11 @@ having; neither substitutes for the other.
 Staged so each step is independently buildable/testable before the next starts — not a big-bang rewrite:
 
 1. ✅ **Quick wins** (§5) — done.
-2. **`SwitcherModel`** first — appears in all 4 remaining frontends, and two of them
-   (`browser-windows-reactor`, `browser-macos-appkit`) already have it in nearly extractable shape. Migrate
-   one frontend at a time, confirming existing behavior/tests still hold after each.
+2. 🟡 **`SwitcherModel`** — done as a crate, migrated to `browser-windows-reactor`/`browser-macos-appkit` (the
+   two that already had it in nearly extractable shape). Still to do: migrate `browser-linux-gtk3` (the
+   original implementation everything else was derived from — GTK's `FlowBox` renders `SwitcherRow` instead
+   of building its own tiles) and `browser-windows-winui`, and give `browser-windows-reactor`'s
+   `tile_element` real color rendering now that `SwitcherRow::Open` carries it (§4's `SwitcherModel` bullet).
 3. **`SettingsController` + `KeybindingsController`** — same treatment.
 4. **`PageController`'s decision logic** — trickiest, since container strategy genuinely differs by platform
    (§3.7); only the *decision* half (what should happen) extracts, containers stay native/local.

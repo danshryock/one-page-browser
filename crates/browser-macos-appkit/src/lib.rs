@@ -80,8 +80,8 @@ use objc2_app_kit::{
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
 use browser_core::{
-    domain_of, launch_new_profile_process, list_profile_names, resolve_address_input, resolve_profile_name, resolve_url_argument,
-    Action, HistoryEntry, HistoryStore, Keybindings, PageManager, Profile, Settings, HOME_URL,
+    launch_new_profile_process, list_profile_names, resolve_address_input, resolve_profile_name, resolve_url_argument, Action,
+    HistoryStore, Keybindings, PageManager, Profile, Settings, HOME_URL,
 };
 use render_engine::{RenderEngine, WryEngine};
 
@@ -106,16 +106,13 @@ enum Overlay {
     Profile,
 }
 
-/// One row in the switcher's list — mirrors `browser-windows-winui`'s/
-/// `browser-windows-reactor`'s `Tile`: open pages matching the search query
-/// first, then a trailing "add page" row, then history matches (only once
-/// there's a query, and only for URLs not already open).
-#[derive(Clone)]
-enum SwitcherRow {
-    Open { id: String, title: String, domain: String },
-    Add,
-    History { url: String, title: String, domain: String },
-}
+// The switcher's row list/activation logic used to be a local `SwitcherRow`
+// enum + hand-copied row-building here — now
+// `browser_chrome_core::{SwitcherRow, build_switcher_rows, activate_row}`
+// (see `ARCHITECTURE.md` §3.2/§4: the exact same decision logic was
+// independently hand-copied in `browser-linux-gtk3`/`browser-windows-
+// reactor` too, and is now unit-tested once, toolkit-free, instead of
+// manually in three places).
 
 struct AppState {
     window: Retained<NSWindow>,
@@ -148,7 +145,7 @@ struct AppState {
     /// buttons are tagged with their index into this so a click can look up
     /// which row it was (AppKit's `target`/`action` dispatch has no
     /// built-in "which item" beyond the sender itself).
-    switcher_rows: RefCell<Vec<SwitcherRow>>,
+    switcher_rows: RefCell<Vec<browser_chrome_core::SwitcherRow>>,
 
     settings_view: Retained<NSView>,
     start_page_field: Retained<NSTextField>,
@@ -583,44 +580,12 @@ impl AppState {
     fn rebuild_switcher_rows(&self) {
         let mtm = self.mtm();
         let query = self.address_bar.stringValue().to_string();
-        let open_matches = self.core.borrow().matching_ids(&query);
-        let mut rows: Vec<SwitcherRow> = Vec::new();
-        {
-            let core = self.core.borrow();
-            for page in core.pages() {
-                if !open_matches.contains(&page.id) {
-                    continue;
-                }
-                let title = page.title.borrow().clone();
-                let title = if title.is_empty() { "New Page".to_string() } else { title };
-                let url = page.current_url();
-                let domain = domain_of(&url);
-                let domain = if page.loaded { domain } else { format!("{domain} \u{b7} unloaded") };
-                rows.push(SwitcherRow::Open { id: page.id.clone(), title, domain });
-            }
-        }
-        rows.push(SwitcherRow::Add);
-        if !query.trim().is_empty() {
-            let open_urls: Vec<String> = self.core.borrow().pages().iter().map(|p| p.current_url()).collect();
-            let history_matches: Vec<HistoryEntry> = self
-                .history
-                .search(&query, 8)
-                .unwrap_or_else(|err| {
-                    eprintln!("history search failed: {err}");
-                    Vec::new()
-                })
-                .into_iter()
-                .filter(|entry| !open_urls.contains(&entry.url))
-                .collect();
-            for entry in history_matches {
-                let title = if entry.title.is_empty() { "New Page".to_string() } else { entry.title };
-                rows.push(SwitcherRow::History { url: entry.url, title, domain: format!("{} \u{b7} history", entry.domain) });
-            }
-        }
+        let rows = browser_chrome_core::build_switcher_rows(&self.core.borrow(), &self.history, &query);
 
         clear_subviews(&self.switcher_rows_container);
         let width = self.switcher_rows_container.frame().size.width;
         for (idx, row) in rows.iter().enumerate() {
+            use browser_chrome_core::SwitcherRow;
             let (label, sub) = match row {
                 SwitcherRow::Open { title, domain, .. } => (title.clone(), domain.clone()),
                 SwitcherRow::Add => ("+ New Page".to_string(), String::new()),
@@ -640,20 +605,14 @@ impl AppState {
 
     fn switcher_row_clicked(self: &Rc<Self>, idx: usize) {
         let rows = self.switcher_rows.borrow();
-        let Some(row) = rows.get(idx).cloned() else { return };
-        drop(rows);
         let start_page = self.settings.borrow().start_page.clone();
-        match row {
-            SwitcherRow::Open { id, .. } => self.switch_to(&id),
-            SwitcherRow::Add => {
-                if let Err(err) = self.add_page(&start_page) {
-                    eprintln!("failed to open new page: {err}");
-                }
-                self.close_all_overlays();
-            }
-            SwitcherRow::History { url, .. } => {
+        let Some(activation) = browser_chrome_core::activate_row(&rows, idx, &start_page) else { return };
+        drop(rows);
+        match activation {
+            browser_chrome_core::SwitcherActivation::SwitchTo(id) => self.switch_to(&id),
+            browser_chrome_core::SwitcherActivation::OpenNewPage(url) => {
                 if let Err(err) = self.add_page(&url) {
-                    eprintln!("failed to open history entry: {err}");
+                    eprintln!("failed to open page: {err}");
                 }
                 self.close_all_overlays();
             }
