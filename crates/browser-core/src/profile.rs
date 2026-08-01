@@ -62,6 +62,13 @@ impl Profile {
         Some(dirs.data_dir().join(&self.name).join("history.db"))
     }
 
+    /// Reserved for the per-profile password vault database — same
+    /// resolve-the-path-without-opening-anything split as `history_db_path`.
+    pub fn passwords_db_path(&self) -> Option<PathBuf> {
+        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        Some(dirs.data_dir().join(&self.name).join("passwords.db"))
+    }
+
     /// Where this profile's page screenshots are saved by default — kept
     /// per-profile (rather than a shared system Pictures folder) for the
     /// same reason every other piece of profile data is: a browser profile
@@ -103,6 +110,40 @@ impl Profile {
     pub fn enable_passphrase(&self) -> anyhow::Result<()> {
         let path = self
             .passphrase_marker_path()
+            .ok_or_else(|| anyhow::anyhow!("no data directory available on this platform"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, b"")?;
+        Ok(())
+    }
+
+    /// Path to the password vault's own passphrase marker — deliberately a
+    /// *separate* file from `passphrase_marker_path`, not a rename/reuse of
+    /// it: the vault and the history database are independently encrypted
+    /// (a profile can have one, the other, both, or neither), even though
+    /// whenever both are on they share one passphrase value (see
+    /// `passwords::decide_vault_unlock_action`, which is what actually
+    /// implements that sharing — nothing at the storage layer links the two
+    /// databases together).
+    pub fn vault_passphrase_marker_path(&self) -> Option<PathBuf> {
+        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        Some(dirs.data_dir().join(&self.name).join("vault-passphrase-enabled"))
+    }
+
+    /// Whether this profile's password vault is passphrase-protected —
+    /// independent of `has_passphrase()` (history's marker). Always `false`
+    /// for an `ephemeral` profile, same reasoning as `has_passphrase`.
+    pub fn has_vault_passphrase(&self) -> bool {
+        !self.ephemeral && self.vault_passphrase_marker_path().map(|p| p.exists()).unwrap_or(false)
+    }
+
+    /// Marks this profile's vault as passphrase-protected going forward —
+    /// called once, right after successfully establishing encryption on a
+    /// brand new (empty) vault database, same timing as `enable_passphrase`.
+    pub fn enable_vault_passphrase(&self) -> anyhow::Result<()> {
+        let path = self
+            .vault_passphrase_marker_path()
             .ok_or_else(|| anyhow::anyhow!("no data directory available on this platform"))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -379,6 +420,40 @@ mod tests {
     #[test]
     fn ephemeral_profiles_never_report_having_a_passphrase() {
         assert!(!Profile::ephemeral().has_passphrase());
+    }
+
+    #[test]
+    fn has_vault_passphrase_reflects_its_own_marker_file() {
+        let profile = Profile::new(format!("vault-passphrase-marker-test-{}", std::process::id()));
+        let marker = profile.vault_passphrase_marker_path().expect("a data dir should be available in tests");
+        let _ = std::fs::remove_file(&marker);
+        assert!(!profile.has_vault_passphrase(), "a fresh profile shouldn't have a vault passphrase marker yet");
+
+        profile.enable_vault_passphrase().expect("enable_vault_passphrase should succeed");
+        assert!(profile.has_vault_passphrase(), "after enable_vault_passphrase, has_vault_passphrase should be true");
+        assert!(marker.exists());
+
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn vault_passphrase_and_history_passphrase_markers_are_independent() {
+        let profile = Profile::new(format!("independent-passphrase-markers-test-{}", std::process::id()));
+        let history_marker = profile.passphrase_marker_path().unwrap();
+        let vault_marker = profile.vault_passphrase_marker_path().unwrap();
+        let _ = std::fs::remove_file(&history_marker);
+        let _ = std::fs::remove_file(&vault_marker);
+
+        profile.enable_vault_passphrase().expect("enable_vault_passphrase should succeed");
+        assert!(profile.has_vault_passphrase(), "the vault marker should be set");
+        assert!(!profile.has_passphrase(), "enabling the vault passphrase shouldn't also enable history's");
+
+        let _ = std::fs::remove_file(&vault_marker);
+    }
+
+    #[test]
+    fn ephemeral_profiles_never_report_having_a_vault_passphrase() {
+        assert!(!Profile::ephemeral().has_vault_passphrase());
     }
 
     #[test]

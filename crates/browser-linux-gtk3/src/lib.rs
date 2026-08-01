@@ -13,11 +13,24 @@ use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use browser_core::{
-    domain_of, list_profile_names, resolve_address_input, Action, Bookmarks, HistoryStore, KeyChord, Keybindings, PageManager,
-    Profile, Settings, Theme,
+    decide_vault_unlock_action, domain_of, list_profile_names, resolve_address_input, Action, Bookmarks, HistoryStore, KeyChord,
+    Keybindings, PageManager, PasswordStore, Profile, Settings, Theme, VaultUnlockAction,
 };
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
+
+/// The password vault's session state — UI-level bookkeeping distinct from
+/// `PasswordStore`/`PasswordBackend` (the storage/abstraction layer, in
+/// `browser-core`): this enum only tracks what this specific running window
+/// currently knows, not how the vault is actually backed.
+enum VaultState {
+    /// The profile has never had a vault passphrase set up
+    /// (`!Profile::has_vault_passphrase()`).
+    NotSetUp,
+    /// The vault has a passphrase, but it hasn't been unlocked this run yet.
+    Locked,
+    Unlocked(PasswordStore),
+}
 
 pub struct AppState {
     /// Doubles as the switcher grid's search box: while the switcher is
@@ -82,6 +95,32 @@ pub struct AppState {
     /// the active page changes or a bookmark is added/removed for it.
     bookmark_toggle_button: gtk::Button,
     bookmarks: RefCell<Bookmarks>,
+    /// The password manager overlay's root widget — same in-window-overlay
+    /// pattern as the other five.
+    passwords_panel: gtk::Widget,
+    /// Rebuilt from `VaultState::Unlocked`'s `PasswordStore::list()` each
+    /// time the overlay opens and after every add/update/delete.
+    passwords_list_box: gtk::Box,
+    /// Whether the vault has ever been set up, is set up but not opened
+    /// this session, or is open and ready to use — see
+    /// `decide_vault_unlock_action`'s doc comment for how a profile that
+    /// already has a passphrase (for history, the vault, or both) ends up
+    /// in each state.
+    passwords: RefCell<VaultState>,
+    /// The passphrase, if any, this run has already used to unlock *some*
+    /// store (history at startup, or the vault) — reused silently instead
+    /// of re-prompting when the vault turns out to need the very same
+    /// passphrase. Never written to disk; cleared along with everything
+    /// else when the process exits.
+    session_passphrase: RefCell<Option<String>>,
+    /// The add-new-credential form's fields — read/cleared by
+    /// `add_password_from_fields`, same pattern as
+    /// `new_engine_name_entry`/`new_engine_url_entry` for the settings
+    /// overlay's search-engine form.
+    new_password_site_entry: gtk::Entry,
+    new_password_username_entry: gtk::Entry,
+    new_password_password_entry: gtk::Entry,
+    new_password_notes_entry: gtk::Entry,
     /// Snapshot taken by the last `rebuild_switcher_grid` call — the source
     /// of truth `activate_switcher_row` indexes into, so a tile's widget
     /// name can just be its position in this list rather than needing a
@@ -265,6 +304,7 @@ impl AppState {
         self.close_settings();
         self.close_profile_picker();
         self.close_bookmarks();
+        self.close_passwords();
         self.rebuild_switcher_grid();
         self.stack.set_sensitive(false);
         self.switcher_panel.show();
@@ -322,6 +362,7 @@ impl AppState {
         self.close_switcher();
         self.close_profile_picker();
         self.close_bookmarks();
+        self.close_passwords();
         let settings = self.settings.borrow();
         self.start_page_entry.set_text(&settings.start_page);
         match settings.max_loaded_pages {
@@ -500,6 +541,7 @@ impl AppState {
         self.close_switcher();
         self.close_settings();
         self.close_bookmarks();
+        self.close_passwords();
         self.new_profile_entry.set_text("");
         self.new_profile_encrypted_check.set_active(false);
         self.rebuild_profile_list();
@@ -599,6 +641,7 @@ impl AppState {
         self.close_switcher();
         self.close_settings();
         self.close_profile_picker();
+        self.close_passwords();
         self.rebuild_bookmarks_list();
         self.stack.set_sensitive(false);
         self.bookmarks_panel.show();
@@ -689,6 +732,220 @@ impl AppState {
         self.refresh_bookmark_toggle_button();
     }
 
+    /// Shows the password manager overlay. Unlike every other overlay, this
+    /// first has to resolve the vault's unlock/setup state (see
+    /// `decide_vault_unlock_action`'s doc comment) — opening it might mean
+    /// silently reusing an already-known passphrase, silently establishing
+    /// a brand new vault under one, or genuinely needing a prompt.
+    pub fn open_passwords(self: &Rc<Self>) {
+        self.close_switcher();
+        self.close_settings();
+        self.close_profile_picker();
+        self.close_bookmarks();
+
+        if matches!(*self.passwords.borrow(), VaultState::Unlocked(_)) {
+            self.show_passwords_panel();
+            return;
+        }
+
+        match decide_vault_unlock_action(&self.profile, self.session_passphrase.borrow().as_deref()) {
+            VaultUnlockAction::SilentlySetUpWith(passphrase) => {
+                if self.try_open_vault_with(&passphrase, true) {
+                    self.show_passwords_panel();
+                } else {
+                    // The cached passphrase (known from unlocking history)
+                    // somehow doesn't work for the vault — fall back to a
+                    // real prompt rather than looping on a passphrase we
+                    // already know is wrong for this store.
+                    show_vault_passphrase_prompt(Rc::clone(self), true);
+                }
+            }
+            VaultUnlockAction::SilentlyUnlockWith(passphrase) => {
+                if self.try_open_vault_with(&passphrase, false) {
+                    self.show_passwords_panel();
+                } else {
+                    show_vault_passphrase_prompt(Rc::clone(self), false);
+                }
+            }
+            VaultUnlockAction::PromptToSetUp => show_vault_passphrase_prompt(Rc::clone(self), true),
+            VaultUnlockAction::PromptToUnlock => show_vault_passphrase_prompt(Rc::clone(self), false),
+        }
+    }
+
+    /// Tries to open the vault with `passphrase`, updating `self.passwords`/
+    /// `self.session_passphrase` on success. `is_setup` marks this as the
+    /// vault's first-ever passphrase (calls `enable_vault_passphrase`) —
+    /// see `PasswordStore::open_encrypted`'s doc comment for why "setup"
+    /// and "unlock" are otherwise the same call. Returns whether it
+    /// succeeded, so callers can fall back to a real prompt on failure
+    /// instead of silently doing nothing.
+    ///
+    /// `pub` so tests can simulate completing `show_vault_passphrase_prompt`
+    /// directly (driving `AppState` rather than that prompt's real GTK
+    /// widgets, same approach every other test in this suite takes for its
+    /// own prompt-style windows) — not meant to be called from outside this
+    /// crate in real use.
+    pub fn try_open_vault_with(self: &Rc<Self>, passphrase: &str, is_setup: bool) -> bool {
+        match PasswordStore::open_encrypted(&self.profile, passphrase) {
+            Ok(store) => {
+                if is_setup {
+                    if let Err(err) = self.profile.enable_vault_passphrase() {
+                        eprintln!("failed to mark profile as vault-passphrase-protected: {err}");
+                    }
+                }
+                if self.session_passphrase.borrow().is_none() {
+                    *self.session_passphrase.borrow_mut() = Some(passphrase.to_string());
+                }
+                *self.passwords.borrow_mut() = VaultState::Unlocked(store);
+                true
+            }
+            Err(err) => {
+                eprintln!("failed to open password vault: {err}");
+                false
+            }
+        }
+    }
+
+    /// Records that `passphrase` is now known to unlock this session's
+    /// encrypted stores — called once, right after successfully unlocking
+    /// history with it at startup (see `show_passphrase_prompt`). If the
+    /// vault already has its own passphrase set up but hasn't been opened
+    /// yet this run, this also opens it immediately with the same
+    /// passphrase — the concrete mechanism behind "the same passphrase
+    /// unlocks both, when both are on." `pub` for the same test-facing
+    /// reason as `try_open_vault_with`.
+    pub fn note_unlocked_with_passphrase(self: &Rc<Self>, passphrase: &str) {
+        *self.session_passphrase.borrow_mut() = Some(passphrase.to_string());
+        if matches!(*self.passwords.borrow(), VaultState::Locked) {
+            let _ = self.try_open_vault_with(passphrase, false);
+        }
+    }
+
+    fn show_passwords_panel(self: &Rc<Self>) {
+        self.rebuild_passwords_list();
+        self.stack.set_sensitive(false);
+        self.passwords_panel.show();
+    }
+
+    /// Hides the password manager overlay. Always use this (rather than
+    /// hiding `passwords_panel` directly) so the stack never gets left
+    /// insensitive.
+    pub fn close_passwords(&self) {
+        self.passwords_panel.hide();
+        self.stack.set_sensitive(true);
+    }
+
+    /// Whether the password manager overlay is currently shown — test/
+    /// inspection helper.
+    pub fn is_passwords_open(&self) -> bool {
+        self.passwords_panel.is_visible()
+    }
+
+    /// Rebuilds the password manager overlay's list of rows from scratch.
+    /// A no-op (empty list) if the vault isn't currently unlocked — callers
+    /// should only reach this after `try_open_vault_with`/
+    /// `show_vault_passphrase_prompt` succeeds.
+    fn rebuild_passwords_list(self: &Rc<Self>) {
+        for child in self.passwords_list_box.children() {
+            self.passwords_list_box.remove(&child);
+        }
+
+        let entries = match &*self.passwords.borrow() {
+            VaultState::Unlocked(store) => store.list().unwrap_or_else(|err| {
+                eprintln!("failed to list password entries: {err}");
+                Vec::new()
+            }),
+            VaultState::Locked | VaultState::NotSetUp => Vec::new(),
+        };
+
+        if entries.is_empty() {
+            let empty_label = gtk::Label::new(Some("No saved passwords yet"));
+            empty_label.set_halign(gtk::Align::Start);
+            self.passwords_list_box.pack_start(&empty_label, false, false, 0);
+        }
+        for entry in entries {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+
+            let label_text = format!("{} \u{2014} {}", entry.domain, entry.username);
+            let label = gtk::Label::new(Some(&label_text));
+            label.set_halign(gtk::Align::Start);
+            label.set_hexpand(true);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            row.pack_start(&label, true, true, 0);
+
+            let copy_button = gtk::Button::with_label("Copy");
+            let password = entry.password.clone();
+            copy_button.connect_clicked(move |_| {
+                if let Some(display) = gtk::gdk::Display::default() {
+                    if let Some(clipboard) = gtk::Clipboard::default(&display) {
+                        clipboard.set_text(&password);
+                    }
+                }
+            });
+            row.pack_start(&copy_button, false, false, 0);
+
+            let remove_button = gtk::Button::with_label("\u{d7}");
+            let app_clone = Rc::clone(self);
+            let id = entry.id.clone();
+            remove_button.connect_clicked(move |_| {
+                app_clone.delete_password_entry(&id);
+            });
+            row.pack_start(&remove_button, false, false, 0);
+
+            self.passwords_list_box.pack_start(&row, false, false, 0);
+        }
+        self.passwords_list_box.show_all();
+    }
+
+    /// Sets the add-new-credential form's fields and submits them — test
+    /// helper, same pattern as `add_search_engine_via_fields`.
+    pub fn add_password_via_fields(self: &Rc<Self>, site: &str, username: &str, password: &str, notes: &str) {
+        self.new_password_site_entry.set_text(site);
+        self.new_password_username_entry.set_text(username);
+        self.new_password_password_entry.set_text(password);
+        self.new_password_notes_entry.set_text(notes);
+        self.add_password_from_fields();
+    }
+
+    /// Adds a credential from the add-new-credential form's current field
+    /// values, then clears them and rebuilds the list — same pattern as
+    /// `add_search_engine_from_fields`. A no-op if the site field is blank,
+    /// or if the vault somehow isn't unlocked (shouldn't happen: the form
+    /// is only ever shown alongside an unlocked vault).
+    pub fn add_password_from_fields(self: &Rc<Self>) {
+        let site = self.new_password_site_entry.text().to_string();
+        let site = site.trim().to_string();
+        if site.is_empty() {
+            return;
+        }
+        let username = self.new_password_username_entry.text().to_string();
+        let password = self.new_password_password_entry.text().to_string();
+        let notes = self.new_password_notes_entry.text().to_string();
+
+        let result = match &*self.passwords.borrow() {
+            VaultState::Unlocked(store) => store.add(&site, &username, &password, &notes),
+            VaultState::Locked | VaultState::NotSetUp => return,
+        };
+        if let Err(err) = result {
+            eprintln!("failed to add password entry: {err}");
+            return;
+        }
+        self.new_password_site_entry.set_text("");
+        self.new_password_username_entry.set_text("");
+        self.new_password_password_entry.set_text("");
+        self.new_password_notes_entry.set_text("");
+        self.rebuild_passwords_list();
+    }
+
+    fn delete_password_entry(self: &Rc<Self>, id: &str) {
+        if let VaultState::Unlocked(store) = &*self.passwords.borrow() {
+            if let Err(err) = store.delete(id) {
+                eprintln!("failed to delete password entry: {err}");
+            }
+        }
+        self.rebuild_passwords_list();
+    }
+
     /// Shows a native "Save Screenshot" dialog (suggesting a filename built
     /// from the active page's domain and the current time, starting in this
     /// profile's `screenshots_dir()`) and, if confirmed, hands the chosen
@@ -773,6 +1030,16 @@ impl AppState {
     /// Bookmarked URLs, most-recently-added first — test/inspection helper.
     pub fn bookmarked_urls(&self) -> Vec<String> {
         self.bookmarks.borrow().all().iter().map(|b| b.url.clone()).collect()
+    }
+
+    /// Usernames of every credential currently in the vault, most-recently-
+    /// added first — empty if the vault isn't unlocked. Test/inspection
+    /// helper.
+    pub fn password_vault_usernames(&self) -> Vec<String> {
+        match &*self.passwords.borrow() {
+            VaultState::Unlocked(store) => store.list().unwrap_or_default().into_iter().map(|e| e.username).collect(),
+            VaultState::Locked | VaultState::NotSetUp => Vec::new(),
+        }
     }
 
     /// Bookmarks a URL directly, without needing to open it as a real page
@@ -890,6 +1157,7 @@ impl AppState {
             Action::ToggleBookmark => self.toggle_bookmark_for_active(),
             Action::OpenBookmarks => self.open_bookmarks(),
             Action::ToggleReaderMode => self.toggle_reader_mode(),
+            Action::OpenPasswords => self.open_passwords(),
         }
     }
 
@@ -1550,6 +1818,12 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         gtk::IconSize::Button,
     )));
     reader_mode_button.set_tooltip_text(Some("Toggle reader mode"));
+    let passwords_button = gtk::Button::new();
+    passwords_button.set_image(Some(&gtk::Image::from_icon_name(
+        Some("dialog-password-symbolic"),
+        gtk::IconSize::Button,
+    )));
+    passwords_button.set_tooltip_text(Some("Password manager"));
     for button in [
         &back_button,
         &forward_button,
@@ -1561,6 +1835,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         &bookmarks_button,
         &screenshot_button,
         &reader_mode_button,
+        &passwords_button,
     ] {
         button.style_context().add_class("flat");
     }
@@ -1598,6 +1873,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     header_bar.pack_end(&bookmarks_button);
     header_bar.pack_end(&screenshot_button);
     header_bar.pack_end(&reader_mode_button);
+    header_bar.pack_end(&passwords_button);
 
     window.set_titlebar(Some(&header_bar));
 
@@ -1848,12 +2124,64 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     bookmarks_overlay.add(&bookmarks_scrim);
     bookmarks_overlay.add_overlay(&bookmarks_box);
 
+    // --- Password manager overlay: same shape again. One row per
+    // credential, rebuilt from `PasswordStore::list()` each time the
+    // overlay opens and after every add/update/delete — plus an inline
+    // add-new-credential form, since unlike bookmarks a password isn't
+    // captured from the active page, it has to be typed in.
+    let passwords_scrim = gtk::EventBox::new();
+    passwords_scrim.style_context().add_class("switcher-scrim");
+    passwords_scrim
+        .style_context()
+        .add_provider(&scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+    let passwords_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    passwords_box.set_halign(gtk::Align::Center);
+    passwords_box.set_valign(gtk::Align::Center);
+    passwords_box.style_context().add_class("settings-box");
+    passwords_box.set_margin(24);
+
+    let passwords_title = gtk::Label::new(Some("Password Manager"));
+    passwords_title.style_context().add_class("settings-title");
+    passwords_title.set_halign(gtk::Align::Start);
+    passwords_box.pack_start(&passwords_title, false, false, 0);
+
+    let passwords_list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    passwords_box.pack_start(&passwords_list_box, false, false, 0);
+
+    let new_password_site_entry = gtk::Entry::new();
+    new_password_site_entry.set_placeholder_text(Some("Site (e.g. https://example.com)"));
+    passwords_box.pack_start(&new_password_site_entry, false, false, 0);
+    let new_password_username_entry = gtk::Entry::new();
+    new_password_username_entry.set_placeholder_text(Some("Username"));
+    passwords_box.pack_start(&new_password_username_entry, false, false, 0);
+    let new_password_password_entry = gtk::Entry::new();
+    new_password_password_entry.set_visibility(false);
+    new_password_password_entry.set_placeholder_text(Some("Password"));
+    passwords_box.pack_start(&new_password_password_entry, false, false, 0);
+    let new_password_notes_entry = gtk::Entry::new();
+    new_password_notes_entry.set_placeholder_text(Some("Notes (optional)"));
+    passwords_box.pack_start(&new_password_notes_entry, false, false, 0);
+    let add_password_button = gtk::Button::with_label("Add");
+    passwords_box.pack_start(&add_password_button, false, false, 0);
+
+    let passwords_close_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    passwords_close_row.set_halign(gtk::Align::End);
+    let passwords_close_button = gtk::Button::with_label("Close");
+    passwords_close_row.pack_start(&passwords_close_button, false, false, 0);
+    passwords_box.pack_start(&passwords_close_row, false, false, 0);
+
+    let passwords_overlay = gtk::Overlay::new();
+    passwords_overlay.add(&passwords_scrim);
+    passwords_overlay.add_overlay(&passwords_box);
+
     let root_overlay = gtk::Overlay::new();
     root_overlay.add(&stack);
     root_overlay.add_overlay(&switcher_overlay);
     root_overlay.add_overlay(&settings_overlay);
     root_overlay.add_overlay(&profile_overlay);
     root_overlay.add_overlay(&bookmarks_overlay);
+    root_overlay.add_overlay(&passwords_overlay);
 
     window.add(&root_overlay);
     window.show_all();
@@ -1861,10 +2189,12 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     settings_overlay.hide();
     profile_overlay.hide();
     bookmarks_overlay.hide();
+    passwords_overlay.hide();
 
     let settings = Settings::load(&profile);
     let bookmarks = Bookmarks::load(&profile);
     let core = PageManager::new(settings.max_loaded_pages);
+    let initial_vault_state = if profile.has_vault_passphrase() { VaultState::Locked } else { VaultState::NotSetUp };
     let app = Rc::new(AppState {
         address_bar: address_bar.clone(),
         stack,
@@ -1892,6 +2222,14 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         bookmarks_list_box: bookmarks_list_box.clone(),
         bookmark_toggle_button: bookmark_toggle_button.clone(),
         bookmarks: RefCell::new(bookmarks),
+        passwords_panel: passwords_overlay.clone().upcast::<gtk::Widget>(),
+        passwords_list_box: passwords_list_box.clone(),
+        passwords: RefCell::new(initial_vault_state),
+        session_passphrase: RefCell::new(None),
+        new_password_site_entry: new_password_site_entry.clone(),
+        new_password_username_entry: new_password_username_entry.clone(),
+        new_password_password_entry: new_password_password_entry.clone(),
+        new_password_notes_entry: new_password_notes_entry.clone(),
         switcher_rows: RefCell::new(Vec::new()),
         core: RefCell::new(core),
         containers: RefCell::new(HashMap::new()),
@@ -2158,6 +2496,37 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     }
     {
         let app = Rc::clone(&app);
+        passwords_button.connect_clicked(move |_| {
+            app.open_passwords();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        passwords_scrim.connect_button_press_event(move |_, _| {
+            app.close_passwords();
+            gtk::glib::Propagation::Stop
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        passwords_close_button.connect_clicked(move |_| {
+            app.close_passwords();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        add_password_button.connect_clicked(move |_| {
+            app.add_password_from_fields();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        new_password_password_entry.connect_activate(move |_| {
+            app.add_password_from_fields();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
         window.connect_key_press_event(move |_, event| {
             let is_escape = event.keyval() == gtk::gdk::keys::Key::from_name("Escape");
             if is_escape && app.is_switcher_open() {
@@ -2171,6 +2540,9 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
                 return gtk::glib::Propagation::Stop;
             } else if is_escape && app.is_bookmarks_open() {
                 app.close_bookmarks();
+                return gtk::glib::Propagation::Stop;
+            } else if is_escape && app.is_passwords_open() {
+                app.close_passwords();
                 return gtk::glib::Propagation::Stop;
             }
 
@@ -2397,6 +2769,13 @@ pub fn show_passphrase_prompt(profile: Profile, setup: bool) -> anyhow::Result<(
                     window.close();
                     match build_window_and_app_with_history(profile.clone(), history) {
                         Ok((_main_window, app)) => {
+                            // The vault, if it has its own passphrase set up
+                            // already, shares this same one (see
+                            // `note_unlocked_with_passphrase`'s doc comment)
+                            // — do this before opening the start page so a
+                            // vault-open failure is logged early, not
+                            // silently deferred.
+                            app.note_unlocked_with_passphrase(&passphrase);
                             let start_page = app.settings().start_page.clone();
                             if let Err(err) = app.add_page(&start_page) {
                                 eprintln!("failed to open the start page: {err}");
@@ -2430,4 +2809,96 @@ pub fn show_passphrase_prompt(profile: Profile, setup: bool) -> anyhow::Result<(
     }
 
     Ok(())
+}
+
+/// Shows a small standalone window collecting a passphrase for `app`'s
+/// password vault — either to set up a *new* one (`setup: true`, when
+/// `decide_vault_unlock_action` returns `PromptToSetUp`) or to *unlock* an
+/// already-protected one (`setup: false`, `PromptToUnlock`). Unlike
+/// `show_passphrase_prompt` (which bootstraps a whole new window/app at
+/// process startup, before any main window exists), this operates on an
+/// **already-running** app: on success it fills in `app.passwords`/
+/// `app.session_passphrase` (via `try_open_vault_with`) and shows the
+/// passwords overlay directly, rather than building anything new. Retries
+/// in place on a wrong passphrase, same as `show_passphrase_prompt`.
+fn show_vault_passphrase_prompt(app: Rc<AppState>, setup: bool) {
+    let window = gtk::Window::new(gtk::WindowType::Toplevel);
+    window.set_title(if setup { "Set a vault passphrase" } else { "Unlock password vault" });
+    window.set_default_size(420, 160);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin(16);
+
+    let prompt_text = if setup {
+        "Choose a passphrase to encrypt your password vault."
+    } else {
+        "Your password vault is passphrase-protected."
+    };
+    let prompt_label = gtk::Label::new(Some(prompt_text));
+    prompt_label.set_line_wrap(true);
+    prompt_label.set_halign(gtk::Align::Start);
+    content.pack_start(&prompt_label, false, false, 0);
+
+    let passphrase_entry = gtk::Entry::new();
+    passphrase_entry.set_visibility(false);
+    passphrase_entry.set_placeholder_text(Some("Passphrase"));
+    content.pack_start(&passphrase_entry, false, false, 0);
+
+    let error_label = gtk::Label::new(None);
+    error_label.set_halign(gtk::Align::Start);
+    content.pack_start(&error_label, false, false, 0);
+
+    let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    button_row.set_halign(gtk::Align::End);
+    let cancel_button = gtk::Button::with_label("Cancel");
+    let confirm_button = gtk::Button::with_label(if setup { "Set Passphrase" } else { "Unlock" });
+    button_row.pack_start(&cancel_button, false, false, 0);
+    button_row.pack_start(&confirm_button, false, false, 0);
+    content.pack_start(&button_row, false, false, 0);
+
+    window.add(&content);
+    window.show_all();
+
+    {
+        let window = window.clone();
+        cancel_button.connect_clicked(move |_| {
+            window.close();
+        });
+    }
+    // Unlike `show_passphrase_prompt`'s window (which, before the main
+    // window exists, quitting on close is the only sensible behavior),
+    // this one always has a real running browser window underneath it —
+    // closing it (Cancel, Escape, the WM close button) should just dismiss
+    // the prompt, never quit the app.
+    window.connect_delete_event(|_, _| gtk::glib::Propagation::Proceed);
+
+    let try_unlock: Rc<dyn Fn()> = {
+        let window = window.clone();
+        let passphrase_entry = passphrase_entry.clone();
+        let error_label = error_label.clone();
+        let app = Rc::clone(&app);
+        Rc::new(move || {
+            let passphrase = passphrase_entry.text().to_string();
+            if passphrase.is_empty() {
+                error_label.set_text("Passphrase can't be empty.");
+                return;
+            }
+            if app.try_open_vault_with(&passphrase, setup) {
+                window.close();
+                app.show_passwords_panel();
+            } else {
+                error_label.set_text("Couldn't open the vault with that passphrase. Try again.");
+                passphrase_entry.set_text("");
+                passphrase_entry.grab_focus();
+            }
+        })
+    };
+    {
+        let try_unlock = Rc::clone(&try_unlock);
+        confirm_button.connect_clicked(move |_| try_unlock());
+    }
+    {
+        let try_unlock = Rc::clone(&try_unlock);
+        passphrase_entry.connect_activate(move |_| try_unlock());
+    }
 }

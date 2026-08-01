@@ -568,6 +568,81 @@ fn bookmarks_toggle_and_overlay() {
 }
 
 #[test]
+fn password_vault_setup_add_and_overlay_mutual_exclusion() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("password-vault-basics");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        assert!(app.password_vault_usernames().is_empty());
+        assert!(!profile.has_vault_passphrase(), "a fresh profile shouldn't have a vault passphrase yet");
+
+        // Simulates the user completing show_vault_passphrase_prompt's
+        // setup flow.
+        assert!(
+            app.try_open_vault_with("correct horse battery staple", true),
+            "setting up a fresh vault should succeed"
+        );
+        assert!(profile.has_vault_passphrase(), "setting up the vault should mark the profile as vault-protected");
+
+        app.add_password_via_fields("https://example.com", "alice", "hunter2", "personal account");
+        app.add_password_via_fields("https://example.com", "bob", "letmein", "");
+        assert_eq!(
+            app.password_vault_usernames(),
+            vec!["bob".to_string(), "alice".to_string()],
+            "most-recently-added credential should list first"
+        );
+
+        // Mutually exclusive with the other overlays, same as bookmarks.
+        app.open_settings();
+        app.open_passwords();
+        assert!(!app.is_settings_open(), "opening the password manager while settings is open should close settings");
+        assert!(app.is_passwords_open(), "open_passwords should show the password manager overlay");
+        assert!(!app.is_background_page_interactive(), "open_passwords should make the background page stack insensitive");
+
+        app.close_passwords();
+        assert!(!app.is_passwords_open());
+        assert!(app.is_background_page_interactive(), "closing the password manager should restore background page interactivity");
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn password_vault_reuses_an_already_known_passphrase_with_no_second_prompt() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("password-vault-shared-passphrase");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        // Simulates history already having been unlocked with this
+        // passphrase at startup (see `show_passphrase_prompt`'s success
+        // branch, which calls this same method) — the vault has no
+        // passphrase of its own set up yet.
+        assert!(!profile.has_vault_passphrase());
+        app.note_unlocked_with_passphrase("shared passphrase");
+
+        // Opening the vault for the first time should silently establish
+        // it under the *same* passphrase — straight to the panel, no
+        // prompt-completion step needed (unlike the test above, which
+        // simulates completing a real prompt since no passphrase was known
+        // yet in that scenario).
+        app.open_passwords();
+        assert!(
+            app.is_passwords_open(),
+            "a passphrase already known this session should silently unlock/set up the vault, not prompt for a new one"
+        );
+        assert!(profile.has_vault_passphrase(), "opening the vault should have set up its own marker under the shared passphrase");
+
+        app.add_password_via_fields("https://example.com", "alice", "hunter2", "");
+        assert_eq!(app.password_vault_usernames(), vec!["alice".to_string()]);
+
+        app.close_passwords();
+        assert!(!app.is_passwords_open());
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
 fn edit_url_opens_switcher_with_current_url_selected_not_blanked() {
     run_on_gtk_thread(|| {
         let profile = test_profile("edit-url");

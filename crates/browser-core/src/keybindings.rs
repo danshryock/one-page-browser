@@ -26,6 +26,7 @@ pub enum Action {
     ToggleBookmark,
     OpenBookmarks,
     ToggleReaderMode,
+    OpenPasswords,
 }
 
 impl Action {
@@ -41,6 +42,7 @@ impl Action {
         Action::ToggleBookmark,
         Action::OpenBookmarks,
         Action::ToggleReaderMode,
+        Action::OpenPasswords,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -56,6 +58,7 @@ impl Action {
             Action::ToggleBookmark => "Bookmark this page",
             Action::OpenBookmarks => "Open bookmarks",
             Action::ToggleReaderMode => "Toggle reader mode",
+            Action::OpenPasswords => "Open password manager",
         }
     }
 }
@@ -173,9 +176,9 @@ impl Default for Keybindings {
         map.insert(Action::GoBack, vec![KeyChord::new(false, true, false, "Left")]);
         map.insert(Action::GoForward, vec![KeyChord::new(false, true, false, "Right")]);
         map.insert(Action::ToggleBookmark, vec![KeyChord::new(true, false, false, "D")]);
-        // OpenSettings/OpenProfilePicker/OpenBookmarks/ToggleReaderMode:
-        // unbound by default — toolbar-button-only, used far less often
-        // than the other six.
+        // OpenSettings/OpenProfilePicker/OpenBookmarks/ToggleReaderMode/
+        // OpenPasswords: unbound by default — toolbar-button-only, used far
+        // less often than the other six.
         Self(map)
     }
 }

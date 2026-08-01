@@ -959,9 +959,10 @@ define_class!(
                 Action::GoForward => state.with_active(|e| e.go_forward()),
                 Action::OpenSettings => state.open_settings(),
                 Action::OpenProfilePicker => state.open_profile_picker(),
-                // Bookmarks/reader mode aren't implemented on this front end
-                // either yet — matches browser-windows-winui/reactor's scope.
-                Action::ToggleBookmark | Action::OpenBookmarks | Action::ToggleReaderMode => {}
+                // Bookmarks/reader mode/the password manager overlay aren't
+                // implemented on this front end either yet — matches
+                // browser-windows-winui/reactor's scope.
+                Action::ToggleBookmark | Action::OpenBookmarks | Action::ToggleReaderMode | Action::OpenPasswords => {}
             }
         }
     }

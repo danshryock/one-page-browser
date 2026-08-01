@@ -534,10 +534,15 @@ impl AppState {
             Action::OpenSettings => self.open_settings(),
             Action::OpenProfilePicker => self.open_profile_picker(),
             // Bookmarks, the Ctrl+L/Ctrl+T split (EditUrl vs. OpenSwitcher),
-            // and reader mode all landed in browser-core + browser-linux-gtk3
-            // only so far (see ROADMAP.md's Backlog) — no winui3 UI/engine
-            // support to dispatch any of these to yet.
-            Action::ToggleBookmark | Action::OpenBookmarks | Action::EditUrl | Action::ToggleReaderMode => {}
+            // reader mode, and the password manager overlay all landed in
+            // browser-core + browser-linux-gtk3 only so far (see
+            // ROADMAP.md's Backlog) — no winui3 UI/engine support to
+            // dispatch any of these to yet.
+            Action::ToggleBookmark
+            | Action::OpenBookmarks
+            | Action::EditUrl
+            | Action::ToggleReaderMode
+            | Action::OpenPasswords => {}
         }
     }
 

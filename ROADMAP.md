@@ -47,6 +47,18 @@ build/run instructions.
 - Ctrl+Enter in the switcher's search box now forces a brand-new page open even when the typed text matches
   an open page/history entry (plain Enter still switches to a single match, as before). See
   `summaries/ctrl-enter-force-new-page.md`.
+- Password manager: `browser_core::passwords` (a `PasswordEntry` struct, a libsql-encrypted `PasswordStore`,
+  and a `PasswordBackend` trait — same pattern as `HistoryStore`/`HistoryBackend` — so an external/alternate
+  password manager can later be swapped in wherever code is generic over `impl PasswordBackend`) plus a
+  `browser-linux-gtk3` toolbar button and overlay (add/view/copy/delete credentials; no in-page autofill —
+  explicitly out of scope for this pass). The vault always requires a passphrase (no unencrypted mode, unlike
+  every other store in this app) — independent of `HistoryStore`'s own passphrase
+  (`Profile::has_vault_passphrase`/`enable_vault_passphrase`, separate marker file from
+  `Profile::has_passphrase`), but when a profile has both, they share one passphrase value: whichever store
+  gets unlocked first in a session caches the passphrase, and the other one reuses it silently, no second
+  prompt (see `browser_core::decide_vault_unlock_action`). `browser-windows-winui`/`browser-windows-reactor`/
+  `browser-macos-appkit` compile against the new module but have no overlay UI yet — same scope pattern as
+  bookmarks.
 - Separate `EditUrl`/`OpenSwitcher` actions (`browser-core` + `browser-linux-gtk3`): Ctrl+L now opens the
   switcher with the current URL preloaded and fully selected (not blanked); Ctrl+T/F1 keep the old
   blank-search behavior. See `summaries/edit-url-vs-new-page-actions.md`.
@@ -381,15 +393,30 @@ still untested).
   (both landed there only, per scope — see "Done" above).
 - External password manager integration — not attempted: which manager(s) and which integration protocol
   (native messaging, a browser-extension-equivalent, direct API) is a real design decision, not something
-  to guess at unsupervised.
-- Internal password manager — not attempted: this is genuinely large (encrypted credential storage — could
-  reuse the new profile-passphrase infrastructure, gated on a profile actually having one set — plus a
-  management UI, plus autofill via detecting login forms and injecting values into arbitrary third-party
-  page DOMs) and the highest-risk remaining item to get subtly wrong. Autofill correctness in particular
-  varies a lot site-to-site in ways headless fixture-page testing can't validate — this deserves focused
-  attention with real-site testing, not a rushed pass at the end of an already-long session.
-- Changing/removing a profile's passphrase, or migrating an existing unencrypted profile to encrypted
-  (`sqlite3_rekey` is available via libsql-sys but not wired up yet).
+  to guess at unsupervised. `browser_core::PasswordBackend` (see "Done" above) is the extension point once
+  that decision is made.
+- In-page autofill for the password manager (detecting login forms and injecting values into arbitrary
+  third-party page DOMs) — needs `render-engine` JS-injection support that doesn't exist yet. Autofill
+  correctness varies a lot site-to-site in ways headless fixture-page testing can't validate — this deserves
+  focused attention with real-site testing, not a rushed pass.
+- Get libsql's `"encryption"` feature (SQLite3 Multiple Ciphers, via libsql-ffi) building for the
+  cross-compiled targets, not just native Linux — today it's scoped to `target_os = "linux"` only in
+  `browser-core/Cargo.toml`, so `HistoryStore::open_encrypted`/`PasswordStore::open_encrypted` are stubs that
+  always error on Windows/macOS builds from this dev machine. The confirmed blocker for the Windows MSVC
+  target (`cargo build-windows-winui`/`-reactor`, via `cargo-xwin`) is that libsql-ffi's CMake build needs
+  `llvm-lib`, not available in this toolchain — worth revisiting once/if that's installable. The macOS
+  zigbuild cross-compile path hasn't actually been tried with the feature enabled at all (the Linux-only
+  scoping was chosen for simplicity, not because macOS was tested and failed) — that's the cheaper first
+  thing to check.
+- Changing/removing a profile's passphrase, or migrating an existing unencrypted profile (history or vault)
+  to encrypted (`sqlite3_rekey` is available via libsql-sys but not wired up yet) — i.e. key rotation.
+- Investigate key derivation for the two encrypted stores: today `HistoryStore::open_encrypted`/
+  `PasswordStore::open_encrypted` both hand the *same raw passphrase bytes* straight to libsql's
+  `EncryptionConfig`, and whatever key-derivation SQLite3 Multiple Ciphers does internally from those bytes
+  happens the same way for both databases — worth investigating whether deriving a separate, store-specific
+  key from the shared passphrase (e.g. via HKDF with a per-store context/salt) would be meaningfully safer
+  than reusing identical key material across two independent database files, and whether that's compatible
+  with `decide_vault_unlock_action`'s "one passphrase, both stores" UX or would need to change it.
 - `browser-windows-winui` debugging — it's been cross-compile/link-verified only all along (see "Done"
   above), never actually run; once it can be run on real Windows, expect a real debugging pass (custom
   title bar drag, the `WM_KEYDOWN` HWND-subclass keybinding capture, `WebView2` control behavior, etc. are

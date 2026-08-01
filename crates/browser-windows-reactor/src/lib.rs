@@ -425,7 +425,16 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
                 Action::OpenProfilePicker => open_profile.invoke(()),
                 // EditUrl: see this closure's doc comment — not implementable
                 // with the crate's current API surface, not just unbuilt.
-                Action::ToggleBookmark | Action::OpenBookmarks | Action::EditUrl | Action::ToggleReaderMode => {}
+                // OpenPasswords: no password manager overlay in this crate
+                // yet — browser-core's passwords module/PasswordBackend
+                // trait exist and compile against this frontend already,
+                // just no UI built on top here this pass (see
+                // ARCHITECTURE.md).
+                Action::ToggleBookmark
+                | Action::OpenBookmarks
+                | Action::EditUrl
+                | Action::ToggleReaderMode
+                | Action::OpenPasswords => {}
             }
         }
     });
