@@ -75,7 +75,7 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSButtonType, NSControlStateValueOff,
-    NSControlStateValueOn, NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSControlStateValueOn, NSEventModifierFlags, NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
@@ -368,12 +368,21 @@ impl AppState {
 
         let container = NSView::initWithFrame(NSView::alloc(mtm), self.content_view.frame());
         self.content_view.addSubview(&container);
-        let self_for_title = Rc::clone(self);
+        // Weak, not `Rc::clone(self)` — this closure is stored inside the
+        // `wry::WebView` that ends up owned (via `PageManager`) by this same
+        // `AppState`, so a strong reference here would be a genuine `Rc`
+        // cycle (`AppState -> core -> PageManager -> Page.engine ->
+        // wry::WebView -> this closure -> Rc<AppState>`), keeping `AppState`
+        // alive forever. Matches `browser-linux-gtk3`'s
+        // `Rc::downgrade(self)` in the same spot.
+        let self_for_title = Rc::downgrade(self);
         let id_for_title = id.clone();
         let engine = WryEngine::new(&container, url, move |title| {
-            if let Some(page) = self_for_title.core.borrow_mut().page_mut(&id_for_title) {
+            let Some(app) = self_for_title.upgrade() else { return };
+            if let Some(page) = app.core.borrow_mut().page_mut(&id_for_title) {
                 *page.title.borrow_mut() = title;
             }
+            app.record_visit(&id_for_title);
         })?;
 
         let title = Rc::new(RefCell::new(String::new()));
@@ -382,6 +391,23 @@ impl AppState {
         self.containers.borrow_mut().insert(id.clone(), container);
         self.set_active(&id);
         Ok(id)
+    }
+
+    /// Records a history visit for `id`'s current URL/title — called from
+    /// every page's title-changed callback (see `add_page`/
+    /// `ensure_engine_loaded`). Previously missing entirely on this
+    /// platform (a real, silent gap: browsing history never accumulated on
+    /// macOS at all — see `ARCHITECTURE.md` §3.8); mirrors
+    /// `browser-linux-gtk3`'s `AppState::record_visit`.
+    fn record_visit(&self, id: &str) {
+        let core = self.core.borrow();
+        let Some(page) = core.page(id) else { return };
+        let url = page.current_url();
+        let title = page.title.borrow().clone();
+        drop(core);
+        if let Err(err) = self.history.record_visit(&url, &title) {
+            eprintln!("failed to record history visit: {err}");
+        }
     }
 
     /// Drops the live engine/container for every id `PageManager` evicted —
@@ -409,12 +435,15 @@ impl AppState {
         let url = if last_url.is_empty() { HOME_URL.to_string() } else { last_url };
         let container = NSView::initWithFrame(NSView::alloc(mtm), self.content_view.frame());
         self.content_view.addSubview(&container);
-        let self_for_title = Rc::clone(self);
+        // Weak — see the identical comment in `add_page`.
+        let self_for_title = Rc::downgrade(self);
         let id_for_title = id.to_string();
         match WryEngine::new(&container, &url, move |title| {
-            if let Some(page) = self_for_title.core.borrow_mut().page_mut(&id_for_title) {
+            let Some(app) = self_for_title.upgrade() else { return };
+            if let Some(page) = app.core.borrow_mut().page_mut(&id_for_title) {
                 *page.title.borrow_mut() = title;
             }
+            app.record_visit(&id_for_title);
         }) {
             Ok(engine) => {
                 self.core.borrow_mut().install_engine(id, engine);
@@ -469,8 +498,44 @@ impl AppState {
     /// reasoning): an exactly-one open-page match switches to it, else an
     /// exactly-one history match opens that entry, else the typed text is
     /// resolved (URL or search) into a brand-new page.
+    /// ⌘Enter (the platform mapping of `browser-linux-gtk3`'s Ctrl+Enter —
+    /// see this module's doc comment on `ctrl` → ⌘) while the switcher is
+    /// open always opens a brand-new page from the typed text, even when it
+    /// matches an open page or history entry (which plain Enter would
+    /// instead switch to/open) — the escape hatch for deliberately wanting a
+    /// second page at the same URL. Mirrors
+    /// `browser-linux-gtk3`'s `force_new_page_from_search`; dropped
+    /// (silently, not as a deliberate scope cut) when this crate was first
+    /// ported from that one — see `ARCHITECTURE.md` §3.3.
+    fn force_new_page_from_search(self: &Rc<Self>, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let url = resolve_address_input(trimmed, &self.settings.borrow());
+        if let Err(err) = self.add_page(&url) {
+            eprintln!("failed to open new page: {err}");
+        }
+        self.close_all_overlays();
+    }
+
+    /// Whether ⌘ was held for the key event that triggered the control
+    /// action currently being handled — `NSApplication.currentEvent` is the
+    /// standard AppKit way to recover this from inside an action method
+    /// (there's no argument carrying it directly, unlike a raw `keyDown:`
+    /// override).
+    fn command_key_held(&self) -> bool {
+        NSApplication::sharedApplication(self.mtm())
+            .currentEvent()
+            .is_some_and(|event| event.modifierFlags().contains(NSEventModifierFlags::Command))
+    }
+
     fn address_bar_activated(self: &Rc<Self>) {
         let text = self.address_bar.stringValue().to_string();
+        if self.is_switcher_open() && self.command_key_held() {
+            self.force_new_page_from_search(&text);
+            return;
+        }
         if self.is_switcher_open() {
             let trimmed = text.trim();
             if trimmed.is_empty() {

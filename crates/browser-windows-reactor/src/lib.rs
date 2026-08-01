@@ -743,6 +743,7 @@ fn switcher_overlay(
 
     let start_page = shared.settings.borrow().start_page.clone();
     let tiles_for_select = tiles.clone();
+    let add_page_and_switch_for_select = add_page_and_switch.clone();
     let grid_of_tiles = grid_view(tiles, |tile, _idx| tile_element(tile))
         .with_key_selector(tile_key)
         .selected_index(-1)
@@ -750,16 +751,42 @@ fn switcher_overlay(
             let Some(tile) = tiles_for_select.get(idx.max(0) as usize) else { return };
             match tile {
                 Tile::Open { id, .. } => switch_to.invoke(id.clone()),
-                Tile::Add => add_page_and_switch.invoke(start_page.clone()),
-                Tile::History { url, .. } => add_page_and_switch.invoke(url.clone()),
+                Tile::Add => add_page_and_switch_for_select.invoke(start_page.clone()),
+                Tile::History { url, .. } => add_page_and_switch_for_select.invoke(url.clone()),
             }
         });
     let _ = close_page; // reserved for a future close-tile control; not wired yet
 
+    // Ctrl+Enter always opens a brand-new page from the typed text, even
+    // when it matches an open page or history entry (which selecting a
+    // tile would instead switch to/open) — the escape hatch for
+    // deliberately wanting a second page at the same URL. Mirrors
+    // `browser-linux-gtk3`'s `force_new_page_from_search`; dropped
+    // (silently, not as a deliberate scope cut) when this crate was first
+    // built out — see `ARCHITECTURE.md` §3.3. Note this search box has no
+    // plain-Enter behavior at all (only click/selection on a tile) — a
+    // real, separate gap from `browser-linux-gtk3`'s unified address-bar/
+    // search-box design that ARCHITECTURE.md understated; Ctrl+Enter is
+    // the one specific behavior being restored here.
+    let force_new_page_from_search = {
+        let query = search_query.to_string();
+        let shared = Rc::clone(shared);
+        let add_page_and_switch = add_page_and_switch.clone();
+        move || {
+            let trimmed = query.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            let url = resolve_address_input(trimmed, &shared.settings.borrow());
+            add_page_and_switch.invoke(url);
+        }
+    };
+
     let search_box = text_box(search_query.to_string())
         .placeholder_text("Type to filter open pages\u{2026}")
         .on_text_changed(set_search_query)
-        .width(400.0);
+        .width(400.0)
+        .keyboard_accelerator(KeyboardAccelerator::new(VirtualKey::Enter, VirtualKeyModifiers::Control, force_new_page_from_search));
 
     grid((
         Element::from(search_box).grid_row(0),

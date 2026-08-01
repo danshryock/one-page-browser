@@ -126,15 +126,24 @@ port, not a deliberate scope cut.
 ### 3.3 Unified address-bar/search-box state machine
 
 The address bar doubling as the switcher's search box (Enter behavior depends on whether the switcher is
-open) is hand-copied at least three times (`browser-linux-gtk3`, `browser-windows-reactor`,
-`browser-macos-appkit`), each time re-deriving: is-switcher-open → exactly-one-open-match switches to it →
-else exactly-one-history-match opens it → else resolve the text as a URL/search and open a new page.
+open) is hand-copied in `browser-linux-gtk3` and `browser-macos-appkit`: is-switcher-open →
+exactly-one-open-match switches to it → else exactly-one-history-match opens it → else resolve the text as
+a URL/search and open a new page. **Correction to an earlier version of this section**: `browser-windows-
+reactor` doesn't actually share this design — its switcher has its own, separate search box
+(`switcher_overlay`'s `search_box`, independent of the toolbar's `address` state) with no plain-Enter
+behavior at all, only click/selection on a tile. A real, smaller-than-first-described divergence, not the
+close three-way duplicate originally claimed here.
 
-**Drift already visible**: `browser-linux-gtk3` has a documented escape hatch — Ctrl+Enter always forces a
+**Drift found, now fixed**: `browser-linux-gtk3` has a documented escape hatch — Ctrl+Enter always forces a
 brand-new page even when the typed text matches an open page (`force_new_page_from_search`,
-`browser-linux-gtk3/src/lib.rs:911`). Neither the `browser-windows-reactor` nor `browser-macos-appkit` port
-written this session carried that escape hatch forward — a real feature silently dropped during porting,
-not a documented scope decision. Concrete demonstration of the exact risk this document is about.
+`browser-linux-gtk3/src/lib.rs:911`). Neither `browser-windows-reactor` nor `browser-macos-appkit` carried
+that escape hatch forward when first built — a real feature silently dropped during porting, not a
+documented scope decision, and the concrete demonstration that motivated this whole document. **Fixed** in
+both: `browser-macos-appkit`'s `force_new_page_from_search` (checks ⌘ via `NSApplication.currentEvent`'s
+modifier flags — there's no argument carrying it directly into an AppKit action method) and
+`browser-windows-reactor`'s search box now has a real `Ctrl+Enter` `KeyboardAccelerator` wired to the same
+behavior (`resolve_address_input` + `add_page_and_switch`), the first keyboard interaction that search box
+has ever had.
 
 ### 3.4 Settings save/cancel draft state
 
@@ -186,30 +195,30 @@ worth naming explicitly so it isn't mistaken for an oversight later.
   (`AppState::record_visit`, `browser-linux-gtk3/src/lib.rs:176`).
 - `browser-windows-reactor` records it from the navigation-completed callback instead
   (`on_navigation_completed`'s `reflect` closure, `browser-windows-reactor/src/lib.rs`).
-- `browser-macos-appkit` — checked directly this pass — **never calls `history.record_visit` anywhere**.
-  It reads history (for switcher suggestions) but never writes to it. Browsing history silently never
-  accumulates on this platform; the switcher's history-suggestion rows will always be empty. This is a real,
-  currently-shipped bug from this session's work, not a hypothetical — flagged here rather than silently
-  patched, since fixing it wasn't this pass's scope; see §5 for the concrete one-line fix.
+- `browser-macos-appkit` — checked directly this pass — **never called `history.record_visit` anywhere**.
+  It read history (for switcher suggestions) but never wrote to it; browsing history silently never
+  accumulated on this platform. **Fixed**: added the same `record_visit(id)` method
+  `browser-linux-gtk3` has, called from both title-changed callbacks (`add_page`/`ensure_engine_loaded`).
 
 This is the single most concrete piece of evidence for why this document exists: there is no single
 "a page finished navigating" hook that *forces* every frontend to remember to record history. Each one has
 to independently notice it needs to, on whatever event happens to be that platform's navigation-succeeded
 signal — and one of them didn't.
 
-### 3.9 A related, undocumented reference-cycle bug (found while checking §3.8)
+### 3.9 A related reference-cycle bug (found while checking §3.8), now fixed
 
-`browser-macos-appkit`'s `add_page`/`ensure_engine_loaded` capture `Rc::clone(self)` (a strong reference to
+`browser-macos-appkit`'s `add_page`/`ensure_engine_loaded` captured `Rc::clone(self)` (a strong reference to
 the whole `AppState`) inside the per-page title-changed closure, which is stored inside that page's
-`wry::WebView`, which lives inside `PageManager`, which lives inside `AppState.core`. That's a genuine
-reference cycle: `AppState → core → PageManager → Page.engine → wry::WebView → closure → Rc<AppState>`.
-`AppState` will never deallocate for the life of the process (harmless in practice here — the process exits
-and the OS reclaims everything regardless of Rust-level `Drop` — but a real leak nonetheless, and exactly
-the kind of subtle mistake hand-copying this pattern invites).
+`wry::WebView`, which lives inside `PageManager`, which lives inside `AppState.core`. That was a genuine
+reference cycle: `AppState → core → PageManager → Page.engine → wry::WebView → closure → Rc<AppState>` —
+`AppState` would never deallocate for the life of the process (harmless in practice — the process exits and
+the OS reclaims everything regardless of Rust-level `Drop` — but a real leak nonetheless, and exactly the
+kind of subtle mistake hand-copying this pattern invites). **Fixed**: both callbacks now capture
+`Rc::downgrade(self)` and `.upgrade()` inside the closure, matching the pattern below.
 
-Two other frontends already avoided this, in two different ways, worth normalizing:
+Other frontends already avoided this, in two different ways, worth normalizing:
 - `browser-linux-gtk3` uses `Rc::downgrade(self)`/`.upgrade()` in the same callback
-  (`browser-linux-gtk3/src/lib.rs:153`).
+  (`browser-linux-gtk3/src/lib.rs:153`) — the pattern `browser-macos-appkit` now also uses.
 - The now-deleted `browser-windows-win32` sidestepped it structurally — its title-changed callback only
   closed over the title `RefCell` and the raw `HWND`, never a strong reference to the whole app state at all
   (`build_title_changed_callback`, `browser-windows-win32/src/lib.rs:430`) — a good pattern worth keeping in
@@ -254,20 +263,23 @@ control the trait doesn't otherwise need (the now-deleted `browser-wx`'s `wxWebV
 example of this) — and either exception should be a one-line comment at the impl site saying which reason
 applies, so the next new frontend doesn't have to rediscover the reasoning from scratch.
 
-## 5. Quick wins (don't require the full refactor, worth doing regardless)
+## 5. Quick wins — done
 
-Found during this pass, not yet fixed (documentation was this turn's scope) — flagging precisely rather
-than silently patching, since these are real, cheap, independent fixes:
+All three found during the original pass over this document, fixed in the follow-up session that also
+deleted `browser-windows-win32`/`browser-windows-nwg`/`browser-wx` (see `ROADMAP.md`):
 
-1. **`browser-macos-appkit`: wire up `history.record_visit`** (§3.8) — call it from the title-changed
-   callback (matching `browser-linux-gtk3`'s approach) or a navigation-completed signal if one becomes
-   available. One missing call, currently a silent, total feature gap on this platform.
-2. **`browser-macos-appkit`: break the `Rc` cycle** (§3.9) — change the title-changed callback's captured
-   `Rc::clone(self)` to `Rc::downgrade(self)` + `.upgrade()` inside the closure, matching
-   `browser-linux-gtk3`'s existing pattern.
-3. **Restore or explicitly scope-cut the Ctrl+Enter "force new page" escape hatch** (§3.3) in
-   `browser-windows-reactor`/`browser-macos-appkit` — currently silently missing rather than a documented
-   decision.
+1. ✅ **`browser-macos-appkit`: wire up `history.record_visit`** (§3.8) — added, called from both
+   title-changed callbacks (`add_page`/`ensure_engine_loaded`), matching `browser-linux-gtk3`'s approach.
+2. ✅ **`browser-macos-appkit`: break the `Rc` cycle** (§3.9) — both title-changed callbacks now capture
+   `Rc::downgrade(self)` + `.upgrade()`, matching `browser-linux-gtk3`'s existing pattern.
+3. ✅ **Restore the Ctrl+Enter "force new page" escape hatch** (§3.3) — added to both
+   `browser-windows-reactor` (a real `KeyboardAccelerator` on the switcher's search box — its first keyboard
+   interaction at all) and `browser-macos-appkit` (checks ⌘ via `NSApplication.currentEvent`'s modifier
+   flags inside the address bar's action method).
+
+All three verified via `cargo check --workspace`, `cargo test -p browser-core`, and cross-compiling both
+Windows (`cargo build-windows-winui`/`cargo build-windows-reactor`) and macOS (`.cargo/build-macos-appkit.sh`,
+both architectures) after the changes.
 
 ## 6. Testability
 
@@ -288,7 +300,7 @@ having; neither substitutes for the other.
 
 Staged so each step is independently buildable/testable before the next starts — not a big-bang rewrite:
 
-1. **Quick wins** (§5) — cheap, already-understood, no design work needed.
+1. ✅ **Quick wins** (§5) — done.
 2. **`SwitcherModel`** first — appears in all 4 remaining frontends, and two of them
    (`browser-windows-reactor`, `browser-macos-appkit`) already have it in nearly extractable shape. Migrate
    one frontend at a time, confirming existing behavior/tests still hold after each.
