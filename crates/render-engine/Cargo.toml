@@ -7,12 +7,11 @@ license.workspace = true
 [dependencies]
 anyhow = "1"
 
-# Only linux.rs, windows.rs (the gnu-target Win32 backend), and macos.rs use
-# wry — the msvc-target WinUI 3 backend (winui.rs) wraps the native
-# Microsoft.UI.Xaml.Controls.WebView2 control directly, no wry involved.
-# Excluding wry there keeps that target's dependency tree free of
-# wry/webview2-com, which it never needs.
-[target.'cfg(any(target_os = "linux", all(target_os = "windows", target_env = "gnu"), target_os = "macos"))'.dependencies]
+# Only linux.rs and macos.rs use wry — the msvc-target WinUI 3 backend
+# (winui.rs) wraps the native Microsoft.UI.Xaml.Controls.WebView2 control
+# directly, no wry involved. Excluding wry there keeps that target's
+# dependency tree free of wry/webview2-com, which it never needs.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 wry = "0.55"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -28,9 +27,6 @@ webkit2gtk = "2.0"
 # on unifies with that same dependency and enables `ImageSurface::write_to_png`
 # everywhere, including through the `gtk::cairo` re-export.
 cairo-rs = { version = "0.18", features = ["png"] }
-
-[target.'cfg(all(target_os = "windows", target_env = "gnu"))'.dependencies]
-windows = { version = "0.62", features = ["Win32_Foundation"] }
 
 [target.'cfg(all(target_os = "windows", target_env = "msvc"))'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation"] }

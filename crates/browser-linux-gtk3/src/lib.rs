@@ -1,10 +1,10 @@
 //! GTK3 native chrome for the browser — Linux only. Gated on the whole
 //! crate (rather than leaving it to fail on `gtk` being unresolved) so a
-//! bare `cargo build`/`cross build --target x86_64-pc-windows-gnu` across
-//! the whole workspace succeeds everywhere: this crate just compiles to an
-//! empty no-op on any other platform, symmetric with how
-//! `browser-windows-win32`/`browser-windows-nwg` gate themselves to
-//! `target_os = "windows"`.
+//! bare `cargo build` across the whole workspace succeeds everywhere: this
+//! crate just compiles to an empty no-op on any other platform, symmetric
+//! with how `browser-windows-winui`/`browser-windows-reactor` gate
+//! themselves to `target_os = "windows"` and `browser-macos-appkit` to
+//! `target_os = "macos"`.
 #![cfg(target_os = "linux")]
 
 use std::cell::{Cell, RefCell};

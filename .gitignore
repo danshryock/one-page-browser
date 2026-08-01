@@ -1,13 +1,18 @@
 /target
 
-# Wine 11.0 build + the "webview2" bottle (see README.md's "WebView2 under
-# Wine" section) - large (multi-GB), machine-specific binary artifacts, not
-# project source.
+# Wine 11.0 build + the "webview2" bottle, previously used to run the
+# now-deleted browser-windows-win32/browser-windows-nwg/browser-wx crates
+# under Wine. No longer used by anything in this repo (browser-windows-winui/
+# browser-windows-reactor both need the real Windows App SDK runtime, which
+# doesn't work under Wine at all) - kept ignored in case a multi-GB `.wine/`
+# still exists on disk from before that deletion; safe to `rm -rf .wine` to
+# reclaim the space.
 /.wine
 
-# Zig toolchain used by `cargo zigbuild` to cross-compile browser-wx to
-# Windows (see README.md's "browser-wx: building and running" section) -
-# a large, machine-specific binary artifact, not project source.
+# Zig toolchain used by `cargo zigbuild` to cross-compile
+# browser-macos-appkit from Linux (see README.md's "browser-macos-appkit:
+# building" section) - a large, machine-specific binary artifact, not
+# project source.
 /.zig
 
 # macOS SDK (framework .tbd stubs etc.) used by `cargo zigbuild` to

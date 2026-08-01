@@ -1,58 +1,26 @@
-# Lets `cargo run`/`cargo test --target x86_64-pc-windows-gnu` execute the
-# resulting .exe under Wine automatically, instead of needing
-# `wine target/x86_64-pc-windows-gnu/debug/foo.exe` typed out by hand every
-# time (see README.md's cross-compiling section). Only affects this target —
-# native Linux/Windows builds are unaffected.
-#
-# The runner is a small wrapper script (rather than plain "wine") so it can
-# also point Wine at WebView2Loader.dll's vendored location via WINEPATH —
-# see .cargo/wine-runner.sh for why.
-[target.x86_64-pc-windows-gnu]
-runner = ".cargo/wine-runner.sh"
-
 # Build-and-run shortcuts for each native chrome, each pinned to whichever
 # target that crate actually applies to (see the per-crate `#![cfg(target_os
-# = "...")]` guards) — the two Windows ones go through the runner above, so
-# `cargo run-win32`/`cargo run-nwg` launch under Wine automatically, same as
-# a plain `cargo run --target x86_64-pc-windows-gnu -p ...` would.
+# = "...")]` guards).
 [alias]
 run-gtk3 = "run -p browser-linux-gtk3"
-run-win32 = "run --target x86_64-pc-windows-gnu -p browser-windows-win32"
-run-nwg = "run --target x86_64-pc-windows-gnu -p browser-windows-nwg"
-# browser-wx (wxDragon) isn't target-gated — see crates/browser-wx/src/lib.rs
-# — so this alias just runs it natively here, same as any other crate.
-run-wx = "run -p browser-wx"
-# There's no [alias] equivalent of run-win32/run-nwg for browser-wx's Windows
-# cross-build: it needs `cargo zigbuild` (see README.md), which — despite
-# having its own internal "run" verb that builds *and* launches — can't be
-# reached through Cargo's [alias]/subcommand dispatch. Cargo always invokes
-# an external plugin as `cargo-<name> <name> <rest>` (repeating the matched
-# name), so "zigbuild run ..." arrives at the cargo-zigbuild binary as
-# arguments to its own "zigbuild" verb, which doesn't recognize "run" and
-# errors — there's no way to get "run" to be the verb cargo-zigbuild receives
-# through `cargo <anything>`. Use `.cargo/run-wx-wine.sh` instead, which
-# calls `cargo zigbuild` (the build verb, which *is* reachable this way) and
-# then the wine-runner.sh above directly, in one script.
 
 # browser-windows-winui only needs to cross-*compile* (see
-# crates/browser-windows-winui/src/lib.rs) — it's never run, so unlike
-# browser-wx above there's no "run" verb to route around, and cargo-xwin's
+# crates/browser-windows-winui/src/lib.rs) — it's never run, and cargo-xwin's
 # own "build" verb *is* reachable directly through [alias] the same way
-# run-win32/run-nwg reach cargo's built-in "run".
+# run-gtk3 reaches cargo's built-in "run".
 build-windows-winui = "xwin build --target x86_64-pc-windows-msvc -p browser-windows-winui"
 # Same reasoning as build-windows-winui above, for the windows-reactor-based
 # rebuild (see crates/browser-windows-reactor/src/lib.rs's module doc
 # comment).
 build-windows-reactor = "xwin build --target x86_64-pc-windows-msvc -p browser-windows-reactor"
 
-# browser-macos-appkit cross-compiles from Linux via `cargo zigbuild` (like
-# browser-wx's Windows build) plus a macOS SDK for the Apple framework
-# stubs the link step needs — neither of those can be reached through a
-# plain [alias] the way build-windows-winui/build-windows-reactor are
-# (cargo-xwin bundles its own SDK-fetcher; cargo-zigbuild needs Zig on PATH
-# and SDKROOT set up first, which aliases can't do). Use
-# .cargo/build-macos-appkit.sh instead (see README.md's
-# "browser-macos-appkit: building" section).
+# browser-macos-appkit cross-compiles from Linux via `cargo zigbuild` plus a
+# macOS SDK for the Apple framework stubs the link step needs — neither of
+# those can be reached through a plain [alias] the way
+# build-windows-winui/build-windows-reactor are (cargo-xwin bundles its own
+# SDK-fetcher; cargo-zigbuild needs Zig on PATH and SDKROOT set up first,
+# which aliases can't do). Use .cargo/build-macos-appkit.sh instead (see
+# README.md's "browser-macos-appkit: building" section).
 
 # browser-core pulls in libsql, whose libsql-ffi dependency compiles a
 # bundled sqlite3.c via cc-rs for *every* target it's built for, including
@@ -72,7 +40,5 @@ build-windows-reactor = "xwin build --target x86_64-pc-windows-msvc -p browser-w
 # `$CARGO_HOME/config.toml` (i.e. `~/.cargo/config.toml`), which is NOT
 # checked into the repo — that's where these two lines now live on this
 # machine, which is the correct place for "where a tool happens to be
-# installed on this specific box" (see also `Cross.toml`'s comment on the
-# unrelated, unused `cross` tool for the same kind of distinction). If
-# `cargo build-windows-winui` ever fails here with a similar ToolNotFound
-# error, check `~/.cargo/config.toml` first.
+# installed on this specific box". If `cargo build-windows-winui` ever fails
+# here with a similar ToolNotFound error, check `~/.cargo/config.toml` first.

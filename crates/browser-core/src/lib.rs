@@ -1,9 +1,11 @@
 //! Platform-agnostic page/tab management shared by every native chrome
-//! (`browser-linux-gtk3`, and eventually `browser-windows-win32`/`browser-macos`).
-//! Owns the page list, active-page tracking, search matching, and URL
-//! helpers; deliberately knows nothing about any GUI toolkit — each
-//! platform's chrome wires its own widgets to this and does its own native
-//! container/window bookkeeping around it.
+//! (`browser-linux-gtk3`, `browser-windows-winui`, `browser-windows-reactor`,
+//! `browser-macos-appkit`). Owns the page list, active-page tracking, search
+//! matching, and URL helpers; deliberately knows nothing about any GUI
+//! toolkit — each platform's chrome wires its own widgets to this and does
+//! its own native container/window bookkeeping around it. See
+//! `ARCHITECTURE.md` for how much of *that* wiring is itself duplicated
+//! across frontends, and what's planned to close the gap.
 
 use std::cell::RefCell;
 use std::rc::Rc;

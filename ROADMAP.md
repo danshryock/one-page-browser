@@ -5,12 +5,18 @@ build/run instructions.
 
 ## Done
 
-- Linux (`browser-linux-gtk3`) and Windows (`browser-windows-win32`, `browser-windows-nwg`) native chrome,
-  cross-compiled and running under Wine from this dev machine.
-- `browser-wx` (wxDragon) — a fourth, now-unmaintained front end kept in the repo.
-- `browser-windows-winui` (WinUI 3) — the fifth front end, and the one under active development for
-  Windows going forward. Cross-compile/link-verified only (never run — no Windows App SDK runtime under
-  Wine).
+- Linux (`browser-linux-gtk3`) native chrome — implemented, working, with real regression tests.
+- `browser-windows-winui` (WinUI 3) and `browser-windows-reactor` (WinUI 3, Microsoft's own `windows-reactor`)
+  — the two Windows front ends going forward. Both cross-compile/link-verified; `browser-windows-reactor`
+  has also been run for real, in a Windows VM used for interactive testing.
+- `browser-macos-appkit` (AppKit) — the macOS front end, at feature parity with the two Windows front ends'
+  scope. Cross-compiles from this Linux dev machine; real runtime verification via GitHub's native macOS
+  runners.
+- **Deleted**: `browser-windows-win32`, `browser-windows-nwg` (both hand-rolled/NWG-based Win32 chrome, no
+  in-app profile picker or keybindings editor), and `browser-wx` (wxDragon experiment) — removed to reduce
+  the number of frontends carrying near-duplicate logic (see `ARCHITECTURE.md`). All three had been
+  cross-compiled and run under Wine from this dev machine at one point, but were unmaintained and behind
+  the other frontends in scope; recoverable from git history if ever needed again.
 - History tracking and search, integrated into the switcher grid.
 - External link launch: a standalone "open in which profile?" chooser when launched with a URL argument.
 - In-app profile picker (create/switch profiles; switching launches a new process).

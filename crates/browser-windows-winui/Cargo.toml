@@ -23,8 +23,8 @@ windows = { version = "0.62", features = [
     # to handle keyboard shortcuts and window-close — this crate's bindings
     # have no working way to subscribe to Window::Closed or any KeyDown
     # event at all (see src/lib.rs's module doc comment), so those go
-    # through the raw HWND instead, the same technique already used in
-    # browser-wx/src/titlebar/windows.rs.
+    # through the raw HWND instead — a standard Win32 technique, not
+    # something specific to this crate's bindings.
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",

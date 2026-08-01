@@ -1,17 +1,17 @@
-//! WinUI 3 (Microsoft.UI.Xaml) native chrome — the fifth front end this
-//! codebase has tried, and (per the user) the one going forward:
-//! `browser-wx`/`browser-windows-win32`/`browser-windows-nwg` stay in the
-//! repo but are no longer being developed. Built out to match
-//! `browser-linux-gtk3`'s feature set (multi-page browsing, a switcher grid,
-//! settings, keyboard shortcuts, profile support), using the native
-//! `Microsoft.UI.Xaml.Controls.WebView2` control (`render_engine::WebView2Engine`)
-//! rather than wry — see that module's doc comment for why.
+//! WinUI 3 (Microsoft.UI.Xaml) native chrome — one of two active Windows
+//! front ends (alongside `browser-windows-reactor`; see that crate's module
+//! doc comment for why both exist). `browser-windows-win32`/
+//! `browser-windows-nwg`/`browser-wx` were deleted from the repo (see
+//! `ROADMAP.md`/`ARCHITECTURE.md`) — unmaintained and behind these two in
+//! scope. Built out to match `browser-linux-gtk3`'s feature set (multi-page
+//! browsing, a switcher grid, settings, keyboard shortcuts, profile
+//! support), using the native `Microsoft.UI.Xaml.Controls.WebView2` control
+//! (`render_engine::WebView2Engine`) rather than wry — see that module's doc
+//! comment for why.
 //!
 //! Gated on `target_env = "msvc"`, not just `target_os = "windows"` — see
-//! `Cargo.toml`'s comment; WinRT/COM interop needs MSVC specifically, so this
-//! crate compiles to an empty no-op everywhere else, including the
-//! `x86_64-pc-windows-gnu` target `browser-windows-win32`/`browser-windows-nwg`
-//! use.
+//! `Cargo.toml`'s comment; WinRT/COM interop needs MSVC specifically, so
+//! this crate compiles to an empty no-op everywhere else.
 //!
 //! # A real gap in `winio-winui3`'s bindings: no working `KeyDown` or
 //! `Window::Closed`
@@ -28,9 +28,8 @@
 //! `CheckBox` `Checked`/`Unchecked`, `ComboBox`/`TextBox`
 //! `SelectionChanged`/`TextChanged`, and `GotFocus`/`LostFocus` all *do* work.
 //!
-//! Fix: subclass the top-level `HWND` directly (`SetWindowSubclass`), the
-//! same technique already used in `browser-wx/src/titlebar/windows.rs`. See
-//! `install_hwnd_subclass` below.
+//! Fix: subclass the top-level `HWND` directly (`SetWindowSubclass`), a
+//! standard Win32 technique. See `install_hwnd_subclass` below.
 #![cfg(all(target_os = "windows", target_env = "msvc"))]
 
 use std::cell::{Cell, RefCell};
@@ -1215,8 +1214,7 @@ fn winui_vk_to_chord(vk: u16, ctrl: bool, alt: bool, shift: bool) -> Option<KeyC
 
 /// See this module's doc comment: `Window` has no working `Closed` event and
 /// `UIElement` has no working `KeyDown` event in this crate's bindings, so
-/// both go through a raw `HWND` subclass instead — the same technique
-/// already used in `browser-wx/src/titlebar/windows.rs`. Handles:
+/// both go through a raw `HWND` subclass instead. Handles:
 /// - `WM_KEYDOWN`: dispatches through `Keybindings::action_for` (or, while
 ///   the keybindings editor is capturing a new binding, assigns it instead),
 ///   plus Escape closing whichever overlay is open and Enter navigating the

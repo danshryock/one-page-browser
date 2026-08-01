@@ -11,11 +11,14 @@ name: Windows
 # never been possible before (Wine can't host the real Windows App SDK/
 # WebView2 runtime WinUI 3 needs; see ROADMAP.md).
 #
-# browser-windows-win32/browser-windows-nwg/browser-wx are intentionally not
-# built here — deprioritized in favor of browser-windows-winui (see
-# ROADMAP.md's "Done" section); win32/nwg already have a working local
-# Wine-based build+run loop, so there's little this workflow would add for
-# them.
+# browser-windows-win32/browser-windows-nwg/browser-wx were deleted from the
+# repo entirely (see ROADMAP.md/ARCHITECTURE.md) — unmaintained and behind
+# the remaining frontends in scope. browser-windows-reactor (the other
+# active Windows frontend, alongside browser-windows-winui) isn't built by
+# this workflow yet either — a real gap, not a deliberate exclusion; it's
+# only ever been verified via local cross-compile + a Windows VM used for
+# interactive testing so far. Worth adding a build-and-smoke job for it here
+# too, mirroring build-and-smoke-winui below.
 
 # Manual runs (workflow_dispatch, the "Run workflow" button in the Actions
 # tab) or a pushed tag matching v*.* -- NOT every push to master. This
@@ -46,11 +49,10 @@ jobs:
       - name: cargo test -p browser-core
         run: cargo test -p browser-core --verbose
 
-      # render-engine's windows.rs (win32/nwg's WryEngine) and winui.rs
-      # (WebView2Engine) both compile on this target; a plain `check` (rather
-      # than `build`, which browser-windows-winui's own job below already
-      # covers via its dependency on render-engine) is enough to confirm the
-      # crate itself is sound here.
+      # render-engine's winui.rs (WebView2Engine) compiles on this target; a
+      # plain `check` (rather than `build`, which browser-windows-winui's own
+      # job below already covers via its dependency on render-engine) is
+      # enough to confirm the crate itself is sound here.
       - name: cargo check -p render-engine
         run: cargo check -p render-engine --verbose
 

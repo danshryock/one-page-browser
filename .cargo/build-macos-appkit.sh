@@ -1,8 +1,8 @@
 #!/bin/sh
 # Cross-compiles browser-macos-appkit from Linux via `cargo zigbuild` (Zig as
-# the C/C++ cross-compiler and linker — same tool browser-wx's Windows build
-# already uses, see run-wx-wine.sh) plus a macOS SDK for the Apple framework
-# .tbd stubs (AppKit, WebKit, Foundation, ...) the final link step needs.
+# the C/C++ cross-compiler and linker) plus a macOS SDK for the Apple
+# framework .tbd stubs (AppKit, WebKit, Foundation, ...) the final link step
+# needs.
 #
 # Not a plain `[alias]` entry in .cargo/config.toml because this needs to set
 # up PATH (to find Zig) and SDKROOT (to find the SDK) first — aliases only

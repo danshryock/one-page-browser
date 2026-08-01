@@ -46,7 +46,9 @@ fn main() -> anyhow::Result<()> {
 fn main() {
     eprintln!(
         "browser-linux-gtk3 is a Linux-only binary; nothing to run on this platform. \
-         Build browser-windows-win32 or browser-windows-nwg instead (--target x86_64-pc-windows-gnu, \
-         via cargo build or cross build)."
+         Build browser-windows-winui or browser-windows-reactor instead (--target \
+         x86_64-pc-windows-msvc, via cargo build-windows-winui/cargo build-windows-reactor), \
+         or browser-macos-appkit (--target aarch64-apple-darwin/x86_64-apple-darwin, via \
+         .cargo/build-macos-appkit.sh)."
     );
 }

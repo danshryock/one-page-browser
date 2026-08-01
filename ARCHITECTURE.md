@@ -18,15 +18,22 @@ render-engine        RenderEngine trait (navigate/go_back/go_forward/reload/curr
                      windows-gnu via WebView2, macos via WKWebView). This is the one
                      dimension that's genuinely swappable today.
                           |
-7 frontend crates    browser-linux-gtk3, browser-windows-{winui,reactor,win32,nwg},
-                     browser-macos-appkit, browser-wx. Each owns: window/toolbar
-                     construction, PageManager wiring, switcher/settings/profile-picker
-                     overlays, keybindings editor, and native event → core-call glue.
+4 frontend crates    browser-linux-gtk3, browser-windows-{winui,reactor},
+                     browser-macos-appkit. Each owns: window/toolbar construction,
+                     PageManager wiring, switcher/settings/profile-picker overlays,
+                     keybindings editor, and native event → core-call glue.
 ```
 
 `browser-core` (2,522 lines) and `render-engine` (520 lines) are the well-modularized layer — see §2.
-The 7 frontend crates (≈9,000 lines combined) are where the *same* decision logic gets rewritten, in a
-different native idiom, every time a new one is added. See §3 for the evidence.
+The 4 frontend crates are where the *same* decision logic gets rewritten, in a different native idiom,
+every time a new one is added. See §3 for the evidence.
+
+**Note on scope**: this document was originally written against 7 frontend crates; `browser-windows-win32`,
+`browser-windows-nwg`, and `browser-wx` were deleted afterward to reduce the number of near-duplicate
+implementations (unmaintained, behind the other frontends in feature scope, and Wine-cross-compile-only —
+see `ROADMAP.md`). Several findings below cite their code specifically, since the patterns found there (both
+good and bad) are still instructive even with the crates themselves gone — recoverable from git history if
+needed. Sections marked accordingly.
 
 ## 2. What's already well-modularized (keep doing this)
 
@@ -43,10 +50,10 @@ different native idiom, every time a new one is added. See §3 for the evidence.
   which is itself a gap — see §4.6): an engine impl lives in `render-engine` *unless* its native dependency
   would burden other frontends' builds. `browser-windows-reactor` keeps its `ReactorWebViewEngine` local
   specifically to avoid pulling `windows-reactor`'s git dependency into `browser-windows-winui`'s build
-  (documented in `engine.rs`'s own module comment). `browser-wx` keeps its engine local because it wraps a
-  wholly different webview control (`wxWebView`, not `wry`) that the trait doesn't otherwise need. Both are
-  good, deliberate calls — but nothing currently tells the *next* person adding a frontend when to make the
-  same call versus defaulting to `render-engine`.
+  (documented in `engine.rs`'s own module comment) — a good, deliberate call, but nothing currently tells
+  the *next* person adding a frontend when to make the same call versus defaulting to `render-engine`. (The
+  now-deleted `browser-wx` was the other example of this — it kept its engine local because it wrapped a
+  wholly different webview control, `wxWebView` rather than `wry`, that the trait didn't otherwise need.)
 
 ## 3. Duplication found, with evidence
 
@@ -56,9 +63,10 @@ references checked this pass.
 ### 3.1 Page lifecycle orchestration
 
 `add_page`/`ensure_engine_loaded`/`unload_engines`/`set_active`/`close_page` follow the identical five-step
-dance in every one of the 7 frontends (all are `PageManager`-backed, `browser-wx` included): allocate an id
-from `PageManager`, build a native container (or not — see §3.7), construct the engine with a title-changed
-callback, `insert`/evict via `PageManager`, activate. Compare:
+dance in every `PageManager`-backed frontend, including the now-deleted `browser-windows-win32`/
+`browser-wx` (kept below as evidence — the pattern held across all 7 original frontends, not just the 4
+remaining): allocate an id from `PageManager`, build a native container (or not — see §3.7), construct the
+engine with a title-changed callback, `insert`/evict via `PageManager`, activate. Compare:
 
 ```rust
 // browser-linux-gtk3/src/lib.rs:143
@@ -75,7 +83,7 @@ pub fn add_page(self: &Rc<Self>, url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-// browser-windows-win32/src/lib.rs:157 — same shape, no container widget (see §3.7)
+// browser-windows-win32/src/lib.rs:157 (crate since deleted) — same shape, no container widget (see §3.7)
 pub fn add_page(&self, url: &str) -> anyhow::Result<()> {
     let id = self.core.borrow_mut().allocate_id();
     let engine = WryEngine::new(self.hwnd, url, build_title_changed_callback(...))?;
@@ -140,30 +148,31 @@ draft fields from/to actual controls.
 `listening_for: Option<Action>` (waiting for a new binding), add/remove/commit against `Keybindings`,
 persist, refresh — identical in `browser-linux-gtk3`, `browser-windows-winui`, `browser-windows-reactor`,
 `browser-macos-appkit`. The one genuine platform difference is *how* a chord is captured: `browser-linux-gtk3`
-(and, per its own docs, `browser-windows-win32`/`browser-windows-nwg` had they built this feature) can do
-live "press keys…" capture via a raw keydown event; `windows-reactor` and `browser-macos-appkit` fell back
-to typed-text parsing (`"Ctrl+Shift+P"`) because neither toolkit's declarative/high-level shortcut API
-exposes a generic "capture the next keypress" hook. So `parse_chord` itself genuinely isn't shareable to all
-seven — but everything *after* obtaining a `KeyChord` (add/remove/persist/refresh) is 100% identical logic,
-currently copy-pasted four times regardless of capture method.
+(and, per its own docs, the now-deleted `browser-windows-win32`/`browser-windows-nwg` had they built this
+feature) can do live "press keys…" capture via a raw keydown event; `windows-reactor` and
+`browser-macos-appkit` fell back to typed-text parsing (`"Ctrl+Shift+P"`) because neither toolkit's
+declarative/high-level shortcut API exposes a generic "capture the next keypress" hook. So `parse_chord`
+itself genuinely isn't shareable across every capture style — but everything *after* obtaining a `KeyChord`
+(add/remove/persist/refresh) is 100% identical logic, currently copy-pasted across all four remaining
+frontends regardless of capture method.
 
 ### 3.6 Profile picker
 
 `list_profile_names()` → mark the current one → click launches a new process or closes the picker (if
 already current). Same in `browser-linux-gtk3`, `browser-windows-winui`, `browser-windows-reactor`,
-`browser-macos-appkit`. Absent entirely in `browser-windows-win32`/`browser-windows-nwg`/`browser-wx` (they
-only support one profile via `--profile`, no in-app switcher UI) — a real scope gap, not a bug, tracked in
-`ROADMAP.md`.
+`browser-macos-appkit` — i.e. universal across every remaining frontend. It was absent in the now-deleted
+`browser-windows-win32`/`browser-windows-nwg`/`browser-wx` (they only supported one profile via `--profile`,
+no in-app switcher UI) — a real scope gap at the time, not a bug, and moot now that those crates are gone.
 
 ### 3.7 Page-container strategy — a genuine platform difference, not just duplication
 
 Not everything here *can* unify:
 
-- `browser-linux-gtk3`/`browser-windows-nwg`/`browser-macos-appkit`: a real native container widget per page
-  (`gtk::Box`/`nwg::Frame`/`NSView`) that owns visibility — hide the container, its embedded webview hides
-  too.
-- `browser-windows-win32`: no container concept exists at all (documented in its own module doc as a
-  deliberate departure) — the webview's raw HWND is shown/hidden directly.
+- `browser-linux-gtk3`/`browser-macos-appkit`: a real native container widget per page (`gtk::Box`/`NSView`)
+  that owns visibility — hide the container, its embedded webview hides too. (The now-deleted
+  `browser-windows-nwg` used the same strategy, via `nwg::Frame`.)
+- The now-deleted `browser-windows-win32` had no container concept at all (documented in its own module doc
+  as a deliberate departure) — the webview's raw HWND was shown/hidden directly.
 - `browser-windows-reactor`: no container either, for a different reason — `windows-reactor`'s declarative
   model has no visibility primitive at all (checked directly against its source); every loaded page's
   element stays mounted, z-order alone decides what's on top.
@@ -198,12 +207,13 @@ reference cycle: `AppState → core → PageManager → Page.engine → wry::Web
 and the OS reclaims everything regardless of Rust-level `Drop` — but a real leak nonetheless, and exactly
 the kind of subtle mistake hand-copying this pattern invites).
 
-Two other frontends already avoid this, in two different ways, worth normalizing:
+Two other frontends already avoided this, in two different ways, worth normalizing:
 - `browser-linux-gtk3` uses `Rc::downgrade(self)`/`.upgrade()` in the same callback
   (`browser-linux-gtk3/src/lib.rs:153`).
-- `browser-windows-win32` sidesteps it structurally — its title-changed callback only closes over the title
-  `RefCell` and the raw `HWND`, never a strong reference to the whole app state at all
-  (`build_title_changed_callback`, `browser-windows-win32/src/lib.rs:430`).
+- The now-deleted `browser-windows-win32` sidestepped it structurally — its title-changed callback only
+  closed over the title `RefCell` and the raw `HWND`, never a strong reference to the whole app state at all
+  (`build_title_changed_callback`, `browser-windows-win32/src/lib.rs:430`) — a good pattern worth keeping in
+  mind even with that crate gone.
 
 ## 4. Future state: a shared, toolkit-agnostic decision layer
 
@@ -240,9 +250,9 @@ Write down, in `render-engine/src/lib.rs`'s module doc comment, the rule already
 inconsistently-documented in individual crates (§2): an engine impl belongs in `render-engine` by default;
 it stays local to a frontend crate only when (a) its native dependency would burden *other* frontends'
 builds (the `windows-reactor` git-dependency case), or (b) it wraps a fundamentally different webview
-control the trait doesn't otherwise need (the `browser-wx`/`wxWebView` case) — and either exception should
-be a one-line comment at the impl site saying which reason applies, so the next new frontend doesn't have
-to rediscover the reasoning from scratch.
+control the trait doesn't otherwise need (the now-deleted `browser-wx`'s `wxWebView` case was the only
+example of this) — and either exception should be a one-line comment at the impl site saying which reason
+applies, so the next new frontend doesn't have to rediscover the reasoning from scratch.
 
 ## 5. Quick wins (don't require the full refactor, worth doing regardless)
 
@@ -264,28 +274,24 @@ than silently patching, since these are real, cheap, independent fixes:
 `browser-core`'s `MockEngine`-based test pattern (86 tests, zero native toolkit, `crates/browser-core/src/
 lib.rs`'s `#[cfg(test)] mod tests`) is the thing to extend, not replace. Once the controllers/models in §4
 exist, they're testable the exact same way — meaning the switcher/settings/keybindings/profile-picker
-decision logic across all seven frontends, which currently has **zero automated test coverage** (only
-exercised by manual clicking, or, for `browser-linux-gtk3` specifically, the `examples/nav_test.rs`/
-`switcher_test.rs` manually-run binaries), gets real unit tests essentially for free.
+decision logic across all four frontends, which currently has **zero automated test coverage** (only
+exercised by manual clicking), gets real unit tests essentially for free.
 
-This is complementary to, not a replacement for, the separate in-flight plan to convert
-`browser-linux-gtk3`'s manual example binaries into real `cargo test`-driven tests via `gtk-test`
-(synthetic input against the actual live GTK widgets, needing a real or headless display) — that effort
-verifies the *real native rendering* end-to-end for one platform; the controller/model extraction here
-verifies the *decision logic* with no toolkit at all, for every platform at once. Both are worth having;
-neither substitutes for the other.
+This is complementary to, not a replacement for, `browser-linux-gtk3`'s existing `tests/gtk_tests.rs`
+(using `gtk-test`, replacing what used to be manually-run `examples/nav_test.rs`/`switcher_test.rs`
+binaries — see `README.md`'s Testing section): that suite verifies the *real native rendering* end-to-end
+for one platform, driving actual live GTK widgets with synthetic input; the controller/model extraction
+here verifies the *decision logic* with no toolkit at all, for every platform at once. Both are worth
+having; neither substitutes for the other.
 
 ## 7. Suggested rollout order
 
 Staged so each step is independently buildable/testable before the next starts — not a big-bang rewrite:
 
 1. **Quick wins** (§5) — cheap, already-understood, no design work needed.
-2. **`SwitcherModel`** first — highest duplication count (4 of 7 frontends), and two of those four
+2. **`SwitcherModel`** first — appears in all 4 remaining frontends, and two of them
    (`browser-windows-reactor`, `browser-macos-appkit`) already have it in nearly extractable shape. Migrate
    one frontend at a time, confirming existing behavior/tests still hold after each.
 3. **`SettingsController` + `KeybindingsController`** — same treatment.
 4. **`PageController`'s decision logic** — trickiest, since container strategy genuinely differs by platform
    (§3.7); only the *decision* half (what should happen) extracts, containers stay native/local.
-5. **Revisit `browser-windows-win32`/`browser-windows-nwg`/`browser-wx`** for the profile-picker/keybindings-
-   editor features they're currently missing (§3.6) — once the decision logic already exists elsewhere,
-   adding it to these three becomes "write the native rendering glue only," much cheaper than today.
