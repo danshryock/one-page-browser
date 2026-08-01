@@ -707,7 +707,10 @@ fn switcher_overlay(
     add_page_and_switch: Callback<String>,
     close_page: Callback<String>,
 ) -> Grid {
-    let tiles = browser_chrome_core::build_switcher_rows(&core.borrow(), &shared.history, search_query);
+    // No bookmarks integration on this platform (see `ARCHITECTURE.md`
+    // §5/Backlog) — `None` means `build_switcher_rows` simply skips that
+    // source.
+    let tiles = browser_chrome_core::build_switcher_rows(&core.borrow(), &shared.history, None, search_query);
 
     let start_page = shared.settings.borrow().start_page.clone();
     let tiles_for_select = tiles.clone();
@@ -769,6 +772,12 @@ fn tile_key(tile: &browser_chrome_core::SwitcherRow) -> String {
         SwitcherRow::Open { id, .. } => format!("open:{id}"),
         SwitcherRow::Add => "add".to_string(),
         SwitcherRow::History { url, .. } => format!("history:{url}"),
+        // Not reachable today (this platform never passes `Some(bookmarks)`
+        // to `build_switcher_rows` — see `switcher_overlay` — so these two
+        // variants are never actually produced), but handled anyway so this
+        // match stays exhaustive if that changes.
+        SwitcherRow::Bookmark { url, .. } => format!("bookmark:{url}"),
+        SwitcherRow::Similar { url, .. } => format!("similar:{url}"),
     }
 }
 
@@ -777,7 +786,9 @@ fn tile_element(tile: &browser_chrome_core::SwitcherRow) -> Element {
     let (title, domain) = match tile {
         SwitcherRow::Open { title, domain, .. } => (title.clone(), domain.clone()),
         SwitcherRow::Add => ("+".to_string(), String::new()),
-        SwitcherRow::History { title, domain, .. } => (title.clone(), domain.clone()),
+        SwitcherRow::History { title, domain, .. }
+        | SwitcherRow::Bookmark { title, domain, .. }
+        | SwitcherRow::Similar { title, domain, .. } => (title.clone(), domain.clone()),
     };
     vstack((
         Element::from(text_block(title).bold()),

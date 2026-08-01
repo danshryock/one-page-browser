@@ -6,6 +6,19 @@
 //! `rebuild_switcher_rows` — see `ARCHITECTURE.md` §3.2 for the duplication
 //! this closes.
 //!
+//! Modeled on `browser-linux-gtk3`'s version specifically, not the (simpler)
+//! shape `browser-windows-reactor`/`browser-macos-appkit` independently
+//! re-derived: gtk3's is the original, and the *only* one of the three that
+//! also searches bookmarks and lexically-similar history matches
+//! (`HistoryBackend::search_similar`) — dropping those to migrate gtk3 onto
+//! the simpler shape would have been exactly the kind of silent feature
+//! loss this whole extraction exists to prevent (see `ARCHITECTURE.md`
+//! §3.2's "drift already visible" callout). `bookmarks` is `Option<&
+//! Bookmarks>` rather than a required parameter since only `browser-linux-
+//! gtk3` has bookmark support wired up at all right now — `None` simply
+//! skips that source, so the other three frontends keep their current
+//! (bookmark-free) behavior exactly.
+//!
 //! Each frontend's job now shrinks to: call `build_switcher_rows` whenever
 //! the switcher opens or its query changes, render the result as native
 //! widgets, and call `activate_row` when the user picks one (a click, or —
@@ -13,12 +26,15 @@
 //! `ARCHITECTURE.md` §3.3 — a forced-new-page shortcut) to learn what should
 //! happen next.
 
-use browser_core::{domain_of, HistoryBackend, HistoryEntry, PageManager};
+use browser_core::{domain_of, Bookmarks, HistoryBackend, HistoryEntry, PageManager};
 use render_engine::RenderEngine;
 
 /// One row in the switcher's list — open pages matching the current query
 /// first, then a trailing "add page" row, then (only once there's a query)
-/// history matches for URLs not already open.
+/// exact history matches, then bookmark matches, then lexically-similar
+/// history matches — each source skips any URL a prior one already showed
+/// (mirrors `browser-linux-gtk3`'s single running `shown_urls` list across
+/// all three).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SwitcherRow {
     Open {
@@ -35,11 +51,15 @@ pub enum SwitcherRow {
         color: &'static str,
     },
     Add,
-    History {
-        url: String,
-        title: String,
-        domain: String,
-    },
+    /// Exact substring match against a `HistoryBackend` (URL or title).
+    History { url: String, title: String, domain: String },
+    /// Exact substring match against `Bookmarks` — only ever produced when
+    /// `build_switcher_rows` is given `Some(bookmarks)`.
+    Bookmark { url: String, title: String, domain: String },
+    /// Lexically-similar (not necessarily substring-matching) history entry
+    /// — see `HistoryBackend::search_similar`'s doc comment for exactly
+    /// what "similar" means here.
+    Similar { url: String, title: String, domain: String },
 }
 
 /// What activating a row (clicking it, or a single unambiguous match from a
@@ -52,15 +72,20 @@ pub enum SwitcherActivation {
     OpenNewPage(String),
 }
 
-/// Rebuilds every switcher row from scratch: open pages matching `query`
-/// (via `PageManager::matching_ids`, which already treats an empty query as
+/// Rebuilds every switcher row from scratch. Mirrors `browser-linux-gtk3`'s
+/// `rebuild_switcher_grid` exactly (the first implementation of this logic,
+/// and the one every later port re-derived, some incompletely — see this
+/// module's doc comment): open pages matching `query` (via
+/// `PageManager::matching_ids`, which already treats an empty query as
 /// "match everything"), a trailing "add page" row, then, only once there's
-/// a non-empty query, history matches whose URL isn't already open. Mirrors
-/// `browser-linux-gtk3`'s `rebuild_switcher_grid` exactly (the first
-/// implementation of this logic, and the one every later port re-derived).
+/// a non-empty query: exact history matches, bookmark matches (if
+/// `bookmarks` is `Some`), then lexically-similar history matches — each
+/// pass skipping any URL a prior one (an open page, or an earlier pass in
+/// this same call) already produced.
 pub fn build_switcher_rows<E: RenderEngine, H: HistoryBackend>(
     core: &PageManager<E>,
     history: &H,
+    bookmarks: Option<&Bookmarks>,
     query: &str,
 ) -> Vec<SwitcherRow> {
     let open_matches = core.matching_ids(query);
@@ -78,22 +103,53 @@ pub fn build_switcher_rows<E: RenderEngine, H: HistoryBackend>(
     }
     rows.push(SwitcherRow::Add);
 
-    if !query.trim().is_empty() {
-        let open_urls: Vec<String> = core.pages().iter().map(|p| p.current_url()).collect();
-        let history_matches: Vec<HistoryEntry> = history
-            .search(query, 8)
-            .unwrap_or_else(|err| {
-                eprintln!("history search failed: {err}");
-                Vec::new()
-            })
-            .into_iter()
-            .filter(|entry| !open_urls.contains(&entry.url))
-            .collect();
-        for entry in history_matches {
-            let title = if entry.title.is_empty() { "New Page".to_string() } else { entry.title };
-            rows.push(SwitcherRow::History { url: entry.url, title, domain: format!("{} \u{b7} history", entry.domain) });
+    if query.trim().is_empty() {
+        return rows;
+    }
+
+    let mut shown_urls: Vec<String> = core.pages().iter().map(|p| p.current_url()).collect();
+
+    let history_matches: Vec<HistoryEntry> = history.search(query, 8).unwrap_or_else(|err| {
+        eprintln!("history search failed: {err}");
+        Vec::new()
+    });
+    for entry in history_matches {
+        if shown_urls.contains(&entry.url) {
+            continue;
+        }
+        shown_urls.push(entry.url.clone());
+        let title = if entry.title.is_empty() { "New Page".to_string() } else { entry.title };
+        rows.push(SwitcherRow::History { url: entry.url, title, domain: format!("{} \u{b7} history", entry.domain) });
+    }
+
+    if let Some(bookmarks) = bookmarks {
+        for bookmark in bookmarks.search(query).into_iter().take(8) {
+            if shown_urls.contains(&bookmark.url) {
+                continue;
+            }
+            shown_urls.push(bookmark.url.clone());
+            let title = if bookmark.title.is_empty() { "New Page".to_string() } else { bookmark.title.clone() };
+            rows.push(SwitcherRow::Bookmark {
+                url: bookmark.url.clone(),
+                title,
+                domain: format!("{} \u{b7} bookmark", bookmark.domain),
+            });
         }
     }
+
+    let similar_matches: Vec<HistoryEntry> = history.search_similar(query, 5).unwrap_or_else(|err| {
+        eprintln!("history similarity search failed: {err}");
+        Vec::new()
+    });
+    for entry in similar_matches {
+        if shown_urls.contains(&entry.url) {
+            continue;
+        }
+        shown_urls.push(entry.url.clone());
+        let title = if entry.title.is_empty() { "New Page".to_string() } else { entry.title };
+        rows.push(SwitcherRow::Similar { url: entry.url, title, domain: format!("{} \u{b7} similar", entry.domain) });
+    }
+
     rows
 }
 
@@ -107,7 +163,9 @@ pub fn activate_row(rows: &[SwitcherRow], idx: usize, start_page: &str) -> Optio
     match rows.get(idx)? {
         SwitcherRow::Open { id, .. } => Some(SwitcherActivation::SwitchTo(id.clone())),
         SwitcherRow::Add => Some(SwitcherActivation::OpenNewPage(start_page.to_string())),
-        SwitcherRow::History { url, .. } => Some(SwitcherActivation::OpenNewPage(url.clone())),
+        SwitcherRow::History { url, .. } | SwitcherRow::Bookmark { url, .. } | SwitcherRow::Similar { url, .. } => {
+            Some(SwitcherActivation::OpenNewPage(url.clone()))
+        }
     }
 }
 
@@ -116,7 +174,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use browser_core::{MemoryHistoryStore, PageManager};
+    use browser_core::{Bookmarks, MemoryHistoryStore, PageManager};
 
     use super::*;
     use browser_core::testing::MockEngine;
@@ -134,7 +192,7 @@ mod tests {
         insert_page(&mut mgr, "https://rust-lang.org");
         let history = MemoryHistoryStore::default();
 
-        let rows = build_switcher_rows(&mgr, &history, "");
+        let rows = build_switcher_rows(&mgr, &history, None, "");
         assert_eq!(rows.len(), 3); // 2 open pages + Add
         assert!(matches!(rows[2], SwitcherRow::Add));
     }
@@ -146,7 +204,7 @@ mod tests {
         let history = MemoryHistoryStore::default();
         history.record_visit("https://rust-lang.org/learn", "Learn Rust").unwrap();
 
-        let rows = build_switcher_rows(&mgr, &history, "rust");
+        let rows = build_switcher_rows(&mgr, &history, None, "rust");
         // The open "example.com" page shouldn't match "rust" at all, so
         // just Add + the one history entry.
         assert_eq!(rows.len(), 2);
@@ -161,7 +219,7 @@ mod tests {
         let history = MemoryHistoryStore::default();
         history.record_visit("https://rust-lang.org/learn", "Learn Rust").unwrap();
 
-        let rows = build_switcher_rows(&mgr, &history, "rust");
+        let rows = build_switcher_rows(&mgr, &history, None, "rust");
         // Open page matches "rust" in its URL, so: Open row + Add — no
         // second History row for the same URL.
         assert_eq!(rows.len(), 2);
@@ -175,7 +233,7 @@ mod tests {
         insert_page(&mut mgr, "https://example.com");
         let history = MemoryHistoryStore::default();
 
-        let rows = build_switcher_rows(&mgr, &history, "");
+        let rows = build_switcher_rows(&mgr, &history, None, "");
         let SwitcherRow::Open { color, .. } = &rows[0] else { panic!("expected an Open row") };
         assert!(!color.is_empty());
     }
@@ -189,10 +247,47 @@ mod tests {
         insert_page(&mut mgr, "https://rust-lang.org");
 
         let history = MemoryHistoryStore::default();
-        let rows = build_switcher_rows(&mgr, &history, "");
+        let rows = build_switcher_rows(&mgr, &history, None, "");
         let unloaded = rows.iter().find(|r| matches!(r, SwitcherRow::Open { id, .. } if id == "0")).unwrap();
         let SwitcherRow::Open { domain, .. } = unloaded else { unreachable!() };
         assert!(domain.contains("unloaded"), "expected 'unloaded' marker in {domain:?}");
+    }
+
+    #[test]
+    fn bookmark_match_is_included_when_bookmarks_provided() {
+        let mgr = PageManager::<MockEngine>::new(None);
+        let history = MemoryHistoryStore::default();
+        let mut bookmarks = Bookmarks::default();
+        bookmarks.add("https://rust-lang.org/book", "The Rust Book", 0);
+
+        let rows = build_switcher_rows(&mgr, &history, Some(&bookmarks), "rust");
+        assert!(rows.iter().any(|r| matches!(r, SwitcherRow::Bookmark { url, .. } if url == "https://rust-lang.org/book")));
+    }
+
+    #[test]
+    fn bookmark_already_shown_as_history_is_not_duplicated() {
+        let mgr = PageManager::<MockEngine>::new(None);
+        let history = MemoryHistoryStore::default();
+        history.record_visit("https://rust-lang.org/book", "The Rust Book").unwrap();
+        let mut bookmarks = Bookmarks::default();
+        bookmarks.add("https://rust-lang.org/book", "The Rust Book", 0);
+
+        let rows = build_switcher_rows(&mgr, &history, Some(&bookmarks), "rust");
+        let matches: Vec<_> = rows.iter().filter(|r| matches!(r, SwitcherRow::History { .. } | SwitcherRow::Bookmark { .. })).collect();
+        assert_eq!(matches.len(), 1, "expected exactly one row for the shared URL, got {matches:?}");
+        assert!(matches!(matches[0], SwitcherRow::History { .. }), "history match should win, being checked first");
+    }
+
+    #[test]
+    fn no_bookmarks_source_means_no_bookmark_rows_at_all() {
+        let mgr = PageManager::<MockEngine>::new(None);
+        let history = MemoryHistoryStore::default();
+        // No `Bookmarks::add` call needed — passing `None` should mean the
+        // bookmark source is never consulted at all, matching
+        // `browser-windows-reactor`/`browser-macos-appkit`/
+        // `browser-windows-winui`'s current (bookmark-free) behavior.
+        let rows = build_switcher_rows(&mgr, &history, None, "anything");
+        assert!(!rows.iter().any(|r| matches!(r, SwitcherRow::Bookmark { .. })));
     }
 
     #[test]
@@ -200,7 +295,7 @@ mod tests {
         let mut mgr = PageManager::<MockEngine>::new(None);
         insert_page(&mut mgr, "https://example.com");
         let history = MemoryHistoryStore::default();
-        let rows = build_switcher_rows(&mgr, &history, "");
+        let rows = build_switcher_rows(&mgr, &history, None, "");
 
         assert_eq!(activate_row(&rows, 0, "https://start.example"), Some(SwitcherActivation::SwitchTo("0".to_string())));
     }
@@ -209,7 +304,7 @@ mod tests {
     fn activate_add_row_opens_the_start_page() {
         let mgr = PageManager::<MockEngine>::new(None);
         let history = MemoryHistoryStore::default();
-        let rows = build_switcher_rows(&mgr, &history, "");
+        let rows = build_switcher_rows(&mgr, &history, None, "");
 
         assert_eq!(rows, vec![SwitcherRow::Add]);
         assert_eq!(activate_row(&rows, 0, "https://start.example"), Some(SwitcherActivation::OpenNewPage("https://start.example".to_string())));
@@ -220,7 +315,7 @@ mod tests {
         let mgr = PageManager::<MockEngine>::new(None);
         let history = MemoryHistoryStore::default();
         history.record_visit("https://rust-lang.org/learn", "Learn Rust").unwrap();
-        let rows = build_switcher_rows(&mgr, &history, "rust");
+        let rows = build_switcher_rows(&mgr, &history, None, "rust");
 
         let history_idx = rows.iter().position(|r| matches!(r, SwitcherRow::History { .. })).unwrap();
         assert_eq!(
@@ -230,10 +325,25 @@ mod tests {
     }
 
     #[test]
+    fn activate_bookmark_row_opens_its_url() {
+        let mgr = PageManager::<MockEngine>::new(None);
+        let history = MemoryHistoryStore::default();
+        let mut bookmarks = Bookmarks::default();
+        bookmarks.add("https://rust-lang.org/book", "The Rust Book", 0);
+        let rows = build_switcher_rows(&mgr, &history, Some(&bookmarks), "rust");
+
+        let idx = rows.iter().position(|r| matches!(r, SwitcherRow::Bookmark { .. })).unwrap();
+        assert_eq!(
+            activate_row(&rows, idx, "https://start.example"),
+            Some(SwitcherActivation::OpenNewPage("https://rust-lang.org/book".to_string()))
+        );
+    }
+
+    #[test]
     fn activate_out_of_range_index_is_none() {
         let mgr = PageManager::<MockEngine>::new(None);
         let history = MemoryHistoryStore::default();
-        let rows = build_switcher_rows(&mgr, &history, "");
+        let rows = build_switcher_rows(&mgr, &history, None, "");
         assert_eq!(activate_row(&rows, 99, "https://start.example"), None);
     }
 }

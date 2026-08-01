@@ -17,6 +17,11 @@ build/run instructions.
   the number of frontends carrying near-duplicate logic (see `ARCHITECTURE.md`). All three had been
   cross-compiled and run under Wine from this dev machine at one point, but were unmaintained and behind
   the other frontends in scope; recoverable from git history if ever needed again.
+- New `browser-chrome-core` crate (see `ARCHITECTURE.md` §4/§7) holding toolkit-agnostic decision logic
+  shared across frontends, starting with `SwitcherModel` (`build_switcher_rows`/`activate_row`, 13 unit
+  tests, zero native toolkit or real I/O in the test suite). All four frontends migrated onto it, replacing
+  each one's hand-rolled tile-building/activation logic. `SettingsController`/`KeybindingsController`/
+  `PageController` are the same treatment, not yet started.
 - History tracking and search, integrated into the switcher grid.
 - External link launch: a standalone "open in which profile?" chooser when launched with a URL argument.
 - In-app profile picker (create/switch profiles; switching launches a new process).

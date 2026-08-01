@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use browser_core::{
-    domain_of, list_profile_names, resolve_address_input, Action, HistoryStore, KeyChord, Keybindings, PageManager, Profile,
+    list_profile_names, resolve_address_input, Action, HistoryStore, KeyChord, Keybindings, PageManager, Profile,
     Settings,
 };
 use render_engine::{AssertSend, RenderEngine, WebView2Engine};
@@ -579,14 +579,14 @@ impl AppState {
         self.rebuild_switcher_grid();
     }
 
-    /// Rebuilds the switcher's tile grid from scratch — open pages matching
-    /// the search box's current text (or all of them, if empty —
-    /// `matching_ids` already handles that; this filtering is itself new,
-    /// fixing a real gap where typing previously did nothing to the visible
-    /// tiles here, unlike gtk3's `FlowBox` filtering), plus, when there's a
-    /// query, matching history entries not already open. No `WrapPanel`/
-    /// `GridView` binding exists in this crate's subset, so tiles are laid
-    /// out by hand into a fixed `TILE_COLUMNS`-wide grid — and since
+    /// Rebuilds the switcher's tile grid from scratch, sourcing the row list
+    /// itself from `browser_chrome_core::build_switcher_rows` (open pages
+    /// matching the search box's current text, the "+" add row, and matching
+    /// history entries not already open, once there's a query — see that
+    /// function's doc comment; `None` for the bookmarks source, since this
+    /// crate has no bookmarks integration). No `WrapPanel`/`GridView`
+    /// binding exists in this crate's subset, so tiles are laid out by hand
+    /// into a fixed `TILE_COLUMNS`-wide grid — and since
     /// `FrameworkElement::SizeChanged` has no working `add` accessor either
     /// (see this module's doc comment), the column count can't react to the
     /// actual window width the way gtk3's `FlowBox` does; it's a fixed
@@ -598,28 +598,10 @@ impl AppState {
         let _ = row_defs.Clear();
 
         let query = self.search_box.Text().map(|t| t.to_string()).unwrap_or_default();
-        let open_matches = self.core.borrow().matching_ids(&query);
+        let start_page = self.settings.borrow().start_page.clone();
+        let rows = browser_chrome_core::build_switcher_rows(&self.core.borrow(), &self.history, None, &query);
 
-        // History matches — only once there's a query to narrow by (an
-        // empty query would otherwise dump the entire history into the
-        // grid). Skips any entry whose URL is already an open page's.
-        let history_matches: Vec<browser_core::HistoryEntry> = if query.trim().is_empty() {
-            Vec::new()
-        } else {
-            let open_urls: Vec<String> = self.core.borrow().pages().iter().map(|p| p.current_url()).collect();
-            self.history
-                .search(&query, 8)
-                .unwrap_or_else(|err| {
-                    eprintln!("history search failed: {err}");
-                    Vec::new()
-                })
-                .into_iter()
-                .filter(|entry| !open_urls.contains(&entry.url))
-                .collect()
-        };
-
-        let tile_count = open_matches.len() + 1 + history_matches.len(); // +1 for the trailing add-tile
-        let row_count = ((tile_count as i32) + TILE_COLUMNS - 1) / TILE_COLUMNS;
+        let row_count = ((rows.len() as i32) + TILE_COLUMNS - 1) / TILE_COLUMNS;
         for _ in 0..row_count.max(1) {
             if let Ok(row) = RowDefinition::new() {
                 let _ = row.SetHeight(GridLength { Value: TILE_HEIGHT as f64, GridUnitType: GridUnitType::Pixel });
@@ -627,83 +609,46 @@ impl AppState {
             }
         }
 
-        let mut index = 0i32;
-        {
-            let core = self.core.borrow();
-            for page in core.pages() {
-                if !open_matches.contains(&page.id) {
-                    continue;
-                }
-                let id = page.id.clone();
-                let title_text = {
-                    let t = page.title.borrow();
-                    if t.is_empty() { "New Page".to_string() } else { t.clone() }
-                };
-                let url = page.current_url();
-                let domain = domain_of(&url);
-                let domain_text = if page.loaded { domain } else { format!("{domain} \u{b7} unloaded") };
+        for (idx, row) in rows.iter().enumerate() {
+            // Every row kind renders as the same title/domain tile shape —
+            // this crate never had per-page color-coding or a close button
+            // (see `build_tile`'s doc comment), so there's no visual
+            // distinction to preserve between Open/History/Bookmark/Similar
+            // the way gtk3's CSS classes give it. Bookmark/Similar are
+            // unreachable today (bookmarks is `None` above) but matched
+            // anyway so this stays exhaustive as the shared model grows.
+            let built = match row {
+                browser_chrome_core::SwitcherRow::Add => build_add_tile(),
+                browser_chrome_core::SwitcherRow::Open { title, domain, .. }
+                | browser_chrome_core::SwitcherRow::History { title, domain, .. }
+                | browser_chrome_core::SwitcherRow::Bookmark { title, domain, .. }
+                | browser_chrome_core::SwitcherRow::Similar { title, domain, .. } => build_tile(title, domain),
+            };
+            let Ok(tile) = built else { continue };
 
-                if let Ok(tile) = build_tile(&title_text, &domain_text) {
-                    let _ = Grid::SetRow(&tile, index / TILE_COLUMNS);
-                    let _ = Grid::SetColumn(&tile, index % TILE_COLUMNS);
-                    let _ = children.Append(&tile);
+            let idx = idx as i32;
+            let _ = Grid::SetRow(&tile, idx / TILE_COLUMNS);
+            let _ = Grid::SetColumn(&tile, idx % TILE_COLUMNS);
+            let _ = children.Append(&tile);
 
-                    let app_clone = Rc::clone(self);
-                    let id_clone = id.clone();
-                    let state = AssertSend((app_clone, id_clone));
-                    let _ = tile.Click(&winui3::Microsoft::UI::Xaml::RoutedEventHandler::new(move |_, _| {
-                        let state = &state;
-                        let (app, id) = &state.0;
-                        app.switch_to(id);
-                        Ok(())
-                    }));
-                }
-                index += 1;
-            }
-        }
-
-        if let Ok(add_tile) = build_add_tile() {
-            let _ = Grid::SetRow(&add_tile, index / TILE_COLUMNS);
-            let _ = Grid::SetColumn(&add_tile, index % TILE_COLUMNS);
-            let _ = children.Append(&add_tile);
-
+            let activation = browser_chrome_core::activate_row(&rows, idx as usize, &start_page);
             let app_clone = Rc::clone(self);
-            let state = AssertSend(app_clone);
-            let _ = add_tile.Click(&winui3::Microsoft::UI::Xaml::RoutedEventHandler::new(move |_, _| {
+            let state = AssertSend((app_clone, activation));
+            let _ = tile.Click(&winui3::Microsoft::UI::Xaml::RoutedEventHandler::new(move |_, _| {
                 let state = &state;
-                let app = &state.0;
-                let start_page = app.settings.borrow().start_page.clone();
-                if let Err(err) = app.add_page(&start_page) {
-                    eprintln!("failed to open new page: {err}");
+                let (app, activation) = &state.0;
+                match activation {
+                    Some(browser_chrome_core::SwitcherActivation::SwitchTo(id)) => app.switch_to(id),
+                    Some(browser_chrome_core::SwitcherActivation::OpenNewPage(url)) => {
+                        if let Err(err) = app.add_page(url) {
+                            eprintln!("failed to open page: {err}");
+                        }
+                        app.close_switcher();
+                    }
+                    None => {}
                 }
-                app.close_switcher();
                 Ok(())
             }));
-        }
-        index += 1;
-
-        for entry in history_matches {
-            let title_text = if entry.title.is_empty() { "New Page".to_string() } else { entry.title.clone() };
-            let domain_text = format!("{} \u{b7} history", entry.domain);
-            if let Ok(tile) = build_tile(&title_text, &domain_text) {
-                let _ = Grid::SetRow(&tile, index / TILE_COLUMNS);
-                let _ = Grid::SetColumn(&tile, index % TILE_COLUMNS);
-                let _ = children.Append(&tile);
-
-                let app_clone = Rc::clone(self);
-                let url = entry.url.clone();
-                let state = AssertSend((app_clone, url));
-                let _ = tile.Click(&winui3::Microsoft::UI::Xaml::RoutedEventHandler::new(move |_, _| {
-                    let state = &state;
-                    let (app, url) = &state.0;
-                    if let Err(err) = app.add_page(url) {
-                        eprintln!("failed to open history entry: {err}");
-                    }
-                    app.close_switcher();
-                    Ok(())
-                }));
-            }
-            index += 1;
         }
     }
 }

@@ -260,9 +260,19 @@ no new test infrastructure needed.
   `color` field from §3.2. Generic over `HistoryBackend` (not just `HistoryStore`), so it's tested with
   `MemoryHistoryStore` — real `MockEngine`/`MemoryHistoryStore`, zero real webview/SQLite I/O, reusing
   `browser-core`'s own test doubles exactly as planned (see `browser_core::testing`, newly exposed for this
-  — previously private to `browser-core`'s own `#[cfg(test)] mod tests`). `browser-windows-reactor` and
-  `browser-macos-appkit` both migrated to it (their local `Tile`/`SwitcherRow` enums and hand-copied
-  row-building removed entirely); `browser-linux-gtk3`/`browser-windows-winui` not yet migrated.
+  — previously private to `browser-core`'s own `#[cfg(test)] mod tests`). Generalized once more (`Bookmark`/
+  `Similar` row variants, `bookmarks: Option<&Bookmarks>` parameter) before migrating `browser-linux-gtk3` —
+  its real switcher also searches bookmarks and lexically-similar history matches, which the original
+  3-variant shape (modeled on the simpler reactor/macos-appkit switchers) would have silently dropped.
+  All four frontends now migrated: `browser-windows-reactor` and `browser-macos-appkit` (their local `Tile`/
+  `SwitcherRow` enums and hand-copied row-building removed entirely), `browser-linux-gtk3` (its tile-building
+  split into `build_open_tile`/`build_add_tile`/`build_search_result_tile` helpers keyed by `SwitcherRow`
+  variant, with every tile's `widget_name` now its index into a stored `switcher_rows` snapshot — a bonus
+  fix along the way: history/bookmark/similar tiles previously had no `widget_name` at all, so keyboard
+  Enter/Space only ever worked on open-page/add tiles; routing every tile through the same index-based
+  `activate_switcher_row` fixed that gap for free), and `browser-windows-winui` (`None` passed for
+  `bookmarks` — no bookmarks integration in that crate — and each tile's `Click` closure now just captures
+  the `SwitcherActivation` computed once at build time, rather than a separate closure shape per row kind).
 - **`SettingsController`**: draft-state handling (start page, search engine index, unlimited/limit), Save/
   Cancel, `String`/`bool`/`Option<usize>` fields only — no native widgets anywhere in this type.
 - **`KeybindingsController`**: add/remove/commit against `Keybindings`, decoupled from *how* the `KeyChord`
@@ -317,11 +327,11 @@ having; neither substitutes for the other.
 Staged so each step is independently buildable/testable before the next starts — not a big-bang rewrite:
 
 1. ✅ **Quick wins** (§5) — done.
-2. 🟡 **`SwitcherModel`** — done as a crate, migrated to `browser-windows-reactor`/`browser-macos-appkit` (the
-   two that already had it in nearly extractable shape). Still to do: migrate `browser-linux-gtk3` (the
-   original implementation everything else was derived from — GTK's `FlowBox` renders `SwitcherRow` instead
-   of building its own tiles) and `browser-windows-winui`, and give `browser-windows-reactor`'s
-   `tile_element` real color rendering now that `SwitcherRow::Open` carries it (§4's `SwitcherModel` bullet).
+2. ✅ **`SwitcherModel`** — done as a crate, migrated to all four frontends (`browser-windows-reactor`,
+   `browser-macos-appkit`, `browser-linux-gtk3`, `browser-windows-winui`). One deliberately-deferred item
+   remains: `browser-windows-reactor`'s `tile_element` still doesn't render `SwitcherRow::Open`'s `color` —
+   no background-color builder exists in that crate's bound subset of the WinUI 3 API (see the comment at
+   `tile_element`'s definition) — a real, narrow toolkit gap, not a modeling gap.
 3. **`SettingsController` + `KeybindingsController`** — same treatment.
 4. **`PageController`'s decision logic** — trickiest, since container strategy genuinely differs by platform
    (§3.7); only the *decision* half (what should happen) extracts, containers stay native/local.

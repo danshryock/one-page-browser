@@ -82,6 +82,11 @@ pub struct AppState {
     /// the active page changes or a bookmark is added/removed for it.
     bookmark_toggle_button: gtk::Button,
     bookmarks: RefCell<Bookmarks>,
+    /// Snapshot taken by the last `rebuild_switcher_grid` call — the source
+    /// of truth `activate_switcher_row` indexes into, so a tile's widget
+    /// name can just be its position in this list rather than needing a
+    /// separate id/url stashed on the widget itself.
+    switcher_rows: RefCell<Vec<browser_chrome_core::SwitcherRow>>,
     core: RefCell<PageManager<WryEngine>>,
     /// GTK `Stack` children, keyed by page id — `browser_core::Page` doesn't
     /// hold these since they're a GTK-only concept.
@@ -920,6 +925,32 @@ impl AppState {
         self.close_switcher();
     }
 
+    /// Routes a tile activation (click or keyboard Enter/Space, both funnel
+    /// through here — see `rebuild_switcher_grid` and the flowbox's
+    /// `connect_child_activated` handler) through `browser_chrome_core`'s
+    /// shared `activate_row`, keyed by the tile's position in
+    /// `switcher_rows` (the same snapshot `rebuild_switcher_grid` just
+    /// built the grid from). Covers every row kind uniformly, including
+    /// history/bookmark/similar tiles — previously those only supported
+    /// mouse clicks, since they never got a real `widget_name` at all.
+    pub fn activate_switcher_row(self: &Rc<Self>, idx: usize) {
+        let start_page = self.settings.borrow().start_page.clone();
+        let activation = {
+            let rows = self.switcher_rows.borrow();
+            browser_chrome_core::activate_row(&rows, idx, &start_page)
+        };
+        match activation {
+            Some(browser_chrome_core::SwitcherActivation::SwitchTo(id)) => self.switch_to(&id),
+            Some(browser_chrome_core::SwitcherActivation::OpenNewPage(url)) => {
+                if let Err(err) = self.add_page(&url) {
+                    eprintln!("failed to open page: {err}");
+                }
+                self.close_switcher();
+            }
+            None => {}
+        }
+    }
+
     pub fn close_page(self: &Rc<Self>, id: &str) {
         let was_active = self.core.borrow().active_id() == id;
 
@@ -946,114 +977,130 @@ impl AppState {
         self.rebuild_switcher_grid();
     }
 
-    /// Rebuilds every tile from scratch — open pages matching the search
-    /// box's current text (or all of them, if empty — `matching_ids` already
-    /// handles that), plus, when there's a query, matching history entries
-    /// not already open. Does its own filtering here (rather than GTK's
-    /// separate `set_filter_func`/`invalidate_filter` mechanism, used until
-    /// this history integration) since folding in a second, differently-
-    /// sourced set of results (history, queried fresh each time) doesn't fit
-    /// a filter predicate over already-built children.
+    /// Rebuilds every tile from scratch, sourcing the row list itself from
+    /// `browser_chrome_core::build_switcher_rows` (open pages matching the
+    /// search box's current text, the "+" add row, and — once there's a
+    /// query — matching history/bookmark/lexically-similar entries not
+    /// already open, all deduped against each other; see that function's
+    /// doc comment). This method's job is purely turning each `SwitcherRow`
+    /// into a native GTK tile; each tile's `widget_name` is just its index
+    /// into `switcher_rows`, which both `connect_child_activated` and
+    /// `activate_switcher_row` key off of — one shared activation path for
+    /// every row kind, mouse or keyboard.
     fn rebuild_switcher_grid(self: &Rc<Self>) {
         for child in self.flowbox.children() {
             self.flowbox.remove(&child);
         }
 
         let query = self.address_bar.text().to_string();
-        let open_matches = self.core.borrow().matching_ids(&query);
+        let rows = browser_chrome_core::build_switcher_rows(
+            &self.core.borrow(),
+            &self.history,
+            Some(&self.bookmarks.borrow()),
+            &query,
+        );
 
-        {
-            let core = self.core.borrow();
-            for page in core.pages() {
-                if !open_matches.contains(&page.id) {
-                    continue;
+        for (idx, row) in rows.iter().enumerate() {
+            let flow_child = match row {
+                browser_chrome_core::SwitcherRow::Open { id, title, domain, color } => {
+                    self.build_open_tile(idx, id, title, domain, color)
                 }
-                let id = page.id.clone();
-                let title_text = {
-                    let t = page.title.borrow();
-                    if t.is_empty() { "New Page".to_string() } else { t.clone() }
-                };
-                let url = page.current_url();
-                let domain = domain_of(&url);
-
-                let tile = gtk::Button::new();
-                tile.style_context().add_class("page-tile");
-                let css = gtk::CssProvider::new();
-                // Adwaita's button theme draws its own background-image (a
-                // gradient) on top of any background-color, which is why the
-                // tile's real color was only visible on hover (when the theme's
-                // hover state happens to thin that gradient). Explicitly zeroing
-                // background-image/border/box-shadow here removes the theme's
-                // button chrome so the flat color always shows.
-                let _ = css.load_from_data(
-                    format!(
-                        ".page-tile {{ background-image: none; background-color: {}; \
-                          border: none; box-shadow: none; border-radius: 10px; color: #fff; }}",
-                        page.color
-                    )
-                    .as_bytes(),
-                );
-                tile.style_context()
-                    .add_provider(&css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-                if !page.loaded {
-                    tile.style_context().add_class("page-tile-unloaded");
+                browser_chrome_core::SwitcherRow::Add => self.build_add_tile(idx),
+                browser_chrome_core::SwitcherRow::History { title, domain, .. } => {
+                    self.build_search_result_tile(idx, "history-tile", title, domain)
                 }
-                tile.set_size_request(150, 110);
-                // Keyboard focus should land on the FlowBoxChild wrapper, not
-                // descend into this button, so arrow keys move between tiles
-                // instead of highlighting sub-widgets. Mouse clicks still work —
-                // can_focus only affects keyboard focus/tab order.
-                tile.set_can_focus(false);
-
-                let inner = gtk::Box::new(gtk::Orientation::Vertical, 2);
-                inner.set_margin(10);
-                inner.set_valign(gtk::Align::End);
-                let title_label = gtk::Label::new(Some(&title_text));
-                title_label.set_halign(gtk::Align::Start);
-                title_label.style_context().add_class("tile-title");
-                let domain_text = if page.loaded { domain } else { format!("{domain} \u{b7} unloaded") };
-                let domain_label = gtk::Label::new(Some(&domain_text));
-                domain_label.set_halign(gtk::Align::Start);
-                domain_label.style_context().add_class("tile-subtitle");
-                inner.pack_start(&title_label, false, false, 0);
-                inner.pack_start(&domain_label, false, false, 0);
-                tile.add(&inner);
-
-                let app_clone = Rc::clone(self);
-                let id_clone = id.clone();
-                tile.connect_clicked(move |_| {
-                    app_clone.switch_to(&id_clone);
-                });
-
-                let close_btn = gtk::Button::new();
-                close_btn.style_context().add_class("tile-close-btn");
-                let close_label = gtk::Label::new(Some("\u{d7}"));
-                close_label.style_context().add_class("tile-close-label");
-                close_btn.add(&close_label);
-                close_btn.set_halign(gtk::Align::End);
-                close_btn.set_valign(gtk::Align::Start);
-                close_btn.set_margin_top(10);
-                close_btn.set_margin_end(10);
-                close_btn.set_size_request(18, 18);
-                close_btn.set_can_focus(false);
-                let app_clone = Rc::clone(self);
-                let id_clone = id.clone();
-                close_btn.connect_clicked(move |_| {
-                    app_clone.close_page(&id_clone);
-                });
-
-                let tile_overlay = gtk::Overlay::new();
-                tile_overlay.add(&tile);
-                tile_overlay.add_overlay(&close_btn);
-
-                let flow_child = gtk::FlowBoxChild::new();
-                flow_child.set_widget_name(&id);
-                flow_child.add(&tile_overlay);
-                flow_child.show_all();
-                self.flowbox.insert(&flow_child, -1);
-            }
+                browser_chrome_core::SwitcherRow::Bookmark { title, domain, .. } => {
+                    self.build_search_result_tile(idx, "bookmark-tile", title, domain)
+                }
+                browser_chrome_core::SwitcherRow::Similar { title, domain, .. } => {
+                    self.build_search_result_tile(idx, "similar-tile", title, domain)
+                }
+            };
+            flow_child.set_widget_name(&idx.to_string());
+            flow_child.show_all();
+            self.flowbox.insert(&flow_child, -1);
         }
 
+        *self.switcher_rows.borrow_mut() = rows;
+    }
+
+    /// Builds one open-page tile — real per-page palette color (see the CSS
+    /// comment below), a close button overlaid on top (closing a page is
+    /// not part of `activate_row`'s model — see `activate_switcher_row`'s
+    /// doc comment — so it stays wired directly to `close_page` here), and
+    /// the tile body itself wired to `activate_switcher_row(idx)`.
+    fn build_open_tile(self: &Rc<Self>, idx: usize, id: &str, title: &str, domain: &str, color: &str) -> gtk::FlowBoxChild {
+        let tile = gtk::Button::new();
+        tile.style_context().add_class("page-tile");
+        let css = gtk::CssProvider::new();
+        // Adwaita's button theme draws its own background-image (a
+        // gradient) on top of any background-color, which is why the
+        // tile's real color was only visible on hover (when the theme's
+        // hover state happens to thin that gradient). Explicitly zeroing
+        // background-image/border/box-shadow here removes the theme's
+        // button chrome so the flat color always shows.
+        let _ = css.load_from_data(
+            format!(
+                ".page-tile {{ background-image: none; background-color: {color}; \
+                  border: none; box-shadow: none; border-radius: 10px; color: #fff; }}"
+            )
+            .as_bytes(),
+        );
+        tile.style_context()
+            .add_provider(&css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        if domain.ends_with("unloaded") {
+            tile.style_context().add_class("page-tile-unloaded");
+        }
+        tile.set_size_request(150, 110);
+        // Keyboard focus should land on the FlowBoxChild wrapper, not
+        // descend into this button, so arrow keys move between tiles
+        // instead of highlighting sub-widgets. Mouse clicks still work —
+        // can_focus only affects keyboard focus/tab order.
+        tile.set_can_focus(false);
+
+        let inner = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        inner.set_margin(10);
+        inner.set_valign(gtk::Align::End);
+        let title_label = gtk::Label::new(Some(title));
+        title_label.set_halign(gtk::Align::Start);
+        title_label.style_context().add_class("tile-title");
+        let domain_label = gtk::Label::new(Some(domain));
+        domain_label.set_halign(gtk::Align::Start);
+        domain_label.style_context().add_class("tile-subtitle");
+        inner.pack_start(&title_label, false, false, 0);
+        inner.pack_start(&domain_label, false, false, 0);
+        tile.add(&inner);
+
+        let app_clone = Rc::clone(self);
+        tile.connect_clicked(move |_| app_clone.activate_switcher_row(idx));
+
+        let close_btn = gtk::Button::new();
+        close_btn.style_context().add_class("tile-close-btn");
+        let close_label = gtk::Label::new(Some("\u{d7}"));
+        close_label.style_context().add_class("tile-close-label");
+        close_btn.add(&close_label);
+        close_btn.set_halign(gtk::Align::End);
+        close_btn.set_valign(gtk::Align::Start);
+        close_btn.set_margin_top(10);
+        close_btn.set_margin_end(10);
+        close_btn.set_size_request(18, 18);
+        close_btn.set_can_focus(false);
+        let app_clone = Rc::clone(self);
+        let id_clone = id.to_string();
+        close_btn.connect_clicked(move |_| {
+            app_clone.close_page(&id_clone);
+        });
+
+        let tile_overlay = gtk::Overlay::new();
+        tile_overlay.add(&tile);
+        tile_overlay.add_overlay(&close_btn);
+
+        let flow_child = gtk::FlowBoxChild::new();
+        flow_child.add(&tile_overlay);
+        flow_child
+    }
+
+    fn build_add_tile(self: &Rc<Self>, idx: usize) -> gtk::FlowBoxChild {
         let add_tile = gtk::Button::new();
         add_tile.style_context().add_class("add-tile");
         add_tile.set_size_request(150, 110);
@@ -1062,119 +1109,20 @@ impl AppState {
         add_tile_label.style_context().add_class("add-tile-label");
         add_tile.add(&add_tile_label);
         let app_clone = Rc::clone(self);
-        add_tile.connect_clicked(move |_| {
-            let start_page = app_clone.settings.borrow().start_page.clone();
-            if let Err(err) = app_clone.add_page(&start_page) {
-                eprintln!("failed to open new page: {err}");
-            }
-            app_clone.close_switcher();
-        });
+        add_tile.connect_clicked(move |_| app_clone.activate_switcher_row(idx));
 
         let add_child = gtk::FlowBoxChild::new();
-        add_child.set_widget_name("__add__");
         add_child.add(&add_tile);
-        add_child.show_all();
-        self.flowbox.insert(&add_child, -1);
-
-        // History and bookmark matches — only once there's a query to narrow
-        // by (an empty query would otherwise dump the entire history/every
-        // bookmark into the grid). Skips any URL already shown as an open
-        // page's tile, or already shown as a history tile (a bookmarked page
-        // that's also in history would otherwise appear twice) — `shown_urls`
-        // accumulates across both loops for this.
-        if !query.trim().is_empty() {
-            let open_urls: Vec<String> = self.core.borrow().pages().iter().map(|p| p.current_url()).collect();
-            let mut shown_urls = open_urls.clone();
-
-            let history_matches = self.history.search(&query, 8).unwrap_or_else(|err| {
-                eprintln!("history search failed: {err}");
-                Vec::new()
-            });
-            for entry in history_matches {
-                if shown_urls.contains(&entry.url) {
-                    continue;
-                }
-                shown_urls.push(entry.url.clone());
-
-                let title_text = if entry.title.is_empty() { "New Page".to_string() } else { entry.title.clone() };
-                let url = entry.url.clone();
-                let flow_child = self.build_search_result_tile("history-tile", &title_text, &entry.domain, move |app| {
-                    if let Err(err) = app.add_page(&url) {
-                        eprintln!("failed to open history entry: {err}");
-                    }
-                    app.close_switcher();
-                });
-                self.flowbox.insert(&flow_child, -1);
-            }
-
-            let bookmark_matches: Vec<(String, String, String)> = self
-                .bookmarks
-                .borrow()
-                .search(&query)
-                .into_iter()
-                .take(8)
-                .map(|b| (b.url.clone(), b.title.clone(), b.domain.clone()))
-                .collect();
-            for (url, title, domain) in bookmark_matches {
-                if shown_urls.contains(&url) {
-                    continue;
-                }
-                shown_urls.push(url.clone());
-
-                let title_text = if title.is_empty() { "New Page".to_string() } else { title };
-                let flow_child = self.build_search_result_tile("bookmark-tile", &title_text, &domain, move |app| {
-                    if let Err(err) = app.add_page(&url) {
-                        eprintln!("failed to open bookmark: {err}");
-                    }
-                    app.close_switcher();
-                });
-                self.flowbox.insert(&flow_child, -1);
-            }
-
-            // Lexically-similar history matches — entries whose *title*
-            // shares vocabulary with the query without necessarily
-            // containing it as a literal substring (see
-            // `HistoryStore::search_similar`'s doc comment for exactly what
-            // kind of "similar" this is). Deliberately last and still
-            // deduped against `shown_urls`, so an entry already shown via
-            // exact substring match or as a bookmark doesn't also show up
-            // here.
-            let similar_matches = self.history.search_similar(&query, 5).unwrap_or_else(|err| {
-                eprintln!("history similarity search failed: {err}");
-                Vec::new()
-            });
-            for entry in similar_matches {
-                if shown_urls.contains(&entry.url) {
-                    continue;
-                }
-                shown_urls.push(entry.url.clone());
-
-                let title_text = if entry.title.is_empty() { "New Page".to_string() } else { entry.title.clone() };
-                let url = entry.url.clone();
-                let flow_child = self.build_search_result_tile("similar-tile", &title_text, &entry.domain, move |app| {
-                    if let Err(err) = app.add_page(&url) {
-                        eprintln!("failed to open history entry: {err}");
-                    }
-                    app.close_switcher();
-                });
-                self.flowbox.insert(&flow_child, -1);
-            }
-        }
+        add_child
     }
 
-    /// Builds one switcher-grid tile for a history or bookmark search
-    /// result — same shape as an open-page tile but without a close button,
-    /// tagged with `extra_css_class` (`"history-tile"`/`"bookmark-tile"`) so
-    /// the two read as visually distinct from open pages and each other.
-    /// `on_click` runs when the tile is clicked (open the entry and close
-    /// the switcher).
-    fn build_search_result_tile(
-        self: &Rc<Self>,
-        extra_css_class: &str,
-        title_text: &str,
-        domain: &str,
-        on_click: impl Fn(&Rc<Self>) + 'static,
-    ) -> gtk::FlowBoxChild {
+    /// Builds one switcher-grid tile for a history, bookmark, or
+    /// lexically-similar search result — same shape as an open-page tile
+    /// but without a close button, tagged with `extra_css_class`
+    /// (`"history-tile"`/`"bookmark-tile"`/`"similar-tile"`) so each source
+    /// reads as visually distinct. Wired to `activate_switcher_row(idx)`,
+    /// same as every other tile kind.
+    fn build_search_result_tile(self: &Rc<Self>, idx: usize, extra_css_class: &str, title_text: &str, domain: &str) -> gtk::FlowBoxChild {
         let tile = gtk::Button::new();
         tile.style_context().add_class("page-tile");
         tile.style_context().add_class(extra_css_class);
@@ -1195,11 +1143,10 @@ impl AppState {
         tile.add(&inner);
 
         let app_clone = Rc::clone(self);
-        tile.connect_clicked(move |_| on_click(&app_clone));
+        tile.connect_clicked(move |_| app_clone.activate_switcher_row(idx));
 
         let flow_child = gtk::FlowBoxChild::new();
         flow_child.add(&tile);
-        flow_child.show_all();
         flow_child
     }
 
@@ -1945,6 +1892,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         bookmarks_list_box: bookmarks_list_box.clone(),
         bookmark_toggle_button: bookmark_toggle_button.clone(),
         bookmarks: RefCell::new(bookmarks),
+        switcher_rows: RefCell::new(Vec::new()),
         core: RefCell::new(core),
         containers: RefCell::new(HashMap::new()),
         settings: RefCell::new(settings),
@@ -1991,21 +1939,17 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         // always lands on the FlowBoxChild itself, never its contents).
         let app = Rc::clone(&app);
         flowbox.connect_child_activated(move |_, child| {
-            let name = child.widget_name();
-            if name.as_str() == "__add__" {
-                let start_page = app.settings.borrow().start_page.clone();
-                if let Err(err) = app.add_page(&start_page) {
-                    eprintln!("failed to open new page: {err}");
-                }
-                app.close_switcher();
-            } else {
-                app.switch_to(name.as_str());
+            if let Ok(idx) = child.widget_name().parse::<usize>() {
+                app.activate_switcher_row(idx);
             }
         });
     }
     {
         // Delete closes whichever tile is currently highlighted by keyboard
-        // navigation (Browse selection mode keeps exactly one selected).
+        // navigation (Browse selection mode keeps exactly one selected) —
+        // only meaningful for open-page tiles; the add/history/bookmark/
+        // similar rows have nothing to close, same as `activate_row`
+        // deliberately having no close-page concept.
         let app = Rc::clone(&app);
         flowbox.connect_key_press_event(move |flowbox, event| {
             let is_delete = event.keyval() == gtk::gdk::keys::Key::from_name("Delete");
@@ -2013,9 +1957,14 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
                 return gtk::glib::Propagation::Proceed;
             }
             if let Some(child) = flowbox.selected_children().into_iter().next() {
-                let name = child.widget_name();
-                if name.as_str() != "__add__" {
-                    app.close_page(name.as_str());
+                if let Ok(idx) = child.widget_name().parse::<usize>() {
+                    let open_id = match app.switcher_rows.borrow().get(idx) {
+                        Some(browser_chrome_core::SwitcherRow::Open { id, .. }) => Some(id.clone()),
+                        _ => None,
+                    };
+                    if let Some(id) = open_id {
+                        app.close_page(&id);
+                    }
                 }
             }
             gtk::glib::Propagation::Stop

@@ -160,6 +160,7 @@ name = "browser-linux-gtk3"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "browser-chrome-core",
  "browser-core",
  "gtk",
  "gtk-test",
@@ -197,6 +198,7 @@ name = "browser-windows-winui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "browser-chrome-core",
  "browser-core",
  "render-engine",
  "windows 0.62.2",

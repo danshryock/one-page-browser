@@ -580,7 +580,10 @@ impl AppState {
     fn rebuild_switcher_rows(&self) {
         let mtm = self.mtm();
         let query = self.address_bar.stringValue().to_string();
-        let rows = browser_chrome_core::build_switcher_rows(&self.core.borrow(), &self.history, &query);
+        // No bookmarks integration on this platform (see `ARCHITECTURE.md`
+        // §5/Backlog) — `None` means `build_switcher_rows` simply skips
+        // that source.
+        let rows = browser_chrome_core::build_switcher_rows(&self.core.borrow(), &self.history, None, &query);
 
         clear_subviews(&self.switcher_rows_container);
         let width = self.switcher_rows_container.frame().size.width;
@@ -589,7 +592,13 @@ impl AppState {
             let (label, sub) = match row {
                 SwitcherRow::Open { title, domain, .. } => (title.clone(), domain.clone()),
                 SwitcherRow::Add => ("+ New Page".to_string(), String::new()),
-                SwitcherRow::History { title, domain, .. } => (title.clone(), domain.clone()),
+                // Bookmark/Similar are never actually produced here today
+                // (this platform always passes `None` for bookmarks — see
+                // `rebuild_switcher_rows`) but handled anyway so this match
+                // stays exhaustive if that changes.
+                SwitcherRow::History { title, domain, .. }
+                | SwitcherRow::Bookmark { title, domain, .. }
+                | SwitcherRow::Similar { title, domain, .. } => (title.clone(), domain.clone()),
             };
             let text = if sub.is_empty() { label } else { format!("{label}\n{sub}") };
             let button = unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str(&text), None, None, mtm) };
