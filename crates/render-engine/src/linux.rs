@@ -57,7 +57,84 @@ impl WryEngine {
         self.webview.evaluate_script(READER_MODE_SCRIPT)?;
         Ok(())
     }
+
+    /// Fills the page's first `input[type="password"]` (and, if `username`
+    /// isn't empty, whichever text/email/tel input immediately precedes it
+    /// in DOM order — within the same `<form>` if there is one, document-wide
+    /// otherwise) with `username`/`password`, via a real per-page-load DOM
+    /// mutation with nothing tracked on the Rust side — same "hand-rolled
+    /// heuristic, not perfect" spirit as `toggle_reader_mode`'s Readability.js
+    /// approximation. Doesn't handle multi-step (username-page-then-
+    /// password-page) login flows, or pages with more than one login form.
+    ///
+    /// `username`/`password` are JSON-encoded (`serde_json::to_string` on a
+    /// plain string produces a valid, properly-escaped JS string literal —
+    /// JSON string syntax is a subset of JS's) before being spliced into the
+    /// script, rather than interpolated as raw text — the correct way to
+    /// safely embed untrusted content in injected JS. Not part of the
+    /// `RenderEngine` trait, same reasoning as `toggle_reader_mode`.
+    pub fn fill_login(&self, username: &str, password: &str) -> anyhow::Result<()> {
+        let username_json = serde_json::to_string(username)?;
+        let password_json = serde_json::to_string(password)?;
+        let script = FILL_LOGIN_SCRIPT
+            .replace("\"__USERNAME__\"", &username_json)
+            .replace("\"__PASSWORD__\"", &password_json);
+        self.webview.evaluate_script(&script)?;
+        Ok(())
+    }
+
+    /// Evaluates `script`, delivering its JSON-serialized result to
+    /// `callback` — test/inspection hook only (nothing in real app code
+    /// needs a script's return value: `go_back`/`go_forward`/
+    /// `toggle_reader_mode`/`fill_login` are all fire-and-forget). Exists
+    /// because `evaluate_script_with_callback` itself is otherwise only
+    /// used internally, in `new`'s init workaround.
+    pub fn evaluate_script_for_test(&self, script: &str, callback: impl Fn(String) + Send + 'static) -> anyhow::Result<()> {
+        self.webview.evaluate_script_with_callback(script, callback)?;
+        Ok(())
+    }
 }
+
+/// Finds the page's first password field and, if a non-empty username was
+/// given, whichever text-like input most immediately precedes it (see
+/// `WryEngine::fill_login`'s doc comment). Sets values via the native
+/// property setter rather than plain `el.value = ...` — the latter doesn't
+/// trigger React/Vue-style controlled-input state, a well-known gotcha —
+/// then dispatches real `input`/`change` events so any such framework
+/// actually observes the change.
+const FILL_LOGIN_SCRIPT: &str = r#"
+(function () {
+  var password = document.querySelector('input[type="password"]');
+  if (!password) return;
+
+  function setNativeValue(el, value) {
+    var proto = Object.getPrototypeOf(el);
+    var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    setter.call(el, value);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  var username = "__USERNAME__";
+  if (username.length > 0) {
+    var form = password.closest('form');
+    var scope = form || document;
+    var candidates = scope.querySelectorAll('input');
+    var usernameField = null;
+    for (var i = 0; i < candidates.length; i++) {
+      var el = candidates[i];
+      if (el === password) break;
+      var type = (el.getAttribute('type') || 'text').toLowerCase();
+      if (type === 'text' || type === 'email' || type === 'tel') {
+        usernameField = el;
+      }
+    }
+    if (usernameField) setNativeValue(usernameField, username);
+  }
+
+  setNativeValue(password, "__PASSWORD__");
+})();
+"#;
 
 const READER_MODE_SCRIPT: &str = r#"
 (function () {

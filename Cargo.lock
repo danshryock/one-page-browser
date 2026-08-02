@@ -1991,6 +1991,7 @@ dependencies = [
  "gtk",
  "objc2",
  "objc2-app-kit",
+ "serde_json",
  "webkit2gtk",
  "windows 0.62.2",
  "windows-core 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",

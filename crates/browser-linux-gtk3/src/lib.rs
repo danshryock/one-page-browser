@@ -216,6 +216,25 @@ impl AppState {
         self.with_active(|engine| engine.toggle_reader_mode());
     }
 
+    /// Fills the active page's login form with `entry`'s username/password
+    /// (see `WryEngine::fill_login`) and closes the password manager
+    /// overlay — the "Fill" button's action. Re-checks `entry.domain`
+    /// against the active page's domain itself (a no-op, silent return if
+    /// it doesn't match, or if there's no password to fill) — `build_login_row`
+    /// already gates whether the button is shown on the same check, but the
+    /// restriction needs to be real and enforced here too, not just a UI
+    /// affordance that only holds as long as this is the sole caller.
+    fn fill_active_page_with_login(self: &Rc<Self>, entry: &Login) {
+        let Some(password) = entry.password.clone() else { return };
+        let active_domain = self.core.borrow().active().map(|p| domain_of(&p.current_url()));
+        if active_domain.as_deref() != Some(entry.domain.as_str()) {
+            return;
+        }
+        let username = entry.username.clone();
+        self.with_active(|engine| engine.fill_login(&username, &password));
+        self.close_passwords();
+    }
+
     pub fn add_page(self: &Rc<Self>, url: &str) -> anyhow::Result<()> {
         let id = self.core.borrow_mut().allocate_id();
 
@@ -904,11 +923,15 @@ impl AppState {
     }
 
     /// One row for a `Login` — a label, a Copy button, an Edit button
-    /// (fills the add/edit form from this entry — see `start_editing_login`)
-    /// and a "×" delete button, all wired to route through `source` so they
-    /// hit whichever backend this entry actually came from. Identical for
-    /// local and Bitwarden entries now — both are fully read/write.
-    fn build_login_row(self: &Rc<Self>, entry: &Login, source: LoginSource) -> gtk::Box {
+    /// (fills the add/edit form from this entry — see `start_editing_login`),
+    /// a "×" delete button (all three wired to route through `source` so
+    /// they hit whichever backend this entry actually came from — identical
+    /// for local and Bitwarden entries now, both are fully read/write), and
+    /// a Fill button, shown only when `entry.password` is set and
+    /// `entry.domain` matches `active_domain` — filling credentials into a
+    /// page whose domain doesn't match what they were saved for is a real
+    /// phishing-adjacent footgun, not just a UX nicety to restrict.
+    fn build_login_row(self: &Rc<Self>, entry: &Login, source: LoginSource, active_domain: Option<&str>) -> gtk::Box {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
 
         let label_text = format!("{} \u{2014} {}", entry.domain, entry.username);
@@ -917,6 +940,16 @@ impl AppState {
         label.set_hexpand(true);
         label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         row.pack_start(&label, true, true, 0);
+
+        if entry.password.is_some() && active_domain == Some(entry.domain.as_str()) {
+            let fill_button = gtk::Button::with_label("Fill");
+            let app_clone = Rc::clone(self);
+            let entry_clone = entry.clone();
+            fill_button.connect_clicked(move |_| {
+                app_clone.fill_active_page_with_login(&entry_clone);
+            });
+            row.pack_start(&fill_button, false, false, 0);
+        }
 
         let copy_button = gtk::Button::with_label("Copy");
         let password = entry.password.clone().unwrap_or_default();
@@ -965,6 +998,11 @@ impl AppState {
             self.passwords_list_box.remove(&child);
         }
 
+        // Computed once, up front, so every row's Fill-button gating (see
+        // `build_login_row`) checks against the same snapshot rather than
+        // re-deriving it per row.
+        let active_domain = self.core.borrow().active().map(|p| domain_of(&p.current_url()));
+
         let local_entries = match &*self.passwords.borrow() {
             VaultState::Unlocked(store) => store.list().unwrap_or_else(|err| {
                 eprintln!("failed to list password entries: {err}");
@@ -983,7 +1021,7 @@ impl AppState {
             self.passwords_list_box.pack_start(&empty_label, false, false, 0);
         }
         for entry in &local_entries {
-            let row = self.build_login_row(entry, LoginSource::Local);
+            let row = self.build_login_row(entry, LoginSource::Local, active_domain.as_deref());
             self.passwords_list_box.pack_start(&row, false, false, 0);
         }
 
@@ -1026,7 +1064,7 @@ impl AppState {
                     }
                     Ok(entries) => {
                         for entry in &entries {
-                            let row = self.build_login_row(entry, LoginSource::Bitwarden);
+                            let row = self.build_login_row(entry, LoginSource::Bitwarden, active_domain.as_deref());
                             self.passwords_list_box.pack_start(&row, false, false, 0);
                         }
                     }
@@ -1114,6 +1152,37 @@ impl AppState {
         };
         if let Some(entry) = entry {
             self.start_editing_login(&entry, LoginSource::Local);
+        }
+    }
+
+    /// Test helper: simulates clicking "Fill" on the local vault's row for
+    /// `username` — looks the entry up itself, mirroring what the real Fill
+    /// button's closure already captured at row-build time. A no-op if no
+    /// such entry exists, same as the real button would be if it were
+    /// somehow clicked in a stale/mismatched state.
+    pub fn fill_active_page_with_local_login(self: &Rc<Self>, username: &str) {
+        let entry = match &*self.passwords.borrow() {
+            VaultState::Unlocked(store) => store.list().unwrap_or_default().into_iter().find(|e| e.username == username),
+            VaultState::Locked | VaultState::NotSetUp => None,
+        };
+        if let Some(entry) = entry {
+            self.fill_active_page_with_login(&entry);
+        }
+    }
+
+    /// Test helper: evaluates `script` in the active page's real webview,
+    /// delivering its JSON-serialized result to `callback` — used to read
+    /// back DOM state a test just filled via `fill_active_page_with_local_login`,
+    /// since nothing in production code needs a script's return value (same
+    /// reasoning as `WryEngine::evaluate_script_for_test`, which this calls).
+    pub fn evaluate_script_on_active_page_for_test(&self, script: &str, callback: impl Fn(String) + Send + 'static) {
+        let core = self.core.borrow();
+        if let Some(page) = core.active() {
+            if let Some(engine) = &page.engine {
+                if let Err(err) = engine.evaluate_script_for_test(script, callback) {
+                    eprintln!("evaluate_script_for_test failed: {err}");
+                }
+            }
         }
     }
 

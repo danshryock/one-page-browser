@@ -51,7 +51,66 @@ impl WryEngine {
         })?;
         Ok(())
     }
+
+    /// Fills the page's first `input[type="password"]` (and, if `username`
+    /// isn't empty, whichever text/email/tel input immediately precedes it
+    /// in DOM order) with `username`/`password` — identical to
+    /// `render_engine::linux::WryEngine::fill_login` (see its doc comment
+    /// for the full heuristic/security rationale), since this is the same
+    /// underlying `wry::WebView` type. Not yet called from anywhere —
+    /// `browser-macos-appkit` has no password-manager UI of its own yet
+    /// (see `ROADMAP.md`); added here so the capability exists once it does,
+    /// rather than needing another `render-engine` change at that point.
+    pub fn fill_login(&self, username: &str, password: &str) -> anyhow::Result<()> {
+        let username_json = serde_json::to_string(username)?;
+        let password_json = serde_json::to_string(password)?;
+        let script = FILL_LOGIN_SCRIPT
+            .replace("\"__USERNAME__\"", &username_json)
+            .replace("\"__PASSWORD__\"", &password_json);
+        self.webview.evaluate_script(&script)?;
+        Ok(())
+    }
 }
+
+/// Finds the page's first password field and, if a non-empty username was
+/// given, whichever text-like input most immediately precedes it — see
+/// `render_engine::linux`'s identical constant for the full rationale (same
+/// script, kept as a separate copy since these are two separate files, not
+/// a shared module, mirroring how `go_back`/`go_forward`/etc. are already
+/// duplicated between them rather than factored out).
+const FILL_LOGIN_SCRIPT: &str = r#"
+(function () {
+  var password = document.querySelector('input[type="password"]');
+  if (!password) return;
+
+  function setNativeValue(el, value) {
+    var proto = Object.getPrototypeOf(el);
+    var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    setter.call(el, value);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  var username = "__USERNAME__";
+  if (username.length > 0) {
+    var form = password.closest('form');
+    var scope = form || document;
+    var candidates = scope.querySelectorAll('input');
+    var usernameField = null;
+    for (var i = 0; i < candidates.length; i++) {
+      var el = candidates[i];
+      if (el === password) break;
+      var type = (el.getAttribute('type') || 'text').toLowerCase();
+      if (type === 'text' || type === 'email' || type === 'tel') {
+        usernameField = el;
+      }
+    }
+    if (usernameField) setNativeValue(usernameField, username);
+  }
+
+  setNativeValue(password, "__PASSWORD__");
+})();
+"#;
 
 impl RenderEngine for WryEngine {
     fn navigate(&self, url: &str) -> anyhow::Result<()> {

@@ -78,6 +78,21 @@ build/run instructions.
   "Save to: Local vault / Bitwarden" picker on new entries and an inline error label for failures against
   either backend. A local (gtk3-only, not `browser-core`) `LoginSource` enum is what a login's Edit/Delete
   buttons use to route to whichever backend it actually came from.
+- In-page credential injection ("Fill"): `render_engine::linux::WryEngine::fill_login` (mirrored in
+  `macos.rs`, same underlying `wry::WebView` type, though nothing calls it there yet — `browser-macos-appkit`
+  has no password-manager UI at all) injects JS that finds the page's first `input[type="password"]` and
+  whichever text/email/tel input most immediately precedes it, sets both via the native property setter +
+  dispatches real `input`/`change` events (plain `el.value = ...` doesn't trigger React/Vue-style controlled-
+  input state), and is a plain inherent method rather than part of the `RenderEngine` trait — same shape as
+  the pre-existing `toggle_reader_mode`, since a hypothetical non-web engine (or `WebView2Engine` today, whose
+  bindings expose no JS-eval hook) can't implement arbitrary JS injection the same way. `browser-linux-gtk3`'s
+  password manager overlay gets a "Fill" button per row, shown (and, independently, actually enforced in the
+  action itself, not just gated at the UI level) only when the login's domain matches the active page's own —
+  filling credentials into a domain they weren't saved for is a real phishing-adjacent footgun, not just a UX
+  nicety to restrict. Verified end-to-end against a real fixture login page (`examples/fixtures/login_form.html`)
+  and a real WebKitGTK-rendered DOM read back via a new `evaluate_script_for_test` hook — not just "the call
+  didn't error." Known limitation: the heuristic only handles one form on the page and doesn't handle multi-
+  step (username-page-then-password-page) login flows — see "Backlog" below.
 - Separate `EditUrl`/`OpenSwitcher` actions (`browser-core` + `browser-linux-gtk3`): Ctrl+L now opens the
   switcher with the current URL preloaded and fully selected (not blanked); Ctrl+T/F1 keep the old
   blank-search behavior. See `summaries/edit-url-vs-new-page-actions.md`.
@@ -422,10 +437,10 @@ still untested).
   but this needs a WebAuthn virtual authenticator hooked into `navigator.credentials.create()/get()` at the
   render-engine layer, differently for WebKitGTK/WebView2/WKWebView — comparable in scope to the in-page
   autofill item below, not something the schema work alone unblocks.
-- In-page autofill for the password manager (detecting login forms and injecting values into arbitrary
-  third-party page DOMs) — needs `render-engine` JS-injection support that doesn't exist yet. Autofill
-  correctness varies a lot site-to-site in ways headless fixture-page testing can't validate — this deserves
-  focused attention with real-site testing, not a rushed pass.
+- Autofill correctness on real, complex login pages (multi-step username-then-password flows, non-standard
+  form markup) — the current heuristic (see "Done" above) only handles the common single-form-with-adjacent-
+  fields shape, verified against a controlled fixture page, not real sites. Varies a lot site-to-site in ways
+  headless fixture-page testing can't validate — deserves focused real-site testing, not a rushed pass.
 - Get libsql's `"encryption"` feature (SQLite3 Multiple Ciphers, via libsql-ffi) building for the
   cross-compiled targets, not just native Linux — today it's scoped to `target_os = "linux"` only in
   `browser-core/Cargo.toml`, so `HistoryStore::open_encrypted`/`PasswordStore::open_encrypted` are stubs that

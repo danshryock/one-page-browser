@@ -13,6 +13,13 @@ anyhow = "1"
 # dependency tree free of wry/webview2-com, which it never needs.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 wry = "0.55"
+# For `fill_login`'s JSON-escaping of untrusted username/password strings
+# before interpolating them into injected JS — JSON string syntax is a
+# subset of JS string syntax, so this is the correct way to do it, not
+# hand-rolled escaping. Scoped alongside wry since only the wry-based
+# engines (linux.rs/macos.rs) use it — winui.rs has no JS-injection
+# capability at all yet (see its module doc comment).
+serde_json = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"

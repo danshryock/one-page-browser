@@ -37,12 +37,13 @@
 //! needed on top.
 
 use std::panic::AssertUnwindSafe;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use browser_core::{Action, HistoryStore, PasswordBackend, Profile};
-use browser_linux_gtk3::{build_window_and_app, build_window_and_app_with_history};
+use browser_linux_gtk3::{build_window_and_app, build_window_and_app_with_history, AppState};
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
 
@@ -824,6 +825,89 @@ fn bitwarden_edit_and_delete_round_trip_through_the_fake_server() {
         assert!(backend.list().unwrap().is_empty(), "DELETE /object/item/1 should have removed it from the fake server");
 
         app.close_passwords();
+        cleanup_test_profile(&profile);
+    });
+}
+
+/// Polls `app`'s active page (via `evaluate_script_on_active_page_for_test`)
+/// until the login form's current `username|password` values equal
+/// `expected`, or `TIMEOUT` elapses — same "keep re-issuing a read-only
+/// query until it reflects reality" approach `wait_until` itself uses for
+/// other async webview state, just layered on top of a callback-based script
+/// evaluation instead of a plain synchronous getter.
+fn wait_until_login_form_shows(app: &Rc<AppState>, expected: &str) -> bool {
+    use std::sync::{Arc, Mutex};
+    let result: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let query = "document.getElementById('username').value + '|' + document.getElementById('password').value";
+    wait_until(|| {
+        // `evaluate_script_with_callback` (see `WryEngine::evaluate_script_for_test`'s
+        // doc comment) delivers its result JSON-serialized — a JS string
+        // comes back JSON-quoted (e.g. `"\"alice|hunter2\""`), not the bare
+        // text, so this decodes it back to a plain string before comparing.
+        let matched = result
+            .lock()
+            .unwrap()
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<String>(json).ok())
+            .as_deref()
+            == Some(expected);
+        if !matched {
+            let slot = Arc::clone(&result);
+            app.evaluate_script_on_active_page_for_test(query, move |value| {
+                *slot.lock().unwrap() = Some(value);
+            });
+        }
+        matched
+    })
+}
+
+#[test]
+fn credential_fill_populates_the_pages_login_form() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("credential-fill");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        assert!(app.try_open_vault_with("correct horse battery staple", true));
+
+        let login_url = fixture_url("login_form.html");
+        app.add_page(&login_url).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(login_url.as_str())));
+
+        // `login_url` is a `file://` URL, so `domain_of` (a plain host
+        // extractor, not URL-scheme-aware) computes an empty string for it
+        // on both sides — using the exact same URL for the login's `site`
+        // as the page actually open keeps the domain-match check consistent
+        // regardless of what `domain_of` returns for this scheme.
+        app.add_password_via_fields(&login_url, "alice", "hunter2", "");
+
+        app.fill_active_page_with_local_login("alice");
+        assert!(wait_until_login_form_shows(&app, "alice|hunter2"), "the login form's fields should reflect the filled values");
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn credential_fill_does_nothing_when_the_logins_domain_doesnt_match_the_active_page() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("credential-fill-mismatch");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        assert!(app.try_open_vault_with("correct horse battery staple", true));
+
+        let login_url = fixture_url("login_form.html");
+        app.add_page(&login_url).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(login_url.as_str())));
+
+        // A real (non-empty-domain) site, deliberately not the active
+        // page's own — the fill should be refused, not just unfilled by
+        // coincidence.
+        app.add_password_via_fields("https://not-the-active-page.example", "mallory", "shouldnt-appear", "");
+
+        app.fill_active_page_with_local_login("mallory");
+        // There's nothing to positively wait for here (a fill that correctly
+        // never happens), so this waits only for the read-back itself to
+        // complete, then asserts on its content.
+        assert!(wait_until_login_form_shows(&app, "|"), "a domain mismatch should leave the login form untouched");
+
         cleanup_test_profile(&profile);
     });
 }
