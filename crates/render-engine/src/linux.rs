@@ -58,14 +58,19 @@ impl WryEngine {
         Ok(())
     }
 
-    /// Fills the page's first `input[type="password"]` (and, if `username`
-    /// isn't empty, whichever text/email/tel input immediately precedes it
-    /// in DOM order — within the same `<form>` if there is one, document-wide
-    /// otherwise) with `username`/`password`, via a real per-page-load DOM
-    /// mutation with nothing tracked on the Rust side — same "hand-rolled
-    /// heuristic, not perfect" spirit as `toggle_reader_mode`'s Readability.js
-    /// approximation. Doesn't handle multi-step (username-page-then-
-    /// password-page) login flows, or pages with more than one login form.
+    /// Fills the page's login form with `username`/`password`, via a real
+    /// per-page-load DOM mutation with nothing tracked on the Rust side —
+    /// same "hand-rolled heuristic, not perfect" spirit as
+    /// `toggle_reader_mode`'s Readability.js approximation. Field detection
+    /// prefers the standard `autocomplete` attribute (`"current-password"`
+    /// for the password field, `"username"`/`"email"` for the identifier
+    /// field) when a page marks its fields that way — the explicit, reliable
+    /// signal sites are supposed to provide — falling back to a positional
+    /// heuristic (the page's first `input[type="password"]`, and whichever
+    /// text/email/tel input immediately precedes it in DOM order, within the
+    /// same `<form>` if there is one) only when `autocomplete` isn't present.
+    /// Doesn't handle multi-step (username-page-then-password-page) login
+    /// flows, or pages with more than one login form.
     ///
     /// `username`/`password` are JSON-encoded (`serde_json::to_string` on a
     /// plain string produces a valid, properly-escaped JS string literal —
@@ -95,16 +100,21 @@ impl WryEngine {
     }
 }
 
-/// Finds the page's first password field and, if a non-empty username was
-/// given, whichever text-like input most immediately precedes it (see
-/// `WryEngine::fill_login`'s doc comment). Sets values via the native
-/// property setter rather than plain `el.value = ...` — the latter doesn't
-/// trigger React/Vue-style controlled-input state, a well-known gotcha —
-/// then dispatches real `input`/`change` events so any such framework
-/// actually observes the change.
+/// Finds the password field (preferring `autocomplete="current-password"`,
+/// falling back to the page's first `input[type="password"]`) and, if a
+/// non-empty username was given, the identifier field (preferring
+/// `autocomplete="username"`/`"email"` within the same scope, falling back
+/// to whichever text-like input most immediately precedes the password
+/// field in DOM order — see `WryEngine::fill_login`'s doc comment). Sets
+/// values via the native property setter rather than plain
+/// `el.value = ...` — the latter doesn't trigger React/Vue-style
+/// controlled-input state, a well-known gotcha — then dispatches real
+/// `input`/`change` events so any such framework actually observes the
+/// change.
 const FILL_LOGIN_SCRIPT: &str = r#"
 (function () {
-  var password = document.querySelector('input[type="password"]');
+  var password = document.querySelector('input[autocomplete="current-password"]') ||
+                  document.querySelector('input[type="password"]');
   if (!password) return;
 
   function setNativeValue(el, value) {
@@ -119,14 +129,16 @@ const FILL_LOGIN_SCRIPT: &str = r#"
   if (username.length > 0) {
     var form = password.closest('form');
     var scope = form || document;
-    var candidates = scope.querySelectorAll('input');
-    var usernameField = null;
-    for (var i = 0; i < candidates.length; i++) {
-      var el = candidates[i];
-      if (el === password) break;
-      var type = (el.getAttribute('type') || 'text').toLowerCase();
-      if (type === 'text' || type === 'email' || type === 'tel') {
-        usernameField = el;
+    var usernameField = scope.querySelector('input[autocomplete="username"], input[autocomplete="email"]');
+    if (!usernameField) {
+      var candidates = scope.querySelectorAll('input');
+      for (var i = 0; i < candidates.length; i++) {
+        var el = candidates[i];
+        if (el === password) break;
+        var type = (el.getAttribute('type') || 'text').toLowerCase();
+        if (type === 'text' || type === 'email' || type === 'tel') {
+          usernameField = el;
+        }
       }
     }
     if (usernameField) setNativeValue(usernameField, username);

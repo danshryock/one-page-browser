@@ -52,12 +52,11 @@ impl WryEngine {
         Ok(())
     }
 
-    /// Fills the page's first `input[type="password"]` (and, if `username`
-    /// isn't empty, whichever text/email/tel input immediately precedes it
-    /// in DOM order) with `username`/`password` — identical to
-    /// `render_engine::linux::WryEngine::fill_login` (see its doc comment
-    /// for the full heuristic/security rationale), since this is the same
-    /// underlying `wry::WebView` type. Not yet called from anywhere —
+    /// Fills the page's login form with `username`/`password` — identical
+    /// to `render_engine::linux::WryEngine::fill_login` (see its doc comment
+    /// for the full heuristic/security rationale, including the
+    /// `autocomplete`-attribute-first field detection), since this is the
+    /// same underlying `wry::WebView` type. Not yet called from anywhere —
     /// `browser-macos-appkit` has no password-manager UI of its own yet
     /// (see `ROADMAP.md`); added here so the capability exists once it does,
     /// rather than needing another `render-engine` change at that point.
@@ -72,15 +71,19 @@ impl WryEngine {
     }
 }
 
-/// Finds the page's first password field and, if a non-empty username was
-/// given, whichever text-like input most immediately precedes it — see
-/// `render_engine::linux`'s identical constant for the full rationale (same
-/// script, kept as a separate copy since these are two separate files, not
-/// a shared module, mirroring how `go_back`/`go_forward`/etc. are already
-/// duplicated between them rather than factored out).
+/// Finds the password field (preferring `autocomplete="current-password"`,
+/// falling back to the page's first `input[type="password"]`) and, if a
+/// non-empty username was given, the identifier field (preferring
+/// `autocomplete="username"`/`"email"`, falling back to positional
+/// proximity) — see `render_engine::linux`'s identical constant for the
+/// full rationale (same script, kept as a separate copy since these are two
+/// separate files, not a shared module, mirroring how `go_back`/
+/// `go_forward`/etc. are already duplicated between them rather than
+/// factored out).
 const FILL_LOGIN_SCRIPT: &str = r#"
 (function () {
-  var password = document.querySelector('input[type="password"]');
+  var password = document.querySelector('input[autocomplete="current-password"]') ||
+                  document.querySelector('input[type="password"]');
   if (!password) return;
 
   function setNativeValue(el, value) {
@@ -95,14 +98,16 @@ const FILL_LOGIN_SCRIPT: &str = r#"
   if (username.length > 0) {
     var form = password.closest('form');
     var scope = form || document;
-    var candidates = scope.querySelectorAll('input');
-    var usernameField = null;
-    for (var i = 0; i < candidates.length; i++) {
-      var el = candidates[i];
-      if (el === password) break;
-      var type = (el.getAttribute('type') || 'text').toLowerCase();
-      if (type === 'text' || type === 'email' || type === 'tel') {
-        usernameField = el;
+    var usernameField = scope.querySelector('input[autocomplete="username"], input[autocomplete="email"]');
+    if (!usernameField) {
+      var candidates = scope.querySelectorAll('input');
+      for (var i = 0; i < candidates.length; i++) {
+        var el = candidates[i];
+        if (el === password) break;
+        var type = (el.getAttribute('type') || 'text').toLowerCase();
+        if (type === 'text' || type === 'email' || type === 'tel') {
+          usernameField = el;
+        }
       }
     }
     if (usernameField) setNativeValue(usernameField, username);

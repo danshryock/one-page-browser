@@ -1,0 +1,16 @@
+<!doctype html><html><head><title>Login (autocomplete)</title></head><body>
+<!--
+  Deliberately laid out so the *old*, purely positional heuristic (first
+  input[type="password"] on the page, and whichever text-like input most
+  immediately precedes it) would pick the wrong fields: "decoy_text" sits
+  closer to "password" than "username" does, and "decoy_password" comes
+  before "password" in DOM order. Only the autocomplete-attribute-aware
+  selection picks correctly here regardless of position.
+-->
+<form>
+  <input type="text" id="username" name="user" autocomplete="username">
+  <input type="text" id="decoy_text" name="promo" placeholder="promo code">
+  <input type="password" id="decoy_password" name="promo_pw" placeholder="irrelevant">
+  <input type="password" id="password" name="pass" autocomplete="current-password">
+</form>
+</body></html>

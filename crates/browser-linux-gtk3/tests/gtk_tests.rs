@@ -887,6 +887,34 @@ fn credential_fill_populates_the_pages_login_form() {
 }
 
 #[test]
+fn credential_fill_prefers_autocomplete_attributes_over_position() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("credential-fill-autocomplete");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        assert!(app.try_open_vault_with("correct horse battery staple", true));
+
+        // `login_form_autocomplete.html` is laid out so a purely positional
+        // heuristic (first `input[type="password"]`, and whichever text-like
+        // input most immediately precedes it) would pick "decoy_password"/
+        // "decoy_text" instead — only `autocomplete="current-password"`/
+        // `"username"` picks the real "password"/"username" fields correctly
+        // here, regardless of position.
+        let login_url = fixture_url("login_form_autocomplete.html");
+        app.add_page(&login_url).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(login_url.as_str())));
+
+        app.add_password_via_fields(&login_url, "alice", "hunter2", "");
+        app.fill_active_page_with_local_login("alice");
+        assert!(
+            wait_until_login_form_shows(&app, "alice|hunter2"),
+            "autocomplete-marked fields should be filled correctly even though position alone would pick the wrong ones"
+        );
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
 fn credential_fill_does_nothing_when_the_logins_domain_doesnt_match_the_active_page() {
     run_on_gtk_thread(|| {
         let profile = test_profile("credential-fill-mismatch");
