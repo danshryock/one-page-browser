@@ -65,14 +65,19 @@ build/run instructions.
   wire-compatible with real Bitwarden, so one backend covers both, no separate code path. Checks `/status`
   itself and surfaces a distinguishable "locked" vs. "unreachable" error rather than assuming some other
   process already unlocked it; `browser-linux-gtk3`'s password manager overlay renders Bitwarden entries in
-  their own read-only section (Copy only, no delete/edit — `add`/`update`/`delete` are implemented for real
-  against `bw serve`, just not wired to any button yet) alongside the local vault's, with a settings
-  checkbox + URL field (`Settings::bitwarden_server_url`) to enable it and a small "Unlock Bitwarden" prompt
-  when locked. **Caveat, called out in `bitwarden.rs`'s own doc comment**: there was no real `bw serve`
-  instance reachable to verify against while building this — the request/response shapes are this module's
-  best-effort understanding of `bw serve`'s conventions (confirmed synthetically via a fake local HTTP server
-  in its tests), not something confirmed against a live instance; whether `bw`'s login-item JSON exposes
-  FIDO2/passkey data at all is also unverified, so `BitwardenBackend` always reports `passkey: None`.
+  their own section alongside the local vault's, with a settings checkbox + URL field
+  (`Settings::bitwarden_server_url`) to enable it and a small "Unlock Bitwarden" prompt when locked. **Caveat,
+  called out in `bitwarden.rs`'s own doc comment**: there was no real `bw serve` instance reachable to verify
+  against while building this — the request/response shapes are this module's best-effort understanding of
+  `bw serve`'s conventions (confirmed synthetically via a fake local HTTP server in its tests), not something
+  confirmed against a live instance; whether `bw`'s login-item JSON exposes FIDO2/passkey data at all is also
+  unverified, so `BitwardenBackend` always reports `passkey: None`.
+- Full read/write for the Bitwarden section: Edit and Delete now work the same way for Bitwarden rows as
+  local-vault ones (the add-credential form doubles as the edit form for both — the overlay's first-ever edit
+  capability at all, previously it only had Copy/Delete for local rows and Copy-only for Bitwarden), plus a
+  "Save to: Local vault / Bitwarden" picker on new entries and an inline error label for failures against
+  either backend. A local (gtk3-only, not `browser-core`) `LoginSource` enum is what a login's Edit/Delete
+  buttons use to route to whichever backend it actually came from.
 - Separate `EditUrl`/`OpenSwitcher` actions (`browser-core` + `browser-linux-gtk3`): Ctrl+L now opens the
   switcher with the current URL preloaded and fully selected (not blanked); Ctrl+T/F1 keep the old
   blank-search behavior. See `summaries/edit-url-vs-new-page-actions.md`.
@@ -413,9 +418,6 @@ still untested).
   `bw`'s login-item JSON exposes FIDO2/passkey data at all (`BitwardenBackend` always reports `passkey: None`
   today, rather than guess), and whether `bw serve`'s in-memory unlocked state genuinely persists across
   requests to the same process the way this code assumes.
-- Wire `BitwardenBackend::add`/`update`/`delete` (already implemented for real) into
-  `browser-linux-gtk3`'s overlay — today Bitwarden rows are read-only (Copy only) there; the add-credential
-  form always writes to the local vault. Needs a real UI decision (a "save to" picker) before doing this.
 - Actual passkey creation/assertion in pages — the schema (`PasskeyCredential`, see "Done" above) is ready,
   but this needs a WebAuthn virtual authenticator hooked into `navigator.credentials.create()/get()` at the
   render-engine layer, differently for WebKitGTK/WebView2/WKWebView — comparable in scope to the in-page

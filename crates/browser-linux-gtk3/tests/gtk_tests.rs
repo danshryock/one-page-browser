@@ -41,7 +41,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use browser_core::{Action, HistoryStore, Profile};
+use browser_core::{Action, HistoryStore, PasswordBackend, Profile};
 use browser_linux_gtk3::{build_window_and_app, build_window_and_app_with_history};
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
@@ -608,6 +608,31 @@ fn password_vault_setup_add_and_overlay_mutual_exclusion() {
 }
 
 #[test]
+fn password_vault_edit_updates_a_login_in_place() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("password-vault-edit");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        assert!(app.try_open_vault_with("correct horse battery staple", true));
+
+        app.add_password_via_fields("https://example.com", "alice", "old-pw", "old notes");
+        app.add_password_via_fields("https://b.example", "bob", "pw", "");
+        assert_eq!(app.password_vault_usernames().len(), 2, "sanity check: both logins should exist before editing either");
+
+        let alice_id = app.password_vault_id_for_username("alice").expect("alice's login should exist");
+        app.start_editing_local_login(&alice_id);
+        // Editing reuses the same add form, so submitting again should
+        // update in place rather than create a third entry.
+        app.add_password_via_fields("https://example.com", "alice", "new-pw", "updated notes");
+
+        assert_eq!(app.password_vault_usernames().len(), 2, "editing shouldn't create a third entry");
+        let updated_id = app.password_vault_id_for_username("alice").expect("alice's login should still exist");
+        assert_eq!(updated_id, alice_id, "the same row should have been updated, not replaced");
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
 fn password_vault_reuses_an_already_known_passphrase_with_no_second_prompt() {
     run_on_gtk_thread(|| {
         let profile = test_profile("password-vault-shared-passphrase");
@@ -662,35 +687,59 @@ impl Drop for FakeBitwardenServer {
     }
 }
 
+/// Spawns a fake `bw serve`, stateful enough to prove edits/deletes
+/// actually persist (not just that the HTTP call didn't error): items live
+/// in a shared, mutable list seeded with one "Fake Bank / carol" login;
+/// `PUT`/`DELETE` really mutate it, and `GET /list/object/items` always
+/// reflects the current state.
 fn spawn_fake_bitwarden_server() -> FakeBitwardenServer {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     let unlocked = Arc::new(AtomicBool::new(false));
+    let items = Arc::new(Mutex::new(vec![serde_json::json!({
+        "id": "1", "type": 1, "name": "Fake Bank", "notes": "",
+        "login": {"username": "carol", "password": "pw", "uris": [{"uri": "https://fakebank.example"}]}
+    })]));
     let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("binding a loopback test server should succeed"));
     let addr = server.server_addr().to_ip().expect("this test server always binds an IP socket, not a unix one");
     let base_url = format!("http://{addr}");
     let server_for_thread = Arc::clone(&server);
     let join = std::thread::spawn(move || {
-        while let Ok(request) = server_for_thread.recv() {
-            let (status, body) = match (request.method().to_string().as_str(), request.url()) {
-                ("GET", "/status") => {
-                    let status_str = if unlocked.load(Ordering::SeqCst) { "unlocked" } else { "locked" };
-                    (200, format!(r#"{{"success":true,"data":{{"template":{{"status":"{status_str}"}}}}}}"#))
+        while let Ok(mut request) = server_for_thread.recv() {
+            let mut body_text = String::new();
+            let _ = std::io::Read::read_to_string(request.as_reader(), &mut body_text);
+            let method = request.method().to_string();
+            let url = request.url().to_string();
+
+            let (status, body) = if method == "GET" && url == "/status" {
+                let status_str = if unlocked.load(Ordering::SeqCst) { "unlocked" } else { "locked" };
+                (200, format!(r#"{{"success":true,"data":{{"template":{{"status":"{status_str}"}}}}}}"#))
+            } else if method == "POST" && url == "/unlock" {
+                unlocked.store(true, Ordering::SeqCst);
+                (200, r#"{"success":true}"#.to_string())
+            } else if method == "GET" && url == "/list/object/items" {
+                let items = items.lock().unwrap();
+                (200, serde_json::json!({"success": true, "data": {"data": *items}}).to_string())
+            } else if method == "PUT" && url.starts_with("/object/item/") {
+                let id = url.trim_start_matches("/object/item/");
+                let sent: serde_json::Value = serde_json::from_str(&body_text).unwrap_or_default();
+                let mut items = items.lock().unwrap();
+                match items.iter_mut().find(|item| item["id"] == id) {
+                    Some(item) => {
+                        item["name"] = sent["name"].clone();
+                        item["notes"] = sent["notes"].clone();
+                        item["login"] = sent["login"].clone();
+                        (200, r#"{"success":true}"#.to_string())
+                    }
+                    None => (404, r#"{"success":false,"message":"not found"}"#.to_string()),
                 }
-                ("POST", "/unlock") => {
-                    unlocked.store(true, Ordering::SeqCst);
-                    (200, r#"{"success":true}"#.to_string())
-                }
-                ("GET", "/list/object/items") => (
-                    200,
-                    r#"{"success":true,"data":{"data":[
-                        {"id":"1","type":1,"name":"Fake Bank","notes":"",
-                         "login":{"username":"carol","password":"pw","uris":[{"uri":"https://fakebank.example"}]}}
-                    ]}}"#
-                        .to_string(),
-                ),
-                _ => (404, r#"{"success":false,"message":"not found"}"#.to_string()),
+            } else if method == "DELETE" && url.starts_with("/object/item/") {
+                let id = url.trim_start_matches("/object/item/");
+                items.lock().unwrap().retain(|item| item["id"] != id);
+                (200, r#"{"success":true}"#.to_string())
+            } else {
+                (404, r#"{"success":false,"message":"not found"}"#.to_string())
             };
             let _ = request.respond(tiny_http::Response::from_string(body).with_status_code(status));
         }
@@ -731,6 +780,48 @@ fn bitwarden_section_reflects_locked_then_unlocked_state_and_lists_its_items() {
         app.open_passwords(); // re-renders the list against the now-unlocked fake server
         assert!(app.passwords_list_contains_text("carol"), "the fake server's item should show up in the Bitwarden section once unlocked");
         assert!(app.passwords_list_contains_text("fakebank.example"));
+
+        app.close_passwords();
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn bitwarden_edit_and_delete_round_trip_through_the_fake_server() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("bitwarden-edit-delete");
+        let fake_server = spawn_fake_bitwarden_server();
+        // Bitwarden rows only render once the *local* vault is past its own
+        // setup prompt — see the equivalent comment in the locked/unlocked
+        // test above.
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        assert!(app.try_open_vault_with("local vault passphrase", true));
+
+        app.open_settings();
+        app.set_bitwarden_fields(true, &fake_server.base_url);
+        app.save_settings();
+
+        let backend = app.bitwarden_backend().expect("Bitwarden should be enabled");
+        backend.unlock("anything").expect("the fake server always accepts unlock");
+
+        // Edit: same "reuse the add form" flow as the local-vault edit test,
+        // just targeting the Bitwarden row instead.
+        app.open_passwords();
+        assert!(app.passwords_list_contains_text("carol"));
+        app.start_editing_bitwarden_login("1");
+        app.add_password_via_fields("https://fakebank.example", "carol-updated", "new-pw", "");
+
+        app.open_passwords(); // re-render against the fake server's now-updated state
+        assert!(app.passwords_list_contains_text("carol-updated"), "the edit should have persisted through PUT /object/item/1");
+        let entries = backend.list().unwrap();
+        assert_eq!(entries.len(), 1, "editing shouldn't create a second item");
+        assert_eq!(entries[0].username, "carol-updated", "the update should have replaced the username, not just added text alongside it");
+        assert_eq!(entries[0].password.as_deref(), Some("new-pw"));
+
+        // Delete.
+        assert_eq!(backend.list().unwrap().len(), 1, "sanity check: exactly one Bitwarden item before deleting it");
+        app.delete_bitwarden_login_for_test("1");
+        assert!(backend.list().unwrap().is_empty(), "DELETE /object/item/1 should have removed it from the fake server");
 
         app.close_passwords();
         cleanup_test_profile(&profile);

@@ -33,6 +33,15 @@ enum VaultState {
     Unlocked(PasswordStore),
 }
 
+/// Which backend a `Login` shown in the password manager overlay actually
+/// came from — `update`/`delete` must route to the same one, since there's
+/// no "move a login between backends" operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginSource {
+    Local,
+    Bitwarden,
+}
+
 pub struct AppState {
     /// Doubles as the switcher grid's search box: while the switcher is
     /// open, typing here filters the tile grid (open pages + history)
@@ -116,14 +125,34 @@ pub struct AppState {
     /// passphrase. Never written to disk; cleared along with everything
     /// else when the process exits.
     session_passphrase: RefCell<Option<String>>,
-    /// The add-new-credential form's fields — read/cleared by
-    /// `add_password_from_fields`, same pattern as
+    /// The add/edit-credential form's fields — read/cleared by
+    /// `submit_login_from_fields`, same pattern as
     /// `new_engine_name_entry`/`new_engine_url_entry` for the settings
-    /// overlay's search-engine form.
+    /// overlay's search-engine form. Doubles as the edit form too (see
+    /// `start_editing_login`) rather than being a second, separate form.
     new_password_site_entry: gtk::Entry,
     new_password_username_entry: gtk::Entry,
     new_password_password_entry: gtk::Entry,
     new_password_notes_entry: gtk::Entry,
+    /// Which existing login (if any) the form above is currently editing,
+    /// and which backend it came from — `None` means "add new" mode.
+    editing_login: RefCell<Option<(String, LoginSource)>>,
+    /// Chooses which backend a brand-new login (`editing_login: None`) gets
+    /// saved to — only meaningfully offered (see `rebuild_passwords_list`)
+    /// when Bitwarden integration is enabled; otherwise hidden and every add
+    /// goes to the local vault, same as before this field existed.
+    save_destination_combo: gtk::ComboBoxText,
+    save_destination_row: gtk::Box,
+    /// Submits the add/edit form — labeled "Add" or "Save" depending on
+    /// `editing_login`.
+    submit_password_button: gtk::Button,
+    /// Only visible while `editing_login` is `Some` — abandons the edit and
+    /// returns the form to "add new" mode.
+    cancel_edit_button: gtk::Button,
+    /// Surfaces the last add/update/delete failure against either backend
+    /// (a network error, Bitwarden being locked mid-action, etc.) — cleared
+    /// at the top of every `rebuild_passwords_list` call.
+    passwords_error_label: gtk::Label,
     /// Snapshot taken by the last `rebuild_switcher_grid` call — the source
     /// of truth `activate_switcher_row` indexes into, so a tile's widget
     /// name can just be its position in this list rather than needing a
@@ -762,6 +791,8 @@ impl AppState {
         self.close_settings();
         self.close_profile_picker();
         self.close_bookmarks();
+        // Always opens fresh, never mid-edit from a previous visit.
+        self.cancel_editing_login();
 
         if matches!(*self.passwords.borrow(), VaultState::Unlocked(_)) {
             self.show_passwords_panel();
@@ -861,10 +892,6 @@ impl AppState {
         self.passwords_panel.is_visible()
     }
 
-    /// Rebuilds the password manager overlay's list of rows from scratch.
-    /// A no-op (empty list) if the vault isn't currently unlocked — callers
-    /// should only reach this after `try_open_vault_with`/
-    /// `show_vault_passphrase_prompt` succeeds.
     /// Builds a fresh `BitwardenBackend` from the current settings, if
     /// Bitwarden integration is enabled. Cheap to construct (no network I/O
     /// happens until a real call is made), so there's nothing to cache on
@@ -876,13 +903,12 @@ impl AppState {
         self.settings().bitwarden_server_url.clone().map(BitwardenBackend::new)
     }
 
-    /// One row for a `Login` — a label plus a Copy button, and (only for
-    /// entries the local vault owns) a "×" delete button. Bitwarden rows are
-    /// read-only in this overlay for now (see `rebuild_passwords_list`'s doc
-    /// comment) even though `BitwardenBackend::delete` is implemented for
-    /// real — `deletable` is what actually gates the button, not anything
-    /// about the `Login` itself.
-    fn build_login_row(self: &Rc<Self>, entry: &Login, deletable: bool) -> gtk::Box {
+    /// One row for a `Login` — a label, a Copy button, an Edit button
+    /// (fills the add/edit form from this entry — see `start_editing_login`)
+    /// and a "×" delete button, all wired to route through `source` so they
+    /// hit whichever backend this entry actually came from. Identical for
+    /// local and Bitwarden entries now — both are fully read/write.
+    fn build_login_row(self: &Rc<Self>, entry: &Login, source: LoginSource) -> gtk::Box {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
 
         let label_text = format!("{} \u{2014} {}", entry.domain, entry.username);
@@ -903,15 +929,21 @@ impl AppState {
         });
         row.pack_start(&copy_button, false, false, 0);
 
-        if deletable {
-            let remove_button = gtk::Button::with_label("\u{d7}");
-            let app_clone = Rc::clone(self);
-            let id = entry.id.clone();
-            remove_button.connect_clicked(move |_| {
-                app_clone.delete_password_entry(&id);
-            });
-            row.pack_start(&remove_button, false, false, 0);
-        }
+        let edit_button = gtk::Button::with_label("Edit");
+        let app_clone = Rc::clone(self);
+        let entry_clone = entry.clone();
+        edit_button.connect_clicked(move |_| {
+            app_clone.start_editing_login(&entry_clone, source);
+        });
+        row.pack_start(&edit_button, false, false, 0);
+
+        let remove_button = gtk::Button::with_label("\u{d7}");
+        let app_clone = Rc::clone(self);
+        let id = entry.id.clone();
+        remove_button.connect_clicked(move |_| {
+            app_clone.delete_login(&id, source);
+        });
+        row.pack_start(&remove_button, false, false, 0);
 
         row
     }
@@ -922,12 +954,13 @@ impl AppState {
     /// "Bitwarden". They're kept separate because their timestamps aren't
     /// comparable in any meaningful way (Bitwarden's own `revisionDate`
     /// isn't even fetched — see `bitwarden.rs`), so merging them into one
-    /// sorted list would just be misleading. Bitwarden rows are read-only
-    /// here (Copy only, no delete/edit, and the add-credential form below
-    /// always writes to the local vault) — a deliberate, conservative
-    /// choice for this first pass, not a limitation of `BitwardenBackend`
-    /// itself (its `add`/`update`/`delete` are implemented for real).
+    /// sorted list would just be misleading. Both sections are fully
+    /// read/write (see `build_login_row`) — also rebuilds
+    /// `save_destination_combo`'s contents/visibility and clears any
+    /// leftover error message, since this runs every time the overlay's
+    /// state might have changed underneath it.
     fn rebuild_passwords_list(self: &Rc<Self>) {
+        self.passwords_error_label.set_text("");
         for child in self.passwords_list_box.children() {
             self.passwords_list_box.remove(&child);
         }
@@ -950,9 +983,13 @@ impl AppState {
             self.passwords_list_box.pack_start(&empty_label, false, false, 0);
         }
         for entry in &local_entries {
-            let row = self.build_login_row(entry, true);
+            let row = self.build_login_row(entry, LoginSource::Local);
             self.passwords_list_box.pack_start(&row, false, false, 0);
         }
+
+        let bitwarden_enabled = self.bitwarden_backend().is_some();
+        self.save_destination_row.set_visible(bitwarden_enabled);
+        self.refresh_save_destination_combo();
 
         if let Some(backend) = self.bitwarden_backend() {
             let bitwarden_title = gtk::Label::new(Some("Bitwarden"));
@@ -989,7 +1026,7 @@ impl AppState {
                     }
                     Ok(entries) => {
                         for entry in &entries {
-                            let row = self.build_login_row(entry, false);
+                            let row = self.build_login_row(entry, LoginSource::Bitwarden);
                             self.passwords_list_box.pack_start(&row, false, false, 0);
                         }
                     }
@@ -1006,55 +1043,168 @@ impl AppState {
         self.passwords_list_box.show_all();
     }
 
+    /// Rebuilds `save_destination_combo`'s entries — "Local vault" always,
+    /// plus "Bitwarden" when it's enabled — preserving the current
+    /// selection if it's still valid, defaulting to "local" otherwise. Split
+    /// out from `rebuild_passwords_list` since `start_editing_login` also
+    /// needs to leave the combo's *contents* alone while just disabling it.
+    fn refresh_save_destination_combo(&self) {
+        let bitwarden_enabled = self.bitwarden_backend().is_some();
+        let previously_selected = self.save_destination_combo.active_id().map(|s| s.to_string());
+        self.save_destination_combo.remove_all();
+        self.save_destination_combo.append(Some("local"), "Local vault");
+        if bitwarden_enabled {
+            self.save_destination_combo.append(Some("bitwarden"), "Bitwarden");
+        }
+        let restore = previously_selected.filter(|id| id == "local" || (id == "bitwarden" && bitwarden_enabled));
+        self.save_destination_combo.set_active_id(Some(restore.as_deref().unwrap_or("local")));
+    }
+
+    /// Fills the add/edit form from `entry` and switches it into "edit"
+    /// mode — reuses the exact same form the add-new-credential flow does,
+    /// rather than a second, separate edit form. `submit_login_from_fields`
+    /// checks `editing_login` to decide whether to `add` or `update`.
+    fn start_editing_login(self: &Rc<Self>, entry: &Login, source: LoginSource) {
+        self.new_password_site_entry.set_text(&entry.site);
+        self.new_password_username_entry.set_text(&entry.username);
+        self.new_password_password_entry.set_text(entry.password.as_deref().unwrap_or(""));
+        self.new_password_notes_entry.set_text(&entry.notes);
+        *self.editing_login.borrow_mut() = Some((entry.id.clone(), source));
+        // An existing login's backend can't change via `update` — there's
+        // no "move a login between backends" operation.
+        self.save_destination_combo.set_sensitive(false);
+        self.submit_password_button.set_label("Save");
+        self.cancel_edit_button.set_visible(true);
+    }
+
+    /// Returns the add/edit form to "add new" mode: clears the fields,
+    /// `editing_login`, and undoes everything `start_editing_login` set.
+    fn cancel_editing_login(self: &Rc<Self>) {
+        self.new_password_site_entry.set_text("");
+        self.new_password_username_entry.set_text("");
+        self.new_password_password_entry.set_text("");
+        self.new_password_notes_entry.set_text("");
+        *self.editing_login.borrow_mut() = None;
+        self.save_destination_combo.set_sensitive(true);
+        self.submit_password_button.set_label("Add");
+        self.cancel_edit_button.set_visible(false);
+    }
+
     /// Sets the add-new-credential form's fields and submits them — test
-    /// helper, same pattern as `add_search_engine_via_fields`.
+    /// helper, same pattern as `add_search_engine_via_fields`. Only ever
+    /// used with the form in "add new" mode (`editing_login: None`), so
+    /// this always creates a fresh login in whichever backend
+    /// `save_destination_combo` is currently set to (the local vault, by
+    /// default) — unaffected by this pass's edit-mode changes.
     pub fn add_password_via_fields(self: &Rc<Self>, site: &str, username: &str, password: &str, notes: &str) {
         self.new_password_site_entry.set_text(site);
         self.new_password_username_entry.set_text(username);
         self.new_password_password_entry.set_text(password);
         self.new_password_notes_entry.set_text(notes);
-        self.add_password_from_fields();
+        self.submit_login_from_fields();
     }
 
-    /// Adds a credential from the add-new-credential form's current field
-    /// values, then clears them and rebuilds the list — same pattern as
-    /// `add_search_engine_from_fields`. A no-op if the site field is blank,
-    /// or if the vault somehow isn't unlocked (shouldn't happen: the form
-    /// is only ever shown alongside an unlocked vault).
-    pub fn add_password_from_fields(self: &Rc<Self>) {
+    /// Test helper: simulates clicking "Edit" on the local vault's row with
+    /// this id — looks the entry up itself, mirroring what the real Edit
+    /// button's closure already captured at row-build time.
+    pub fn start_editing_local_login(self: &Rc<Self>, id: &str) {
+        let entry = match &*self.passwords.borrow() {
+            VaultState::Unlocked(store) => store.list().unwrap_or_default().into_iter().find(|e| e.id == id),
+            VaultState::Locked | VaultState::NotSetUp => None,
+        };
+        if let Some(entry) = entry {
+            self.start_editing_login(&entry, LoginSource::Local);
+        }
+    }
+
+    /// Test helper: simulates clicking "Edit" on a Bitwarden row with this
+    /// id — same reasoning as `start_editing_local_login`, just looking the
+    /// entry up via `bitwarden_backend()` instead of the local vault.
+    pub fn start_editing_bitwarden_login(self: &Rc<Self>, id: &str) {
+        let entry = self.bitwarden_backend().and_then(|backend| backend.list().ok()?.into_iter().find(|e| e.id == id));
+        if let Some(entry) = entry {
+            self.start_editing_login(&entry, LoginSource::Bitwarden);
+        }
+    }
+
+    /// Test helper: simulates clicking the "×" delete button on a Bitwarden
+    /// row with this id — `delete_login`/`LoginSource` are private (this
+    /// crate's own concern, not part of the public API), so this is the
+    /// test-facing entry point for exercising that path.
+    pub fn delete_bitwarden_login_for_test(self: &Rc<Self>, id: &str) {
+        self.delete_login(id, LoginSource::Bitwarden);
+    }
+
+    /// Submits the add/edit form — adds a new login (routed to whichever
+    /// backend `save_destination_combo` selects) if `editing_login` is
+    /// `None`, or updates the existing one it names otherwise. A no-op if
+    /// the site field is blank. On success, clears/resets the form (via
+    /// `cancel_editing_login`, reused for that side effect) and rebuilds the
+    /// list; on failure, surfaces the error in `passwords_error_label`
+    /// instead of just logging it — this overlay had no visible error
+    /// surface at all before this.
+    pub fn submit_login_from_fields(self: &Rc<Self>) {
         let site = self.new_password_site_entry.text().to_string();
         let site = site.trim().to_string();
         if site.is_empty() {
             return;
         }
         let username = self.new_password_username_entry.text().to_string();
-        let password = self.new_password_password_entry.text().to_string();
+        let password_text = self.new_password_password_entry.text().to_string();
         let notes = self.new_password_notes_entry.text().to_string();
         // A blank password field means "no password" (None), not the empty
         // string as a literal secret — matches how `Login::password` reads
         // back from storage (see `passwords.rs`'s `collect_entries`).
-        let password = if password.trim().is_empty() { None } else { Some(password) };
+        let password = if password_text.trim().is_empty() { None } else { Some(password_text) };
+        let fields = LoginFields { site, username, password, passkey: None, notes };
 
-        let result = match &*self.passwords.borrow() {
-            VaultState::Unlocked(store) => store.add(LoginFields { site, username, password, passkey: None, notes }),
-            VaultState::Locked | VaultState::NotSetUp => return,
+        let editing = self.editing_login.borrow().clone();
+        let result: anyhow::Result<()> = match editing {
+            Some((id, LoginSource::Local)) => match &*self.passwords.borrow() {
+                VaultState::Unlocked(store) => store.update(&id, fields),
+                VaultState::Locked | VaultState::NotSetUp => return,
+            },
+            Some((id, LoginSource::Bitwarden)) => match self.bitwarden_backend() {
+                Some(backend) => backend.update(&id, fields),
+                None => return,
+            },
+            None => match self.save_destination_combo.active_id().as_deref() {
+                Some("bitwarden") => match self.bitwarden_backend() {
+                    Some(backend) => backend.add(fields).map(|_| ()),
+                    None => return,
+                },
+                _ => match &*self.passwords.borrow() {
+                    VaultState::Unlocked(store) => store.add(fields).map(|_| ()),
+                    VaultState::Locked | VaultState::NotSetUp => return,
+                },
+            },
         };
+
         if let Err(err) = result {
-            eprintln!("failed to add password entry: {err}");
+            let action = if self.editing_login.borrow().is_some() { "save" } else { "add" };
+            self.passwords_error_label.set_text(&format!("Failed to {action} login: {err}"));
             return;
         }
-        self.new_password_site_entry.set_text("");
-        self.new_password_username_entry.set_text("");
-        self.new_password_password_entry.set_text("");
-        self.new_password_notes_entry.set_text("");
+        self.cancel_editing_login();
         self.rebuild_passwords_list();
     }
 
-    fn delete_password_entry(self: &Rc<Self>, id: &str) {
-        if let VaultState::Unlocked(store) = &*self.passwords.borrow() {
-            if let Err(err) = store.delete(id) {
-                eprintln!("failed to delete password entry: {err}");
-            }
+    /// Deletes the login identified by `id` from whichever backend `source`
+    /// names, surfacing any failure the same way `submit_login_from_fields`
+    /// does rather than just logging it.
+    fn delete_login(self: &Rc<Self>, id: &str, source: LoginSource) {
+        let result: anyhow::Result<()> = match source {
+            LoginSource::Local => match &*self.passwords.borrow() {
+                VaultState::Unlocked(store) => store.delete(id),
+                VaultState::Locked | VaultState::NotSetUp => Ok(()),
+            },
+            LoginSource::Bitwarden => match self.bitwarden_backend() {
+                Some(backend) => backend.delete(id),
+                None => Ok(()),
+            },
+        };
+        if let Err(err) = result {
+            self.passwords_error_label.set_text(&format!("Failed to delete login: {err}"));
         }
         self.rebuild_passwords_list();
     }
@@ -1152,6 +1302,17 @@ impl AppState {
         match &*self.passwords.borrow() {
             VaultState::Unlocked(store) => store.list().unwrap_or_default().into_iter().map(|e| e.username).collect(),
             VaultState::Locked | VaultState::NotSetUp => Vec::new(),
+        }
+    }
+
+    /// The local vault's id for the first entry whose username is
+    /// `username` — test helper for driving `start_editing_local_login`,
+    /// which needs a real id rather than the username
+    /// `password_vault_usernames` already exposes.
+    pub fn password_vault_id_for_username(&self, username: &str) -> Option<String> {
+        match &*self.passwords.borrow() {
+            VaultState::Unlocked(store) => store.list().unwrap_or_default().into_iter().find(|e| e.username == username).map(|e| e.id),
+            VaultState::Locked | VaultState::NotSetUp => None,
         }
     }
 
@@ -2320,8 +2481,30 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     let new_password_notes_entry = gtk::Entry::new();
     new_password_notes_entry.set_placeholder_text(Some("Notes (optional)"));
     passwords_box.pack_start(&new_password_notes_entry, false, false, 0);
-    let add_password_button = gtk::Button::with_label("Add");
-    passwords_box.pack_start(&add_password_button, false, false, 0);
+
+    // Hidden entirely unless Bitwarden integration is enabled (see
+    // `rebuild_passwords_list`, which rebuilds this combo's contents and
+    // this row's visibility every time it runs) — a brand-new login always
+    // goes to the local vault when this isn't shown, same as before this
+    // field existed.
+    let save_destination_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    save_destination_row.pack_start(&gtk::Label::new(Some("Save to")), false, false, 0);
+    let save_destination_combo = gtk::ComboBoxText::new();
+    save_destination_row.pack_start(&save_destination_combo, true, true, 0);
+    passwords_box.pack_start(&save_destination_row, false, false, 0);
+
+    let passwords_error_label = gtk::Label::new(None);
+    passwords_error_label.set_halign(gtk::Align::Start);
+    passwords_error_label.set_line_wrap(true);
+    passwords_box.pack_start(&passwords_error_label, false, false, 0);
+
+    let password_form_button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let cancel_edit_button = gtk::Button::with_label("Cancel edit");
+    cancel_edit_button.set_visible(false);
+    let submit_password_button = gtk::Button::with_label("Add");
+    password_form_button_row.pack_start(&cancel_edit_button, false, false, 0);
+    password_form_button_row.pack_start(&submit_password_button, false, false, 0);
+    passwords_box.pack_start(&password_form_button_row, false, false, 0);
 
     let passwords_close_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     passwords_close_row.set_halign(gtk::Align::End);
@@ -2390,6 +2573,12 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         new_password_username_entry: new_password_username_entry.clone(),
         new_password_password_entry: new_password_password_entry.clone(),
         new_password_notes_entry: new_password_notes_entry.clone(),
+        editing_login: RefCell::new(None),
+        save_destination_combo: save_destination_combo.clone(),
+        save_destination_row: save_destination_row.clone(),
+        submit_password_button: submit_password_button.clone(),
+        cancel_edit_button: cancel_edit_button.clone(),
+        passwords_error_label: passwords_error_label.clone(),
         switcher_rows: RefCell::new(Vec::new()),
         core: RefCell::new(core),
         containers: RefCell::new(HashMap::new()),
@@ -2675,14 +2864,20 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     }
     {
         let app = Rc::clone(&app);
-        add_password_button.connect_clicked(move |_| {
-            app.add_password_from_fields();
+        submit_password_button.connect_clicked(move |_| {
+            app.submit_login_from_fields();
         });
     }
     {
         let app = Rc::clone(&app);
         new_password_password_entry.connect_activate(move |_| {
-            app.add_password_from_fields();
+            app.submit_login_from_fields();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        cancel_edit_button.connect_clicked(move |_| {
+            app.cancel_editing_login();
         });
     }
     {

@@ -173,6 +173,7 @@ dependencies = [
  "gtk",
  "gtk-test",
  "render-engine",
+ "serde_json",
  "tiny_http",
 ]
 
