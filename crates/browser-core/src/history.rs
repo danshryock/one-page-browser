@@ -113,12 +113,15 @@ impl HistoryStore {
     /// that a bad passphrase surfaces as a real error — which callers should
     /// treat as "wrong passphrase, ask again," not a generic I/O failure.
     ///
-    /// Only actually implemented on Linux (see the `libsql` dependency's
-    /// `[target.'cfg(target_os = "linux")']` scoping in `Cargo.toml` for
-    /// why) — every other target gets a plain error instead, deliberately
-    /// *not* silently falling back to an unencrypted open, which would be a
-    /// silent security downgrade for anyone who thinks they got encryption.
-    #[cfg(target_os = "linux")]
+    /// Only actually implemented on Linux and macOS (see the `libsql`
+    /// dependency's `[target.'cfg(any(target_os = "linux", target_os =
+    /// "macos"))']` scoping in `Cargo.toml` for why — confirmed to actually
+    /// cross-compile/link on macOS via `cargo zigbuild`, the same finding
+    /// that already unblocked `PasswordStore::open_encrypted` there) — every
+    /// other target gets a plain error instead, deliberately *not* silently
+    /// falling back to an unencrypted open, which would be a silent security
+    /// downgrade for anyone who thinks they got encryption.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn open_encrypted(profile: &Profile, passphrase: &str) -> anyhow::Result<Self> {
         let path = profile
             .history_db_path()
@@ -137,7 +140,7 @@ impl HistoryStore {
         Ok(Self { _db: db, conn })
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub fn open_encrypted(_profile: &Profile, _passphrase: &str) -> anyhow::Result<Self> {
         anyhow::bail!("passphrase-protected profiles aren't available on this platform yet")
     }
@@ -612,12 +615,14 @@ mod tests {
     }
 
     // These three exercise the *real* `open_encrypted` implementation, which
-    // only exists on Linux (see its `#[cfg]` and doc comment) — gated so
-    // they don't run (and fail on the stub's `Err`) on a genuine non-Linux
-    // CI runner, e.g. GitHub Actions' `windows-latest`, which actually
-    // *executes* `browser-core`'s test suite natively rather than only
-    // cross-compiling it.
-    #[cfg(target_os = "linux")]
+    // only exists on Linux and macOS (see its `#[cfg]` and doc comment) —
+    // gated so they don't run (and fail on the stub's `Err`) on a genuine
+    // non-Linux/non-macOS CI runner, e.g. GitHub Actions' `windows-latest`,
+    // which actually *executes* `browser-core`'s test suite natively rather
+    // than only cross-compiling it. On a real `macos-*` runner
+    // (`.github/workflows/macos.yml`) these now actually run too, not just
+    // cross-compile-link-check.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn encrypted_store_round_trips_with_the_right_passphrase() {
         let profile = temp_profile("round-trip");
@@ -638,7 +643,7 @@ mod tests {
         cleanup_profile(&profile);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn encrypted_store_rejects_the_wrong_passphrase() {
         let profile = temp_profile("wrong-passphrase");
@@ -652,7 +657,7 @@ mod tests {
         cleanup_profile(&profile);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_plain_unencrypted_open_cannot_read_an_encrypted_store() {
         let profile = temp_profile("plain-vs-encrypted");
@@ -666,12 +671,13 @@ mod tests {
         cleanup_profile(&profile);
     }
 
-    /// The non-Linux counterpart to the three tests above: confirms the
-    /// stub `open_encrypted` (see its `#[cfg(not(target_os = "linux"))]`
-    /// impl) does what it's documented to do — return an error — rather
-    /// than silently falling back to an unencrypted open, which would be a
-    /// silent security downgrade for anyone who thinks they got encryption.
-    #[cfg(not(target_os = "linux"))]
+    /// The non-Linux/non-macOS counterpart to the three tests above:
+    /// confirms the stub `open_encrypted` (see its
+    /// `#[cfg(not(any(target_os = "linux", target_os = "macos")))]` impl)
+    /// does what it's documented to do — return an error — rather than
+    /// silently falling back to an unencrypted open, which would be a silent
+    /// security downgrade for anyone who thinks they got encryption.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn open_encrypted_returns_an_error_rather_than_silently_opening_unencrypted_on_this_platform() {
         let profile = temp_profile("stub-platform");

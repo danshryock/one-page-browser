@@ -109,12 +109,40 @@ build/run instructions.
   confirmed to actually work by direct experiment this session (libsql's `encryption` feature builds and links
   cleanly via `cargo zigbuild` for both architectures) — previously assumed untried, not blocked — so
   `browser-core/Cargo.toml`/`passwords.rs`'s `#[cfg]` gates were widened to include macOS alongside Linux
-  (`history.rs`'s own gate, and thus "encrypted profiles"/history encryption, stays Linux-only and untouched —
-  the vault's passphrase has always been independent of that). As with everything else in this crate, this is
-  compile/link-verified only from this dev machine (no macOS hardware here to actually run it) — real
-  behavioral proof needs `.github/workflows/macos.yml` triggered for real (a `v*.*` tag push or manual
-  dispatch), which will also be the first time the widened encrypted-vault tests execute on genuine Apple
-  hardware.
+  (`history.rs`'s own gate — "encrypted profiles"/history encryption — was still Linux-only at the time; see
+  the next entry for that gap closing too). As with everything else in this crate, this is compile/link-
+  verified only from this dev machine (no macOS hardware here to actually run it) — real behavioral proof
+  needs `.github/workflows/macos.yml` triggered for real (a `v*.*` tag push or manual dispatch); this was
+  actually done this session and confirmed on real `arm64`/`macos-14` hardware (the `x64`/`macos-13` jobs
+  never got a runner assigned after a long queue and were cancelled — a GitHub-side capacity issue, not a
+  build/code problem).
+- Bookmarks, light/dark theme, and encrypted history for `browser-macos-appkit` — closing the rest of the gap
+  with `browser-linux-gtk3`'s feature set (bar the `NSCollectionView` tile-grid follow-up, still open). Two
+  real, deliberate divergences from a literal port:
+  - **Theme** is an application-wide `NSApplication::setAppearance(NSAppearance::appearanceNamed(...))`
+    override (`NSAppearanceNameAqua`/`NSAppearanceNameDarkAqua`), not a manual color palette — this crate sets
+    zero explicit `NSColor`s anywhere, so every control is already correctly styled by AppKit in both system
+    appearances; gtk3 needs a manual `CssProvider`/`theme_css()` palette only because GTK's stylesheet is
+    otherwise static. A strict improvement over a literal port, not a scope cut: it themes every native
+    control (menu bar included), not just the specific surfaces gtk3's CSS remembers to cover.
+  - **Encrypted history**'s passphrase is collected via a synchronous `NSAlert` + `NSSecureTextField`
+    accessory view, run with `runModal()` *before* the main window is built — not a second `NSWindow` the way
+    gtk3's `show_passphrase_prompt` needs one. `run_chooser` (this crate's only second-window precedent) is
+    architecturally wrong for this: it's a spawn-and-exit standalone mini-app (`NSApplication::run()` +
+    `std::process::exit(0)` on every path), not "collect one input, then keep building the same window in the
+    same process" — `NSAlert::runModal()` is a blocking call designed exactly for that, and can run before
+    `NSApplication::run()` has been entered. `browser-core/src/history.rs`'s `open_encrypted` `#[cfg]` gate
+    was widened to include macOS (mirroring the vault's identical widening above), including its tests, so
+    `.github/workflows/macos.yml`'s `cargo test -p browser-core` job exercises them on real hardware too.
+    Bookmarks reused `browser_chrome_core::build_switcher_rows`'s existing `Option<&Bookmarks>` parameter
+    as-is (this crate previously always passed `None`) — no new per-variant switcher-row styling needed, since
+    this crate's switcher rows have never had any (even `Open`'s palette color is discarded). Creating a new
+    *encrypted* profile got a checkbox in the profile picker, routing to the already-existing
+    `launch_new_encrypted_profile_process`. Verified: compiles/links cleanly cross-compiled for both
+    `aarch64-apple-darwin`/`x86_64-apple-darwin`. Real behavioral proof (does the `NSAlert` passphrase flow
+    actually block correctly before the window exists, does the theme popup actually flip system appearance,
+    does the bookmarks overlay/star toggle work) still needs `.github/workflows/macos.yml` triggered again for
+    this specific change — not yet done as of this entry.
 - Separate `EditUrl`/`OpenSwitcher` actions (`browser-core` + `browser-linux-gtk3`): Ctrl+L now opens the
   switcher with the current URL preloaded and fully selected (not blanked); Ctrl+T/F1 keep the old
   blank-search behavior. See `summaries/edit-url-vs-new-page-actions.md`.
@@ -441,11 +469,9 @@ still untested).
 
 ## Backlog (not yet started, roughly in the order raised)
 
-- `browser-macos-appkit`: bookmarks, light/dark theme, and encrypted profiles (history encryption) — the
-  remaining parts of `browser-linux-gtk3`'s scope neither Windows front end has either (see "Done" above —
-  the password manager is now at parity; these three are unrelated to it and still open). A wrapping tile
-  grid (`NSCollectionView`) instead of the current plain-list switcher/profile/passwords overlays is a
-  smaller, separate follow-up.
+- `browser-macos-appkit`: a wrapping tile grid (`NSCollectionView`) instead of the current plain-list
+  switcher/profile/passwords/bookmarks overlays — the one remaining item from the bookmarks/theme/encrypted-
+  history bullet above, deliberately deferred there as "a smaller, separate follow-up."
 - `browser-windows-winui`: unified search/URL bar and bookmarks, matching what `browser-linux-gtk3` now has
   (both landed there only, per scope — see "Done" above).
 - Other external password managers beyond Bitwarden/Vaultwarden (see "Done" above for that one) — KeePassXC/
@@ -471,15 +497,12 @@ still untested).
   transition with no page navigation; verified against controlled fixture pages, not real sites. Varies a lot
   site-to-site in ways headless fixture-page testing can't validate — deserves focused real-site testing, not
   a rushed pass.
-- Get libsql's `"encryption"` feature (SQLite3 Multiple Ciphers, via libsql-ffi) building for the
-  cross-compiled targets, not just native Linux — today it's scoped to `target_os = "linux"` only in
-  `browser-core/Cargo.toml`, so `HistoryStore::open_encrypted`/`PasswordStore::open_encrypted` are stubs that
-  always error on Windows/macOS builds from this dev machine. The confirmed blocker for the Windows MSVC
-  target (`cargo build-windows-winui`/`-reactor`, via `cargo-xwin`) is that libsql-ffi's CMake build needs
-  `llvm-lib`, not available in this toolchain — worth revisiting once/if that's installable. The macOS
-  zigbuild cross-compile path hasn't actually been tried with the feature enabled at all (the Linux-only
-  scoping was chosen for simplicity, not because macOS was tested and failed) — that's the cheaper first
-  thing to check.
+- Get libsql's `"encryption"` feature (SQLite3 Multiple Ciphers, via libsql-ffi) building for the Windows
+  MSVC cross-compile target too — `browser-core/Cargo.toml` now scopes it to
+  `any(target_os = "linux", target_os = "macos")` (macOS confirmed working this session, both for the vault
+  and now history — see "Done" above), so only Windows remains stubbed. The confirmed blocker there (`cargo
+  build-windows-winui`/`-reactor`, via `cargo-xwin`) is that libsql-ffi's CMake build needs `llvm-lib`, not
+  available in this toolchain — worth revisiting once/if that's installable.
 - Changing/removing a profile's passphrase, or migrating an existing unencrypted profile (history or vault)
   to encrypted (`sqlite3_rekey` is available via libsql-sys but not wired up yet) — i.e. key rotation.
 - Investigate key derivation for the two encrypted stores: today `HistoryStore::open_encrypted`/

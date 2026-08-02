@@ -4,7 +4,8 @@ fn main() -> anyhow::Result<()> {
     use browser_macos_appkit::{build_window_and_app, resolve_args, run_chooser};
 
     let args: Vec<String> = std::env::args().collect();
-    let (url, profile_name) = resolve_args(args);
+    let (url, profile_name) = resolve_args(args.clone());
+    let setup_passphrase = browser_core::resolve_passphrase_setup_requested(args);
 
     match url {
         // Matches the other front ends' `--url`-argument handoff: launched
@@ -14,7 +15,7 @@ fn main() -> anyhow::Result<()> {
         Some(url) => run_chooser(url, profile_name),
         None => {
             let profile = Profile::new(profile_name);
-            let app = build_window_and_app(profile)?;
+            let app = build_window_and_app(profile, setup_passphrase)?;
             app.run();
             Ok(())
         }
