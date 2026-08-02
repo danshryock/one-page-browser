@@ -46,7 +46,7 @@ pub trait PasswordBackend {
     fn delete(&self, id: &str) -> anyhow::Result<()>;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS passwords (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -147,12 +147,16 @@ impl PasswordStore {
     /// why a wrong passphrase only ever surfaces as a generic error from the
     /// first real read, not immediately on open).
     ///
-    /// Only actually implemented on Linux, same constraint and same reason
-    /// as `HistoryStore::open_encrypted` (see `Cargo.toml`'s
-    /// `[target.'cfg(target_os = "linux")']` scoping of libsql's
-    /// `encryption` feature) — every other target gets a plain error
-    /// instead of a silent, unencrypted fallback.
-    #[cfg(target_os = "linux")]
+    /// Implemented on Linux and macOS (see `Cargo.toml`'s
+    /// `[target.'cfg(any(target_os = "linux", target_os = "macos"))']`
+    /// scoping of libsql's `encryption` feature — confirmed to actually
+    /// cross-compile/link for macOS via `cargo zigbuild`, not just assumed;
+    /// Windows stays excluded, blocked on `llvm-lib` for the MSVC target's
+    /// CMake build). Every other target gets a plain error instead of a
+    /// silent, unencrypted fallback — unlike `HistoryStore::open_encrypted`,
+    /// this has no separate "encrypted profiles" concept to piggyback on,
+    /// so this gate is independent of that one.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn open_encrypted(profile: &Profile, passphrase: &str) -> anyhow::Result<Self> {
         let path = profile
             .passwords_db_path()
@@ -171,7 +175,7 @@ impl PasswordStore {
         Ok(Self { _db: db, conn })
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub fn open_encrypted(_profile: &Profile, _passphrase: &str) -> anyhow::Result<Self> {
         anyhow::bail!("the password vault isn't available on this platform yet")
     }
@@ -436,7 +440,7 @@ fn passkey_from_sql(json: Option<String>) -> anyhow::Result<Option<PasskeyCreden
 /// normal case, once every vault has been opened at least once after this
 /// migration was added) — same pattern as `history.rs`'s
 /// `migrate_add_embedding_column`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn migrate_add_passkey_column(conn: &libsql::Connection) {
     let _ = futures_executor::block_on(conn.execute("ALTER TABLE passwords ADD COLUMN passkey TEXT", ()));
 }
@@ -618,10 +622,11 @@ mod tests {
     }
 
     // These exercise the *real* `open_encrypted` implementation, which only
-    // exists on Linux (see its `#[cfg]` and doc comment) — gated so they
-    // don't run (and fail on the stub's `Err`) on a genuine non-Linux CI
-    // runner, same reasoning as `history.rs`'s equivalent tests.
-    #[cfg(target_os = "linux")]
+    // exists on Linux and macOS (see its `#[cfg]` and doc comment) — gated
+    // so they don't run (and fail on the stub's `Err`) on a genuine
+    // Windows CI runner, same reasoning as `history.rs`'s equivalent tests
+    // (though that one stays Linux-only — see this module's doc comment).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn encrypted_store_round_trips_with_the_right_passphrase() {
         let profile = temp_profile("round-trip");
@@ -642,7 +647,7 @@ mod tests {
         cleanup_profile(&profile);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_login_with_a_passkey_round_trips_through_the_real_store() {
         let profile = temp_profile("passkey-round-trip");
@@ -667,7 +672,7 @@ mod tests {
         cleanup_profile(&profile);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn opening_a_database_created_before_the_passkey_column_existed_still_works() {
         let profile = temp_profile("pre-passkey-migration");
@@ -722,7 +727,7 @@ mod tests {
         cleanup_profile(&profile);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn list_breaks_a_created_at_tie_by_insertion_order_against_the_real_store() {
         let profile = temp_profile("tie-breaking");
@@ -747,7 +752,7 @@ mod tests {
         cleanup_profile(&profile);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn encrypted_store_rejects_the_wrong_passphrase() {
         let profile = temp_profile("wrong-passphrase");
@@ -761,12 +766,12 @@ mod tests {
         cleanup_profile(&profile);
     }
 
-    /// The non-Linux counterpart: confirms the stub `open_encrypted` (see
-    /// its `#[cfg(not(target_os = "linux"))]` impl) reports an error rather
-    /// than silently succeeding — there is no unencrypted fallback to worry
-    /// about here (unlike history's equivalent test), since the vault has
-    /// no unencrypted mode at all.
-    #[cfg(not(target_os = "linux"))]
+    /// The Windows counterpart: confirms the stub `open_encrypted` (see its
+    /// `#[cfg(not(any(target_os = "linux", target_os = "macos")))]` impl)
+    /// reports an error rather than silently succeeding — there is no
+    /// unencrypted fallback to worry about here (unlike history's
+    /// equivalent test), since the vault has no unencrypted mode at all.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn open_encrypted_returns_an_error_rather_than_silently_succeeding_on_this_platform() {
         let profile = temp_profile("stub-platform");

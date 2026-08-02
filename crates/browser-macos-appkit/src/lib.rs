@@ -75,13 +75,15 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSButtonType, NSControlStateValueOff,
-    NSControlStateValueOn, NSEventModifierFlags, NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSControlStateValueOn, NSEventModifierFlags, NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSSecureTextField,
+    NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
 use browser_core::{
-    launch_new_profile_process, list_profile_names, resolve_address_input, resolve_profile_name, resolve_url_argument, Action,
-    HistoryStore, Keybindings, PageManager, Profile, Settings, HOME_URL,
+    decide_vault_unlock_action, domain_of, launch_new_profile_process, list_profile_names, resolve_address_input,
+    resolve_profile_name, resolve_url_argument, Action, BitwardenBackend, BitwardenStatus, HistoryStore, Keybindings, Login,
+    LoginFields, PageManager, PasswordBackend, PasswordStore, Profile, Settings, VaultUnlockAction, HOME_URL,
 };
 use render_engine::{RenderEngine, WryEngine};
 
@@ -104,6 +106,28 @@ enum Overlay {
     Switcher,
     Settings,
     Profile,
+    Passwords,
+}
+
+/// The password vault's session state — mirrors `browser-linux-gtk3`'s
+/// `VaultState` exactly (see that crate's doc comment): UI-level
+/// bookkeeping, not a storage concept, distinct from `PasswordStore`/
+/// `PasswordBackend` in `browser-core`.
+enum VaultState {
+    NotSetUp,
+    Locked,
+    Unlocked(PasswordStore),
+}
+
+/// Which backend a `Login` shown in the password manager overlay actually
+/// came from — mirrors `browser-linux-gtk3`'s local (non-`browser-core`)
+/// `LoginSource` enum for the same reason: `Edit`/`Delete`/`Fill` must
+/// route to whichever backend a row actually came from, and there's no
+/// "move a login between backends" operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginSource {
+    Local,
+    Bitwarden,
 }
 
 // The switcher's row list/activation logic used to be a local `SwitcherRow`
@@ -125,6 +149,7 @@ struct AppState {
     switcher_button: Retained<NSButton>,
     settings_button: Retained<NSButton>,
     profile_button: Retained<NSButton>,
+    passwords_button: Retained<NSButton>,
     /// Hosts every page's container view (see `pages`) below the toolbar —
     /// the AppKit equivalent of GTK's `Stack`/reactor's `Grid`: every loaded
     /// page's container is a sibling subview here, only the active one
@@ -163,7 +188,69 @@ struct AppState {
     profile_rows_container: Retained<NSView>,
     new_profile_field: Retained<NSTextField>,
 
+    passwords_view: Retained<NSView>,
+    /// Whether the local vault has ever been set up, is set up but not
+    /// unlocked this run, or is open and ready to use — see
+    /// `browser_core::decide_vault_unlock_action`'s doc comment for how a
+    /// profile that already has a passphrase (for the vault specifically —
+    /// unrelated to "encrypted profiles"/history encryption, which this
+    /// crate has never implemented) reuses it silently.
+    passwords: RefCell<VaultState>,
+    /// The passphrase, if any, this run has already used to unlock the
+    /// vault — never written to disk. Unlike `browser-linux-gtk3`, this
+    /// crate has no encrypted-history/`show_passphrase_prompt` flow at all,
+    /// so this only ever gets set by unlocking the vault itself, not
+    /// shared with anything else — kept as a field anyway (rather than a
+    /// bare local) for symmetry with that crate's design and in case a
+    /// future "encrypted profiles" pass on this platform wants to reuse it.
+    session_passphrase: RefCell<Option<String>>,
+    /// Vault locked/setup sub-group — shown instead of the contents
+    /// sub-group (below) while `passwords` isn't `VaultState::Unlocked`.
+    passwords_unlock_label: Retained<NSTextField>,
+    passwords_unlock_field: Retained<NSSecureTextField>,
+    passwords_unlock_button: Retained<NSButton>,
+    passwords_unlock_error_label: Retained<NSTextField>,
+    /// Vault contents sub-group — the credential list plus the add/edit
+    /// form, shown once `passwords` is `VaultState::Unlocked`.
+    passwords_rows_container: Retained<NSView>,
+    /// Flat, combined (local vault + Bitwarden) index list backing every
+    /// row's `NSButton::setTag(idx)` — AppKit's target/action dispatch has
+    /// no built-in "which item" beyond the sender itself (same reasoning as
+    /// `switcher_rows`), so this is what `idx` indexes into.
+    passwords_rows: RefCell<Vec<(Login, LoginSource)>>,
+    passwords_site_field: Retained<NSTextField>,
+    passwords_username_field: Retained<NSTextField>,
+    passwords_password_field: Retained<NSSecureTextField>,
+    passwords_notes_field: Retained<NSTextField>,
+    /// Chooses which backend a brand-new login (`editing_login: None`)
+    /// gets saved to — populated with "Local vault" always, "Bitwarden"
+    /// only when `Settings::bitwarden_server_url` is set (see
+    /// `rebuild_passwords_rows`).
+    passwords_destination_popup: Retained<NSPopUpButton>,
+    /// Labeled "Add" or "Save" depending on `editing_login`.
+    passwords_submit_button: Retained<NSButton>,
+    /// Only visible while `editing_login` is `Some` — abandons the edit and
+    /// returns the form to "add new" mode.
+    passwords_cancel_edit_button: Retained<NSButton>,
+    passwords_error_label: Retained<NSTextField>,
+    /// Which existing login (if any) the form above is currently editing,
+    /// and which backend it came from — `None` means "add new" mode.
+    editing_login: RefCell<Option<(String, LoginSource)>>,
+    /// Bitwarden's own inline unlock — shown (fixed position, not part of
+    /// the dynamic `passwords_rows_container`) only when Bitwarden is
+    /// configured but its own `status()` reports locked. Unrelated to the
+    /// local vault's unlock fields above; this crate has no "modal that
+    /// hands back to the main window" precedent (see `run_chooser`), so —
+    /// same as the local vault's own setup/unlock flow — this folds into
+    /// the passwords overlay itself rather than a second popup window.
+    bitwarden_unlock_field: Retained<NSSecureTextField>,
+    bitwarden_unlock_button: Retained<NSButton>,
+
     settings: RefCell<Settings>,
+    /// Enables Bitwarden integration and sets `Settings::bitwarden_server_url`
+    /// — same construction (`NSButtonType::Switch`) as `unlimited_checkbox`.
+    bitwarden_checkbox: Retained<NSButton>,
+    bitwarden_url_field: Retained<NSTextField>,
     history: HistoryStore,
     /// Resolved once at startup (from `--profile`, defaulting to
     /// `"default"`) — kept so the settings overlay's Save action re-saves to
@@ -183,7 +270,7 @@ impl AppState {
             NSSize::new(content_size.width, TOOLBAR_HEIGHT),
         ));
 
-        let button_count = 6.0; // back, forward, reload, switcher, settings, profile
+        let button_count = 7.0; // back, forward, reload, switcher, settings, profile, passwords
         let address_bar_x = 3.0 * BUTTON_WIDTH + 4.0 * BUTTON_MARGIN;
         let address_bar_end = content_size.width - (button_count - 3.0) * (BUTTON_WIDTH + BUTTON_MARGIN) - BUTTON_MARGIN;
         self.address_bar.setFrame(NSRect::new(
@@ -191,7 +278,7 @@ impl AppState {
             NSSize::new((address_bar_end - address_bar_x).max(0.0), TOOLBAR_HEIGHT - 2.0 * BUTTON_MARGIN),
         ));
         let mut x = address_bar_end + BUTTON_MARGIN;
-        for button in [&self.switcher_button, &self.settings_button, &self.profile_button] {
+        for button in [&self.switcher_button, &self.settings_button, &self.profile_button, &self.passwords_button] {
             button.setFrame(NSRect::new(NSPoint::new(x, BUTTON_MARGIN), NSSize::new(BUTTON_WIDTH, TOOLBAR_HEIGHT - 2.0 * BUTTON_MARGIN)));
             x += BUTTON_WIDTH + BUTTON_MARGIN;
         }
@@ -236,6 +323,7 @@ impl AppState {
         self.switcher_view.setHidden(true);
         self.settings_view.setHidden(true);
         self.profile_view.setHidden(true);
+        self.passwords_view.setHidden(true);
         if let Some(page) = self.core.borrow().active() {
             self.address_bar.setStringValue(&NSString::from_str(&page.current_url()));
         }
@@ -299,6 +387,16 @@ impl AppState {
                 self.limit_field.setEnabled(false);
             }
         }
+        match &settings.bitwarden_server_url {
+            Some(url) => {
+                self.bitwarden_checkbox.setState(NSControlStateValueOn);
+                self.bitwarden_url_field.setStringValue(&NSString::from_str(url));
+            }
+            None => {
+                self.bitwarden_checkbox.setState(NSControlStateValueOff);
+                self.bitwarden_url_field.setStringValue(&NSString::from_str(""));
+            }
+        }
         drop(settings);
         self.overlay.set(Overlay::Settings);
         self.rebuild_keybindings_rows();
@@ -319,10 +417,16 @@ impl AppState {
         let unlimited = self.unlimited_checkbox.state() == NSControlStateValueOn;
         let limit_text = self.limit_field.stringValue().to_string();
         let new_limit = if unlimited { None } else { limit_text.trim().parse::<usize>().ok().map(|n| n.max(1)) };
+        let bitwarden_enabled = self.bitwarden_checkbox.state() == NSControlStateValueOn;
+        let bitwarden_url_text = self.bitwarden_url_field.stringValue().to_string();
+        let bitwarden_url_text = bitwarden_url_text.trim();
+        let new_bitwarden_url = bitwarden_enabled
+            .then(|| if bitwarden_url_text.is_empty() { "http://127.0.0.1:8087".to_string() } else { bitwarden_url_text.to_string() });
         {
             let mut settings = self.settings.borrow_mut();
             settings.start_page = self.start_page_field.stringValue().to_string();
             settings.max_loaded_pages = new_limit;
+            settings.bitwarden_server_url = new_bitwarden_url;
         }
         let evicted = self.core.borrow_mut().set_max_loaded_pages(new_limit);
         self.unload_engines(&evicted);
@@ -349,6 +453,401 @@ impl AppState {
             }
         }
         self.close_all_overlays();
+    }
+
+    // ---- password manager -----------------------------------------------
+
+    /// Builds a fresh `BitwardenBackend` from the current settings, if
+    /// Bitwarden integration is enabled — cheap to construct (no network
+    /// I/O happens until a real call is made), so there's nothing to cache:
+    /// `bw serve` — a separate, already-running process — is what actually
+    /// owns the vault's lock state, not anything here. Mirrors
+    /// `browser-linux-gtk3`'s identically-named method.
+    fn bitwarden_backend(&self) -> Option<BitwardenBackend> {
+        self.settings.borrow().bitwarden_server_url.clone().map(BitwardenBackend::new)
+    }
+
+    /// Shows the password manager overlay. Unlike every other overlay here,
+    /// this first has to resolve the local vault's unlock/setup state (see
+    /// `decide_vault_unlock_action`'s doc comment) — this crate has no
+    /// separate-window passphrase-prompt precedent (see `run_chooser`'s doc
+    /// comment), so both the "not set up yet"/"locked" states and the real
+    /// credential list are all rendered within this one overlay, toggled by
+    /// `rebuild_passwords_view`.
+    fn open_passwords(self: &Rc<Self>) {
+        self.close_all_overlays();
+        self.overlay.set(Overlay::Passwords);
+        self.cancel_editing_login();
+        self.passwords_unlock_error_label.setStringValue(&NSString::from_str(""));
+        self.rebuild_passwords_view();
+        self.passwords_view.setHidden(false);
+    }
+
+    /// Tries to open the vault with `passphrase`, updating `self.passwords`/
+    /// `self.session_passphrase` on success. `is_setup` marks this as the
+    /// vault's first-ever passphrase (calls `enable_vault_passphrase`) —
+    /// see `PasswordStore::open_encrypted`'s doc comment for why "setup"
+    /// and "unlock" are otherwise the same call. Returns whether it
+    /// succeeded, so callers can show an error rather than silently doing
+    /// nothing. Mirrors `browser-linux-gtk3`'s identically-named method.
+    fn try_open_vault_with(&self, passphrase: &str, is_setup: bool) -> bool {
+        match PasswordStore::open_encrypted(&self.profile, passphrase) {
+            Ok(store) => {
+                if is_setup {
+                    if let Err(err) = self.profile.enable_vault_passphrase() {
+                        eprintln!("failed to mark profile as vault-passphrase-protected: {err}");
+                    }
+                }
+                if self.session_passphrase.borrow().is_none() {
+                    *self.session_passphrase.borrow_mut() = Some(passphrase.to_string());
+                }
+                *self.passwords.borrow_mut() = VaultState::Unlocked(store);
+                true
+            }
+            Err(err) => {
+                eprintln!("failed to open password vault: {err}");
+                false
+            }
+        }
+    }
+
+    /// Decides whether to show the locked/setup sub-group or the vault
+    /// contents sub-group, based on `decide_vault_unlock_action` — a
+    /// `SilentlySetUpWith`/`SilentlyUnlockWith` result (a passphrase already
+    /// known this session) unlocks immediately with no prompt shown at all,
+    /// same "same passphrase, no second prompt" behavior
+    /// `browser-linux-gtk3` implements.
+    fn rebuild_passwords_view(self: &Rc<Self>) {
+        if !matches!(&*self.passwords.borrow(), VaultState::Unlocked(_)) {
+            let action = decide_vault_unlock_action(&self.profile, self.session_passphrase.borrow().as_deref());
+            match action {
+                VaultUnlockAction::SilentlySetUpWith(passphrase) => {
+                    self.try_open_vault_with(&passphrase, true);
+                }
+                VaultUnlockAction::SilentlyUnlockWith(passphrase) => {
+                    self.try_open_vault_with(&passphrase, false);
+                }
+                VaultUnlockAction::PromptToSetUp | VaultUnlockAction::PromptToUnlock => {}
+            }
+        }
+
+        let unlocked = matches!(&*self.passwords.borrow(), VaultState::Unlocked(_));
+        let is_setup = !self.profile.has_vault_passphrase();
+        self.passwords_unlock_label.setStringValue(&NSString::from_str(if is_setup {
+            "Choose a passphrase to encrypt your password vault."
+        } else {
+            "Enter your vault passphrase to unlock it."
+        }));
+        self.passwords_unlock_button.setTitle(&NSString::from_str(if is_setup { "Set Up" } else { "Unlock" }));
+        self.passwords_unlock_label.setHidden(unlocked);
+        self.passwords_unlock_field.setHidden(unlocked);
+        self.passwords_unlock_button.setHidden(unlocked);
+        self.passwords_unlock_error_label.setHidden(unlocked);
+        self.passwords_rows_container.setHidden(!unlocked);
+        self.passwords_site_field.setHidden(!unlocked);
+        self.passwords_username_field.setHidden(!unlocked);
+        self.passwords_password_field.setHidden(!unlocked);
+        self.passwords_notes_field.setHidden(!unlocked);
+        self.passwords_destination_popup.setHidden(!unlocked);
+        self.passwords_submit_button.setHidden(!unlocked);
+
+        if unlocked {
+            self.rebuild_passwords_rows();
+        } else {
+            self.window.makeFirstResponder(Some(&self.passwords_unlock_field));
+        }
+    }
+
+    /// The local vault unlock/setup button's action.
+    fn unlock_vault_clicked(self: &Rc<Self>) {
+        let passphrase = self.passwords_unlock_field.stringValue().to_string();
+        if passphrase.is_empty() {
+            self.passwords_unlock_error_label.setStringValue(&NSString::from_str("Passphrase can't be empty."));
+            return;
+        }
+        let is_setup = !self.profile.has_vault_passphrase();
+        if self.try_open_vault_with(&passphrase, is_setup) {
+            self.passwords_unlock_field.setStringValue(&NSString::from_str(""));
+            self.rebuild_passwords_view();
+        } else {
+            self.passwords_unlock_error_label.setStringValue(&NSString::from_str("Couldn't open the vault with that passphrase. Try again."));
+            self.passwords_unlock_field.setStringValue(&NSString::from_str(""));
+            self.window.makeFirstResponder(Some(&self.passwords_unlock_field));
+        }
+    }
+
+    /// Rebuilds `passwords_destination_popup`'s entries — "Local vault"
+    /// always, plus "Bitwarden" when it's enabled — preserving the current
+    /// selection if it's still valid, defaulting to "Local vault" otherwise.
+    fn refresh_passwords_destination_popup(&self) {
+        let bitwarden_enabled = self.bitwarden_backend().is_some();
+        let previous = self.passwords_destination_popup.titleOfSelectedItem().map(|s| s.to_string());
+        self.passwords_destination_popup.removeAllItems();
+        self.passwords_destination_popup.addItemWithTitle(&NSString::from_str("Local vault"));
+        if bitwarden_enabled {
+            self.passwords_destination_popup.addItemWithTitle(&NSString::from_str("Bitwarden"));
+        }
+        let restore = previous.filter(|t| t == "Local vault" || (t == "Bitwarden" && bitwarden_enabled));
+        self.passwords_destination_popup.selectItemWithTitle(&NSString::from_str(restore.as_deref().unwrap_or("Local vault")));
+    }
+
+    /// Rebuilds the password manager overlay's credential list — local
+    /// vault entries, then (if Bitwarden is configured) Bitwarden entries,
+    /// mirroring `browser-linux-gtk3`'s `rebuild_passwords_list` (see its
+    /// doc comment for why the two sources are sectioned rather than
+    /// interleaved by timestamp). Each row gets Fill (gated on
+    /// `entry.domain` matching the active page's domain — enforced again,
+    /// not just here, inside the actual fill action), Copy, Edit, and
+    /// Delete buttons, all `setTag(idx)`-ed into `passwords_rows`.
+    fn rebuild_passwords_rows(&self) {
+        clear_subviews(&self.passwords_rows_container);
+        self.passwords_error_label.setStringValue(&NSString::from_str(""));
+        self.refresh_passwords_destination_popup();
+
+        let active_domain = self.core.borrow().active().map(|p| domain_of(&p.current_url()));
+        let mut rows: Vec<(Login, LoginSource)> = Vec::new();
+
+        let local_entries = match &*self.passwords.borrow() {
+            VaultState::Unlocked(store) => store.list().unwrap_or_else(|err| {
+                eprintln!("failed to list password entries: {err}");
+                Vec::new()
+            }),
+            VaultState::Locked | VaultState::NotSetUp => Vec::new(),
+        };
+        for entry in local_entries {
+            rows.push((entry, LoginSource::Local));
+        }
+
+        let bitwarden = self.bitwarden_backend();
+        let bitwarden_status = bitwarden.as_ref().map(|b| b.status());
+        if let Some(Ok(BitwardenStatus::Unlocked)) = &bitwarden_status {
+            match bitwarden.as_ref().unwrap().list() {
+                Ok(entries) => {
+                    for entry in entries {
+                        rows.push((entry, LoginSource::Bitwarden));
+                    }
+                }
+                Err(err) => eprintln!("failed to list Bitwarden items: {err}"),
+            }
+        }
+
+        let mtm = self.mtm();
+        let width = self.passwords_rows_container.frame().size.width;
+        for (idx, (entry, _source)) in rows.iter().enumerate() {
+            let y = (rows.len() - 1 - idx) as f64 * ROW_HEIGHT;
+
+            let label_text = format!("{} \u{2014} {}", entry.domain, entry.username);
+            let label = unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str(&label_text), None, None, mtm) };
+            label.setButtonType(NSButtonType::MomentaryLight);
+            label.setEnabled(false);
+            label.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(width * 0.4, ROW_HEIGHT - BUTTON_MARGIN)));
+            self.passwords_rows_container.addSubview(&label);
+
+            // `target: None` — dispatched via the responder chain (up to
+            // the window's delegate, `AppDelegate`) rather than an explicit
+            // target reference, the same nil-targeted-action pattern
+            // `rebuild_switcher_rows`/`rebuild_profile_rows` already use for
+            // every dynamically-created row button in this crate.
+            let mut x = width * 0.4;
+            if entry.password.is_some() && active_domain.as_deref() == Some(entry.domain.as_str()) {
+                let fill = unsafe {
+                    NSButton::buttonWithTitle_target_action(&NSString::from_str("Fill"), None, Some(sel!(passwordRowFillClicked:)), mtm)
+                };
+                fill.setTag(idx as isize);
+                fill.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(60.0, ROW_HEIGHT - BUTTON_MARGIN)));
+                self.passwords_rows_container.addSubview(&fill);
+            }
+            x += 64.0;
+
+            let copy = unsafe {
+                NSButton::buttonWithTitle_target_action(&NSString::from_str("Copy"), None, Some(sel!(passwordRowCopyClicked:)), mtm)
+            };
+            copy.setTag(idx as isize);
+            copy.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(60.0, ROW_HEIGHT - BUTTON_MARGIN)));
+            self.passwords_rows_container.addSubview(&copy);
+            x += 64.0;
+
+            let edit = unsafe {
+                NSButton::buttonWithTitle_target_action(&NSString::from_str("Edit"), None, Some(sel!(passwordRowEditClicked:)), mtm)
+            };
+            edit.setTag(idx as isize);
+            edit.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(60.0, ROW_HEIGHT - BUTTON_MARGIN)));
+            self.passwords_rows_container.addSubview(&edit);
+            x += 64.0;
+
+            let delete = unsafe {
+                NSButton::buttonWithTitle_target_action(&NSString::from_str("\u{d7}"), None, Some(sel!(passwordRowDeleteClicked:)), mtm)
+            };
+            delete.setTag(idx as isize);
+            delete.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(30.0, ROW_HEIGHT - BUTTON_MARGIN)));
+            self.passwords_rows_container.addSubview(&delete);
+        }
+
+        // Bitwarden's own inline unlock — fixed position, not part of the
+        // dynamic row list above (see this crate's `bitwarden_unlock_field`
+        // doc comment for why).
+        let bitwarden_locked = matches!(bitwarden_status, Some(Ok(BitwardenStatus::Locked)));
+        self.bitwarden_unlock_field.setHidden(!bitwarden_locked);
+        self.bitwarden_unlock_button.setHidden(!bitwarden_locked);
+        if let Some(Err(err)) = &bitwarden_status {
+            eprintln!("Bitwarden: could not connect (is `bw serve` running?): {err}");
+        }
+
+        *self.passwords_rows.borrow_mut() = rows;
+    }
+
+    fn password_row_fill_clicked(self: &Rc<Self>, idx: usize) {
+        let Some((entry, _)) = self.passwords_rows.borrow().get(idx).cloned() else { return };
+        self.fill_active_page_with_login(&entry);
+    }
+
+    /// Fills the active page's login form with `entry`'s username/password
+    /// and closes the overlay. Re-checks `entry.domain` against the active
+    /// page's domain itself (a no-op if it doesn't match, or if there's no
+    /// password to fill) — `rebuild_passwords_rows` already gates whether
+    /// the Fill button is shown on the same check, but the restriction
+    /// needs to be real and enforced here too, not just a UI affordance.
+    fn fill_active_page_with_login(self: &Rc<Self>, entry: &Login) {
+        let Some(password) = entry.password.clone() else { return };
+        let active_domain = self.core.borrow().active().map(|p| domain_of(&p.current_url()));
+        if active_domain.as_deref() != Some(entry.domain.as_str()) {
+            return;
+        }
+        let username = entry.username.clone();
+        self.with_active(|engine| engine.fill_login(&username, &password));
+        self.close_all_overlays();
+    }
+
+    fn password_row_copy_clicked(&self, idx: usize) {
+        let Some((entry, _)) = self.passwords_rows.borrow().get(idx).cloned() else { return };
+        let password = entry.password.unwrap_or_default();
+        let pasteboard = NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        unsafe {
+            pasteboard.setString_forType(&NSString::from_str(&password), NSPasteboardTypeString);
+        }
+    }
+
+    fn password_row_edit_clicked(self: &Rc<Self>, idx: usize) {
+        let Some((entry, source)) = self.passwords_rows.borrow().get(idx).cloned() else { return };
+        self.start_editing_login(&entry, source);
+    }
+
+    fn password_row_delete_clicked(self: &Rc<Self>, idx: usize) {
+        let Some((entry, source)) = self.passwords_rows.borrow().get(idx).cloned() else { return };
+        self.delete_login(&entry.id, source);
+    }
+
+    /// Fills the add/edit form from `entry` and switches it into "edit"
+    /// mode — reuses the exact same form the add-new-credential flow does,
+    /// rather than a second, separate edit form. Mirrors
+    /// `browser-linux-gtk3`'s identically-named method.
+    fn start_editing_login(self: &Rc<Self>, entry: &Login, source: LoginSource) {
+        self.passwords_site_field.setStringValue(&NSString::from_str(&entry.site));
+        self.passwords_username_field.setStringValue(&NSString::from_str(&entry.username));
+        self.passwords_password_field.setStringValue(&NSString::from_str(entry.password.as_deref().unwrap_or("")));
+        self.passwords_notes_field.setStringValue(&NSString::from_str(&entry.notes));
+        *self.editing_login.borrow_mut() = Some((entry.id.clone(), source));
+        self.passwords_destination_popup.setEnabled(false);
+        self.passwords_submit_button.setTitle(&NSString::from_str("Save"));
+        self.passwords_cancel_edit_button.setHidden(false);
+    }
+
+    /// Returns the add/edit form to "add new" mode.
+    fn cancel_editing_login(&self) {
+        self.passwords_site_field.setStringValue(&NSString::from_str(""));
+        self.passwords_username_field.setStringValue(&NSString::from_str(""));
+        self.passwords_password_field.setStringValue(&NSString::from_str(""));
+        self.passwords_notes_field.setStringValue(&NSString::from_str(""));
+        *self.editing_login.borrow_mut() = None;
+        self.passwords_destination_popup.setEnabled(true);
+        self.passwords_submit_button.setTitle(&NSString::from_str("Add"));
+        self.passwords_cancel_edit_button.setHidden(true);
+    }
+
+    /// Submits the add/edit form — adds a new login (routed to whichever
+    /// backend `passwords_destination_popup` selects) if `editing_login` is
+    /// `None`, or updates the existing one it names otherwise. Mirrors
+    /// `browser-linux-gtk3`'s identically-named method.
+    fn submit_login_from_fields(self: &Rc<Self>) {
+        let site = self.passwords_site_field.stringValue().to_string();
+        let site = site.trim().to_string();
+        if site.is_empty() {
+            return;
+        }
+        let username = self.passwords_username_field.stringValue().to_string();
+        let password_text = self.passwords_password_field.stringValue().to_string();
+        let notes = self.passwords_notes_field.stringValue().to_string();
+        let password = if password_text.trim().is_empty() { None } else { Some(password_text) };
+        let fields = LoginFields { site, username, password, passkey: None, notes };
+
+        let editing = self.editing_login.borrow().clone();
+        let result: anyhow::Result<()> = match editing {
+            Some((id, LoginSource::Local)) => match &*self.passwords.borrow() {
+                VaultState::Unlocked(store) => store.update(&id, fields),
+                VaultState::Locked | VaultState::NotSetUp => return,
+            },
+            Some((id, LoginSource::Bitwarden)) => match self.bitwarden_backend() {
+                Some(backend) => backend.update(&id, fields),
+                None => return,
+            },
+            None => match self.passwords_destination_popup.titleOfSelectedItem().map(|s| s.to_string()).as_deref() {
+                Some("Bitwarden") => match self.bitwarden_backend() {
+                    Some(backend) => backend.add(fields).map(|_| ()),
+                    None => return,
+                },
+                _ => match &*self.passwords.borrow() {
+                    VaultState::Unlocked(store) => store.add(fields).map(|_| ()),
+                    VaultState::Locked | VaultState::NotSetUp => return,
+                },
+            },
+        };
+
+        if let Err(err) = result {
+            let action = if self.editing_login.borrow().is_some() { "save" } else { "add" };
+            self.passwords_error_label.setStringValue(&NSString::from_str(&format!("Failed to {action} login: {err}")));
+            return;
+        }
+        self.cancel_editing_login();
+        self.rebuild_passwords_rows();
+    }
+
+    /// Deletes the login identified by `id` from whichever backend `source`
+    /// names. Mirrors `browser-linux-gtk3`'s identically-named method.
+    fn delete_login(&self, id: &str, source: LoginSource) {
+        let result: anyhow::Result<()> = match source {
+            LoginSource::Local => match &*self.passwords.borrow() {
+                VaultState::Unlocked(store) => store.delete(id),
+                VaultState::Locked | VaultState::NotSetUp => Ok(()),
+            },
+            LoginSource::Bitwarden => match self.bitwarden_backend() {
+                Some(backend) => backend.delete(id),
+                None => Ok(()),
+            },
+        };
+        if let Err(err) = result {
+            self.passwords_error_label.setStringValue(&NSString::from_str(&format!("Failed to delete login: {err}")));
+        }
+        self.rebuild_passwords_rows();
+    }
+
+    /// Bitwarden's inline "Unlock" button's action.
+    fn unlock_bitwarden_clicked(&self) {
+        let Some(backend) = self.bitwarden_backend() else { return };
+        let password = self.bitwarden_unlock_field.stringValue().to_string();
+        if password.is_empty() {
+            return;
+        }
+        match backend.unlock(&password) {
+            Ok(()) => {
+                self.bitwarden_unlock_field.setStringValue(&NSString::from_str(""));
+                self.rebuild_passwords_rows();
+            }
+            Err(err) => {
+                self.passwords_error_label.setStringValue(&NSString::from_str(&format!("Couldn't unlock Bitwarden: {err}")));
+                self.bitwarden_unlock_field.setStringValue(&NSString::from_str(""));
+            }
+        }
     }
 
     // ---- pages ----------------------------------------------------------
@@ -942,6 +1441,77 @@ define_class!(
             }
         }
 
+        #[unsafe(method(openPasswordsAction:))]
+        fn open_passwords_action(&self, _sender: Option<&AnyObject>) {
+            if let Some(state) = self.ivars().state.borrow().as_ref() {
+                state.open_passwords();
+            }
+        }
+
+        #[unsafe(method(unlockVaultAction:))]
+        fn unlock_vault_action(&self, _sender: Option<&AnyObject>) {
+            if let Some(state) = self.ivars().state.borrow().as_ref() {
+                state.unlock_vault_clicked();
+            }
+        }
+
+        #[unsafe(method(unlockBitwardenAction:))]
+        fn unlock_bitwarden_action(&self, _sender: Option<&AnyObject>) {
+            if let Some(state) = self.ivars().state.borrow().as_ref() {
+                state.unlock_bitwarden_clicked();
+            }
+        }
+
+        #[unsafe(method(submitLoginAction:))]
+        fn submit_login_action(&self, _sender: Option<&AnyObject>) {
+            if let Some(state) = self.ivars().state.borrow().as_ref() {
+                state.submit_login_from_fields();
+            }
+        }
+
+        #[unsafe(method(cancelEditingLoginAction:))]
+        fn cancel_editing_login_action(&self, _sender: Option<&AnyObject>) {
+            if let Some(state) = self.ivars().state.borrow().as_ref() {
+                state.cancel_editing_login();
+            }
+        }
+
+        #[unsafe(method(passwordRowFillClicked:))]
+        fn password_row_fill_clicked(&self, sender: Option<&AnyObject>) {
+            if let Some(state) = self.ivars().state.borrow().as_ref() {
+                if let Some(idx) = sender_tag(sender) {
+                    state.password_row_fill_clicked(idx);
+                }
+            }
+        }
+
+        #[unsafe(method(passwordRowCopyClicked:))]
+        fn password_row_copy_clicked(&self, sender: Option<&AnyObject>) {
+            if let Some(state) = self.ivars().state.borrow().as_ref() {
+                if let Some(idx) = sender_tag(sender) {
+                    state.password_row_copy_clicked(idx);
+                }
+            }
+        }
+
+        #[unsafe(method(passwordRowEditClicked:))]
+        fn password_row_edit_clicked(&self, sender: Option<&AnyObject>) {
+            if let Some(state) = self.ivars().state.borrow().as_ref() {
+                if let Some(idx) = sender_tag(sender) {
+                    state.password_row_edit_clicked(idx);
+                }
+            }
+        }
+
+        #[unsafe(method(passwordRowDeleteClicked:))]
+        fn password_row_delete_clicked(&self, sender: Option<&AnyObject>) {
+            if let Some(state) = self.ivars().state.borrow().as_ref() {
+                if let Some(idx) = sender_tag(sender) {
+                    state.password_row_delete_clicked(idx);
+                }
+            }
+        }
+
         #[unsafe(method(dispatchAction:))]
         fn dispatch_action(&self, sender: Option<&AnyObject>) {
             let Some(state) = self.ivars().state.borrow().clone() else { return };
@@ -959,10 +1529,11 @@ define_class!(
                 Action::GoForward => state.with_active(|e| e.go_forward()),
                 Action::OpenSettings => state.open_settings(),
                 Action::OpenProfilePicker => state.open_profile_picker(),
-                // Bookmarks/reader mode/the password manager overlay aren't
-                // implemented on this front end either yet — matches
-                // browser-windows-winui/reactor's scope.
-                Action::ToggleBookmark | Action::OpenBookmarks | Action::ToggleReaderMode | Action::OpenPasswords => {}
+                Action::OpenPasswords => state.open_passwords(),
+                // Bookmarks/reader mode aren't implemented on this front
+                // end either yet — matches browser-windows-winui/reactor's
+                // scope.
+                Action::ToggleBookmark | Action::OpenBookmarks | Action::ToggleReaderMode => {}
             }
         }
     }
@@ -1088,6 +1659,8 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<App> {
     toolbar_view.addSubview(&settings_button);
     let profile_button = make_button("\u{1f464}", &delegate, sel!(openProfilePickerAction:), mtm);
     toolbar_view.addSubview(&profile_button);
+    let passwords_button = make_button("\u{1f511}", &delegate, sel!(openPasswordsAction:), mtm);
+    toolbar_view.addSubview(&passwords_button);
 
     let content_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(window_rect.size.width, window_rect.size.height - TOOLBAR_HEIGHT));
     let content_view = NSView::initWithFrame(NSView::alloc(mtm), content_frame);
@@ -1118,9 +1691,22 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<App> {
     limit_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, content_frame.size.height - OVERLAY_MARGIN - 3.0 * ROW_HEIGHT), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
     settings_view.addSubview(&limit_field);
 
+    // No live-toggle action needed (unlike `unlimited_checkbox`, which
+    // enables/disables a sibling field) — this is only ever read from in
+    // `save_settings`, so a plain constructor is enough, not `make_button`.
+    let bitwarden_checkbox = NSButton::new(mtm);
+    bitwarden_checkbox.setTitle(&NSString::from_str("Enable Bitwarden (via bw serve)"));
+    bitwarden_checkbox.setButtonType(NSButtonType::Switch);
+    bitwarden_checkbox.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, content_frame.size.height - OVERLAY_MARGIN - 4.0 * ROW_HEIGHT), NSSize::new(220.0, ROW_HEIGHT - BUTTON_MARGIN)));
+    settings_view.addSubview(&bitwarden_checkbox);
+    let bitwarden_url_field = make_text_field(mtm, "");
+    bitwarden_url_field.setPlaceholderString(Some(&NSString::from_str("http://127.0.0.1:8087")));
+    bitwarden_url_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN + 224.0, content_frame.size.height - OVERLAY_MARGIN - 4.0 * ROW_HEIGHT), NSSize::new(OVERLAY_WIDTH - 224.0, ROW_HEIGHT - BUTTON_MARGIN)));
+    settings_view.addSubview(&bitwarden_url_field);
+
     let keybindings_rows_container = NSView::initWithFrame(
         NSView::alloc(mtm),
-        NSRect::new(NSPoint::new(OVERLAY_MARGIN, OVERLAY_MARGIN + ROW_HEIGHT), NSSize::new(content_frame.size.width - 2.0 * OVERLAY_MARGIN, content_frame.size.height - 4.0 * ROW_HEIGHT - 2.0 * OVERLAY_MARGIN)),
+        NSRect::new(NSPoint::new(OVERLAY_MARGIN, OVERLAY_MARGIN + ROW_HEIGHT), NSSize::new(content_frame.size.width - 2.0 * OVERLAY_MARGIN, content_frame.size.height - 5.0 * ROW_HEIGHT - 2.0 * OVERLAY_MARGIN)),
     );
     settings_view.addSubview(&keybindings_rows_container);
     let new_binding_field = make_text_field(mtm, "");
@@ -1157,6 +1743,114 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<App> {
     profile_create.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN + 94.0, OVERLAY_MARGIN), NSSize::new(140.0, ROW_HEIGHT - BUTTON_MARGIN)));
     profile_view.addSubview(&profile_create);
 
+    // ---- password manager overlay ----
+    // Rows 1-4 (from the top) are shared, mutually-exclusive coordinates:
+    // the locked/setup sub-group's fields and the add/edit form's fields
+    // occupy the exact same positions, only one set ever visible at once
+    // (see `rebuild_passwords_view`) — no separate popup window, this
+    // crate's only precedent for a second `NSWindow` (`run_chooser`) is a
+    // spawn-and-exit standalone mini-app, not a modal that hands back to a
+    // running main window (see this module's doc comment on that).
+    let passwords_view = make_overlay_container(mtm, content_frame);
+    content_view.addSubview(&passwords_view);
+
+    let row_y = |n: f64| content_frame.size.height - OVERLAY_MARGIN - n * ROW_HEIGHT;
+
+    let passwords_unlock_label = make_text_field(mtm, "");
+    passwords_unlock_label.setEditable(false);
+    passwords_unlock_label.setBordered(false);
+    passwords_unlock_label.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(1.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+    passwords_view.addSubview(&passwords_unlock_label);
+    let passwords_unlock_field = NSSecureTextField::new(mtm);
+    passwords_unlock_field.setPlaceholderString(Some(&NSString::from_str("Passphrase")));
+    unsafe {
+        passwords_unlock_field.setTarget(Some(&*delegate));
+        passwords_unlock_field.setAction(Some(sel!(unlockVaultAction:)));
+    }
+    passwords_unlock_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(2.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+    passwords_view.addSubview(&passwords_unlock_field);
+    let passwords_unlock_button = make_button("Unlock", &delegate, sel!(unlockVaultAction:), mtm);
+    passwords_unlock_button.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(3.0)), NSSize::new(120.0, ROW_HEIGHT - BUTTON_MARGIN)));
+    passwords_view.addSubview(&passwords_unlock_button);
+    let passwords_unlock_error_label = make_text_field(mtm, "");
+    passwords_unlock_error_label.setEditable(false);
+    passwords_unlock_error_label.setBordered(false);
+    passwords_unlock_error_label.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(4.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+    passwords_view.addSubview(&passwords_unlock_error_label);
+
+    let passwords_site_field = make_text_field(mtm, "");
+    passwords_site_field.setPlaceholderString(Some(&NSString::from_str("Site (e.g. https://example.com)")));
+    passwords_site_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(1.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+    passwords_view.addSubview(&passwords_site_field);
+    let passwords_username_field = make_text_field(mtm, "");
+    passwords_username_field.setPlaceholderString(Some(&NSString::from_str("Username")));
+    passwords_username_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(2.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+    passwords_view.addSubview(&passwords_username_field);
+    let passwords_password_field = NSSecureTextField::new(mtm);
+    passwords_password_field.setPlaceholderString(Some(&NSString::from_str("Password")));
+    unsafe {
+        passwords_password_field.setTarget(Some(&*delegate));
+        passwords_password_field.setAction(Some(sel!(submitLoginAction:)));
+    }
+    passwords_password_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(3.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+    passwords_view.addSubview(&passwords_password_field);
+    let passwords_notes_field = make_text_field(mtm, "");
+    passwords_notes_field.setPlaceholderString(Some(&NSString::from_str("Notes (optional)")));
+    passwords_notes_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(4.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+    passwords_view.addSubview(&passwords_notes_field);
+
+    // Read via `titleOfSelectedItem()` only when the submit button is
+    // clicked (see `submit_login_from_fields`) — no target/action needed on
+    // selection change itself.
+    let passwords_destination_popup = NSPopUpButton::new(mtm);
+    passwords_destination_popup.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(5.0)), NSSize::new(160.0, ROW_HEIGHT - BUTTON_MARGIN)));
+    passwords_view.addSubview(&passwords_destination_popup);
+    let passwords_submit_button = make_button("Add", &delegate, sel!(submitLoginAction:), mtm);
+    passwords_submit_button.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN + 164.0, row_y(5.0)), NSSize::new(90.0, ROW_HEIGHT - BUTTON_MARGIN)));
+    passwords_view.addSubview(&passwords_submit_button);
+    let passwords_cancel_edit_button = make_button("Cancel edit", &delegate, sel!(cancelEditingLoginAction:), mtm);
+    passwords_cancel_edit_button.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN + 258.0, row_y(5.0)), NSSize::new(110.0, ROW_HEIGHT - BUTTON_MARGIN)));
+    passwords_cancel_edit_button.setHidden(true);
+    passwords_view.addSubview(&passwords_cancel_edit_button);
+
+    let passwords_error_label = make_text_field(mtm, "");
+    passwords_error_label.setEditable(false);
+    passwords_error_label.setBordered(false);
+    passwords_error_label.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(6.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+    passwords_view.addSubview(&passwords_error_label);
+
+    let passwords_rows_container = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(
+            NSPoint::new(OVERLAY_MARGIN, OVERLAY_MARGIN + 2.0 * ROW_HEIGHT),
+            NSSize::new(content_frame.size.width - 2.0 * OVERLAY_MARGIN, (row_y(7.0) - OVERLAY_MARGIN - 2.0 * ROW_HEIGHT).max(0.0)),
+        ),
+    );
+    passwords_view.addSubview(&passwords_rows_container);
+
+    // Bitwarden's own inline unlock — fixed position (see this module's
+    // `bitwarden_unlock_field` doc comment for why it isn't part of the
+    // dynamic row list), just above the Close button.
+    let bitwarden_unlock_field = NSSecureTextField::new(mtm);
+    bitwarden_unlock_field.setPlaceholderString(Some(&NSString::from_str("Bitwarden master password")));
+    unsafe {
+        bitwarden_unlock_field.setTarget(Some(&*delegate));
+        bitwarden_unlock_field.setAction(Some(sel!(unlockBitwardenAction:)));
+    }
+    bitwarden_unlock_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, OVERLAY_MARGIN + ROW_HEIGHT), NSSize::new(260.0, ROW_HEIGHT - BUTTON_MARGIN)));
+    bitwarden_unlock_field.setHidden(true);
+    passwords_view.addSubview(&bitwarden_unlock_field);
+    let bitwarden_unlock_button = make_button("Unlock Bitwarden", &delegate, sel!(unlockBitwardenAction:), mtm);
+    bitwarden_unlock_button.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN + 264.0, OVERLAY_MARGIN + ROW_HEIGHT), NSSize::new(140.0, ROW_HEIGHT - BUTTON_MARGIN)));
+    bitwarden_unlock_button.setHidden(true);
+    passwords_view.addSubview(&bitwarden_unlock_button);
+
+    let passwords_close_button = make_button("Close", &delegate, sel!(closeAnyOverlay:), mtm);
+    passwords_close_button.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, OVERLAY_MARGIN), NSSize::new(90.0, ROW_HEIGHT - BUTTON_MARGIN)));
+    passwords_view.addSubview(&passwords_close_button);
+
+    let initial_vault_state = if profile.has_vault_passphrase() { VaultState::Locked } else { VaultState::NotSetUp };
+
     let state = Rc::new(AppState {
         window: window.clone(),
         toolbar_view,
@@ -1164,6 +1858,7 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<App> {
         switcher_button,
         settings_button,
         profile_button,
+        passwords_button,
         content_view,
         containers: RefCell::new(HashMap::new()),
         core: RefCell::new(PageManager::new(settings.max_loaded_pages)),
@@ -1182,7 +1877,29 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<App> {
         profile_view,
         profile_rows_container,
         new_profile_field,
+        passwords_view,
+        passwords: RefCell::new(initial_vault_state),
+        session_passphrase: RefCell::new(None),
+        passwords_unlock_label,
+        passwords_unlock_field,
+        passwords_unlock_button,
+        passwords_unlock_error_label,
+        passwords_rows_container,
+        passwords_rows: RefCell::new(Vec::new()),
+        passwords_site_field,
+        passwords_username_field,
+        passwords_password_field,
+        passwords_notes_field,
+        passwords_destination_popup,
+        passwords_submit_button,
+        passwords_cancel_edit_button,
+        passwords_error_label,
+        editing_login: RefCell::new(None),
+        bitwarden_unlock_field,
+        bitwarden_unlock_button,
         settings: RefCell::new(settings),
+        bitwarden_checkbox,
+        bitwarden_url_field,
         history,
         profile,
     });

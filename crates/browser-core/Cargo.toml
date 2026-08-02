@@ -35,17 +35,22 @@ ureq = { version = "3", default-features = false, features = ["json"] }
 # binary.
 tiny_http = "0.12"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 # `encryption` builds libsql-ffi's bundled SQLite3 Multiple Ciphers via
 # CMake, which needs `llvm-lib` when cross-compiling for the MSVC target
 # (`cargo build-windows-winui`, via xwin/clang-cl) — not available in this
 # environment's toolchain, confirmed by actually hitting the build failure,
-# not assumed. Scoping the feature to Linux only (where
-# `HistoryStore::open_encrypted` is actually used — see its `#[cfg]` in
-# history.rs) sidesteps that entirely, and honors the roadmap item's own
-# "if available" wording. `history.rs`'s `#[cfg(not(target_os = "linux"))]`
-# fallback keeps every other target's `HistoryStore::open_encrypted` call
-# site compiling regardless.
+# not assumed. Windows stays excluded because of that; macOS was added
+# after directly confirming (via `cargo zigbuild`, this repo's real macOS
+# cross-compile path) that the same CMake build succeeds there — previously
+# assumed untried, not actually blocked. Honors the roadmap item's own
+# "if available" wording either way. `history.rs`'s
+# `#[cfg(not(target_os = "linux"))]` fallback deliberately stays Linux-only
+# though (see its own module doc comment) — this widened dependency scope
+# only backs `PasswordStore::open_encrypted` (`passwords.rs`) on macOS, not
+# `HistoryStore::open_encrypted`, which remains a separate, not-yet-tackled
+# gap ("encrypted profiles") independent of the password vault's own
+# passphrase.
 libsql = { version = "0.9", default-features = false, features = ["encryption"] }
 # For EncryptionConfig::new's `encryption_key` — already resolved transitively
 # via libsql's own "encryption" feature (see Cargo.lock), so this adds no new

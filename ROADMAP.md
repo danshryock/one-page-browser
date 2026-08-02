@@ -100,6 +100,21 @@ build/run instructions.
   multi-step (username-page-then-password-page) login flows, forms with multiple password fields (signup/
   change-password) aren't specifically detected and skipped, and same-origin iframes aren't searched — see
   "Backlog" below.
+- Password manager UI for `browser-macos-appkit`: local vault (add/view/copy/edit/delete/fill) + Bitwarden,
+  matching `browser-linux-gtk3`'s feature set, adapted to this crate's own established idioms rather than a
+  literal port — there's no separate-`NSWindow`-that-hands-back-to-the-main-window precedent here (`run_chooser`
+  is spawn-and-exit only), so the local vault's and Bitwarden's passphrase setup/unlock flows fold into the
+  passwords overlay itself (`setHidden`-toggled sub-groups) instead of popup windows. First use of
+  `NSSecureTextField`/`NSPopUpButton`/`NSPasteboard` in this crate. Real vault encryption on macOS was
+  confirmed to actually work by direct experiment this session (libsql's `encryption` feature builds and links
+  cleanly via `cargo zigbuild` for both architectures) — previously assumed untried, not blocked — so
+  `browser-core/Cargo.toml`/`passwords.rs`'s `#[cfg]` gates were widened to include macOS alongside Linux
+  (`history.rs`'s own gate, and thus "encrypted profiles"/history encryption, stays Linux-only and untouched —
+  the vault's passphrase has always been independent of that). As with everything else in this crate, this is
+  compile/link-verified only from this dev machine (no macOS hardware here to actually run it) — real
+  behavioral proof needs `.github/workflows/macos.yml` triggered for real (a `v*.*` tag push or manual
+  dispatch), which will also be the first time the widened encrypted-vault tests execute on genuine Apple
+  hardware.
 - Separate `EditUrl`/`OpenSwitcher` actions (`browser-core` + `browser-linux-gtk3`): Ctrl+L now opens the
   switcher with the current URL preloaded and fully selected (not blanked); Ctrl+T/F1 keep the old
   blank-search behavior. See `summaries/edit-url-vs-new-page-actions.md`.
@@ -426,10 +441,11 @@ still untested).
 
 ## Backlog (not yet started, roughly in the order raised)
 
-- `browser-macos-appkit`: bookmarks, light/dark theme, and encrypted profiles — the parts of
-  `browser-linux-gtk3`'s scope neither Windows front end has either (see "Done" above for what's now at
-  parity). A wrapping tile grid (`NSCollectionView`) instead of the current plain-list switcher/profile
-  overlays is a smaller, separate follow-up.
+- `browser-macos-appkit`: bookmarks, light/dark theme, and encrypted profiles (history encryption) — the
+  remaining parts of `browser-linux-gtk3`'s scope neither Windows front end has either (see "Done" above —
+  the password manager is now at parity; these three are unrelated to it and still open). A wrapping tile
+  grid (`NSCollectionView`) instead of the current plain-list switcher/profile/passwords overlays is a
+  smaller, separate follow-up.
 - `browser-windows-winui`: unified search/URL bar and bookmarks, matching what `browser-linux-gtk3` now has
   (both landed there only, per scope — see "Done" above).
 - Other external password managers beyond Bitwarden/Vaultwarden (see "Done" above for that one) — KeePassXC/
