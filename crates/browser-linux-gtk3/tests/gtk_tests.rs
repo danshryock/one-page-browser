@@ -293,6 +293,44 @@ fn page_lifecycle_add_switch_close() {
 }
 
 #[test]
+fn next_and_previous_page_shortcuts_cycle_through_open_pages() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("next-previous-page");
+        let url_a = fixture_url("page_a.html");
+        let url_b = fixture_url("page_b.html");
+        let url_c = fixture_url("page_c.html");
+
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        app.add_page(&url_a).expect("add_page should succeed");
+        let id_a = app.page_ids()[0].clone();
+        app.add_page(&url_b).expect("add_page should succeed");
+        let id_b = app.page_ids()[1].clone();
+        app.add_page(&url_c).expect("add_page should succeed");
+        let id_c = app.page_ids()[2].clone();
+        assert_eq!(app.active_id(), id_c, "sanity check: the third page should be active after adding it");
+
+        // Ctrl+Tab/Ctrl+PageDown — Action::NextPage's dispatch target.
+        app.switch_to_next_page();
+        assert_eq!(app.active_id(), id_a, "next page should wrap from the last page back to the first");
+        app.switch_to_next_page();
+        assert_eq!(app.active_id(), id_b);
+        app.switch_to_next_page();
+        assert_eq!(app.active_id(), id_c);
+
+        // Ctrl+Shift+Tab/Ctrl+PageUp — Action::PreviousPage's dispatch target.
+        app.switch_to_previous_page();
+        assert_eq!(app.active_id(), id_b);
+        app.switch_to_previous_page();
+        assert_eq!(app.active_id(), id_a);
+        app.switch_to_previous_page();
+        assert_eq!(app.active_id(), id_c, "previous page should wrap from the first page back to the last");
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
 fn switcher_search_and_grid() {
     run_on_gtk_thread(|| {
         let profile = test_profile("switcher-search");

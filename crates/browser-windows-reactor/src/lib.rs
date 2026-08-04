@@ -400,6 +400,7 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         let open_switcher = open_switcher.clone();
         let open_settings = open_settings.clone();
         let open_profile = open_profile.clone();
+        let switch_to = switch_to.clone();
         move |action: Action| {
             trace(&format!("dispatch_action: fired for {action:?}"));
             use render_engine::RenderEngine;
@@ -430,6 +431,25 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
                 // trait exist and compile against this frontend already,
                 // just no UI built on top here this pass (see
                 // ARCHITECTURE.md).
+                // NextPage/PreviousPage (Ctrl+Tab/Ctrl+PageDown/Ctrl+Shift+
+                // Tab/Ctrl+PageUp on gtk3 — this platform has no physical
+                // key recognition for either yet, see ROADMAP.md, but the
+                // dispatch itself is real, working code, not a stub): the
+                // id is copied out of `core`'s borrow before invoking
+                // `switch_to` (which needs its own borrow) rather than held
+                // across it.
+                Action::NextPage => {
+                    let id = core.borrow().next_page_id().map(|s| s.to_string());
+                    if let Some(id) = id {
+                        switch_to.invoke(id);
+                    }
+                }
+                Action::PreviousPage => {
+                    let id = core.borrow().previous_page_id().map(|s| s.to_string());
+                    if let Some(id) = id {
+                        switch_to.invoke(id);
+                    }
+                }
                 Action::ToggleBookmark
                 | Action::OpenBookmarks
                 | Action::EditUrl

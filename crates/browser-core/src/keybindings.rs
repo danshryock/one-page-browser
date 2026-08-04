@@ -27,6 +27,8 @@ pub enum Action {
     OpenBookmarks,
     ToggleReaderMode,
     OpenPasswords,
+    NextPage,
+    PreviousPage,
 }
 
 impl Action {
@@ -43,6 +45,8 @@ impl Action {
         Action::OpenBookmarks,
         Action::ToggleReaderMode,
         Action::OpenPasswords,
+        Action::NextPage,
+        Action::PreviousPage,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -59,6 +63,8 @@ impl Action {
             Action::OpenBookmarks => "Open bookmarks",
             Action::ToggleReaderMode => "Toggle reader mode",
             Action::OpenPasswords => "Open password manager",
+            Action::NextPage => "Next page",
+            Action::PreviousPage => "Previous page",
         }
     }
 }
@@ -176,6 +182,11 @@ impl Default for Keybindings {
         map.insert(Action::GoBack, vec![KeyChord::new(false, true, false, "Left")]);
         map.insert(Action::GoForward, vec![KeyChord::new(false, true, false, "Right")]);
         map.insert(Action::ToggleBookmark, vec![KeyChord::new(true, false, false, "D")]);
+        map.insert(Action::NextPage, vec![KeyChord::new(true, false, false, "Tab"), KeyChord::new(true, false, false, "PageDown")]);
+        map.insert(
+            Action::PreviousPage,
+            vec![KeyChord::new(true, false, true, "Tab"), KeyChord::new(true, false, false, "PageUp")],
+        );
         // OpenSettings/OpenProfilePicker/OpenBookmarks/ToggleReaderMode/
         // OpenPasswords: unbound by default — toolbar-button-only, used far
         // less often than the other six.
@@ -206,6 +217,15 @@ mod tests {
             "Ctrl+L is the traditional \"edit the URL\" binding, distinct from Ctrl+T/F1's \"open switcher for a new page\""
         );
         assert_eq!(defaults.action_for(&KeyChord::new(true, false, false, "W")), Some(Action::ClosePage));
+    }
+
+    #[test]
+    fn default_binds_next_and_previous_page() {
+        let defaults = Keybindings::default();
+        assert_eq!(defaults.action_for(&KeyChord::new(true, false, false, "Tab")), Some(Action::NextPage));
+        assert_eq!(defaults.action_for(&KeyChord::new(true, false, false, "PageDown")), Some(Action::NextPage));
+        assert_eq!(defaults.action_for(&KeyChord::new(true, false, true, "Tab")), Some(Action::PreviousPage));
+        assert_eq!(defaults.action_for(&KeyChord::new(true, false, false, "PageUp")), Some(Action::PreviousPage));
     }
 
     #[test]

@@ -268,6 +268,22 @@ impl<E> PageManager<E> {
         self.pages.iter().map(|p| p.id.clone()).collect()
     }
 
+    /// The id of the page after the active one, in `pages()`'s order
+    /// (creation order — nothing ever reorders it), wrapping around from the
+    /// last page back to the first. `None` only when there are no pages at
+    /// all. Backs `Action::NextPage`.
+    pub fn next_page_id(&self) -> Option<&str> {
+        let idx = self.pages.iter().position(|p| p.id == self.active_id)?;
+        self.pages.get((idx + 1) % self.pages.len()).map(|p| p.id.as_str())
+    }
+
+    /// Same as `next_page_id`, one position earlier (wrapping from the first
+    /// page back to the last). Backs `Action::PreviousPage`.
+    pub fn previous_page_id(&self) -> Option<&str> {
+        let idx = self.pages.iter().position(|p| p.id == self.active_id)?;
+        self.pages.get((idx + self.pages.len() - 1) % self.pages.len()).map(|p| p.id.as_str())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pages.is_empty()
     }
@@ -429,6 +445,33 @@ mod tests {
             "https://b.example",
             "a live engine's URL takes priority over the frozen last_url"
         );
+    }
+
+    #[test]
+    fn next_and_previous_page_id_wrap_around_in_creation_order() {
+        let mut mgr: PageManager<MockEngine> = PageManager::new(None);
+        let id1 = insert_page(&mut mgr, "https://a.example");
+        let id2 = insert_page(&mut mgr, "https://b.example");
+        let id3 = insert_page(&mut mgr, "https://c.example");
+        mgr.set_active(&id1);
+
+        assert_eq!(mgr.next_page_id(), Some(id2.as_str()));
+        mgr.set_active(&id2);
+        assert_eq!(mgr.next_page_id(), Some(id3.as_str()));
+        mgr.set_active(&id3);
+        assert_eq!(mgr.next_page_id(), Some(id1.as_str()), "wraps back to the first page");
+
+        assert_eq!(mgr.previous_page_id(), Some(id2.as_str()));
+        mgr.set_active(&id1);
+        assert_eq!(mgr.previous_page_id(), Some(id3.as_str()), "wraps back to the last page");
+    }
+
+    #[test]
+    fn next_and_previous_page_id_with_a_single_page_returns_itself() {
+        let mut mgr: PageManager<MockEngine> = PageManager::new(None);
+        let id = insert_page(&mut mgr, "https://a.example");
+        assert_eq!(mgr.next_page_id(), Some(id.as_str()));
+        assert_eq!(mgr.previous_page_id(), Some(id.as_str()));
     }
 
     #[test]

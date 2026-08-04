@@ -143,6 +143,27 @@ build/run instructions.
     actually block correctly before the window exists, does the theme popup actually flip system appearance,
     does the bookmarks overlay/star toggle work) still needs `.github/workflows/macos.yml` triggered again for
     this specific change — not yet done as of this entry.
+- `browser-linux-gtk3` overlay redesign, plus `Action::NextPage`/`PreviousPage` (`browser-core` +
+  `browser-linux-gtk3`, with real dispatch wired into `browser-macos-appkit`/`browser-windows-winui`/
+  `browser-windows-reactor` too, per Rust's exhaustive matching on `Action` — see below): the settings/
+  profile/passwords/bookmarks overlays now fill the screen like the switcher grid does (`set_halign(Fill)`/
+  `set_valign(Start)` on each overlay's box, mirroring the switcher's `grid_content` — no CSS width/height
+  rule was involved, purely a layout change). Settings gained "General"/"Search Engines"/"Bitwarden"
+  sub-headings (a new `.settings-subtitle` CSS class) with a light reorder so each heading's rows are
+  contiguous; the password manager gained "Saved Logins"/"Add Login"/"Edit Login" headings. The vault's own
+  `show_vault_passphrase_prompt` and Bitwarden's `show_bitwarden_unlock_prompt` — both separate popup
+  `gtk::Window`s — are gone entirely, replaced with in-overlay toggled sub-groups (new `passwords_unlock_box`/
+  `passwords_content_box` `AppState` fields, mirroring `browser-macos-appkit`'s `rebuild_passwords_view`,
+  which had already solved this same problem for that platform); Bitwarden's inline unlock is now a row built
+  fresh into the dynamic credential list each rebuild rather than a persistent field, since it was already a
+  small dynamically-shown row rather than the whole overlay's alternate state. `PageManager::next_page_id`/
+  `previous_page_id` (creation-order cycling, wrapping) back the two new actions; gtk3 gets real physical
+  keyboard recognition (`Ctrl+Tab`/`Ctrl+PageDown` next, `Ctrl+Shift+Tab`/`Ctrl+PageUp` previous — GDK's
+  `Page_Up`/`Page_Down` keysym names needed translating to the `"PageUp"`/`"PageDown"` convention
+  `Keybindings::default()` already uses elsewhere). The other three front ends get real, working dispatch
+  arms (not stubs) calling the same `PageManager` helper, but deliberately no raw-key-table recognition of
+  Tab/PageUp/PageDown this pass — unverifiable-from-Linux work for Windows/macOS specifically scoped out, so
+  the binding exists in `Keybindings::default()` but isn't reachable via a physical key on those three yet.
 - Separate `EditUrl`/`OpenSwitcher` actions (`browser-core` + `browser-linux-gtk3`): Ctrl+L now opens the
   switcher with the current URL preloaded and fully selected (not blanked); Ctrl+T/F1 keep the old
   blank-search behavior. See `summaries/edit-url-vs-new-page-actions.md`.

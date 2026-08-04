@@ -538,6 +538,8 @@ impl AppState {
             // browser-core + browser-linux-gtk3 only so far (see
             // ROADMAP.md's Backlog) — no winui3 UI/engine support to
             // dispatch any of these to yet.
+            Action::NextPage => self.switch_to_next_page(),
+            Action::PreviousPage => self.switch_to_previous_page(),
             Action::ToggleBookmark
             | Action::OpenBookmarks
             | Action::EditUrl
@@ -553,6 +555,27 @@ impl AppState {
     pub fn switch_to(self: &Rc<Self>, id: &str) {
         self.set_active(id);
         self.close_switcher();
+    }
+
+    /// `Action::NextPage` (Ctrl+Tab/Ctrl+PageDown on gtk3 — this platform has
+    /// no physical key recognition for either yet, see `ROADMAP.md`, but the
+    /// dispatch itself is real, working code, not a stub). The id is copied
+    /// out of `core`'s borrow before calling `set_active` (which needs its
+    /// own borrow) rather than held across it.
+    fn switch_to_next_page(self: &Rc<Self>) {
+        let id = self.core.borrow().next_page_id().map(|s| s.to_string());
+        if let Some(id) = id {
+            self.set_active(&id);
+        }
+    }
+
+    /// `Action::PreviousPage` (Ctrl+Shift+Tab/Ctrl+PageUp on gtk3) — same as
+    /// `switch_to_next_page`, one position earlier.
+    fn switch_to_previous_page(self: &Rc<Self>) {
+        let id = self.core.borrow().previous_page_id().map(|s| s.to_string());
+        if let Some(id) = id {
+            self.set_active(&id);
+        }
     }
 
     pub fn close_page(self: &Rc<Self>, id: &str) {

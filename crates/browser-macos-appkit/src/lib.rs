@@ -1139,6 +1139,27 @@ impl AppState {
         self.close_all_overlays();
     }
 
+    /// `Action::NextPage` (Ctrl+Tab/Ctrl+PageDown on gtk3 — this platform has
+    /// no physical key recognition for either yet, see `ROADMAP.md`, but the
+    /// dispatch itself is real, working code, not a stub). The id is copied
+    /// out of `core`'s borrow before calling `switch_to` (which needs its
+    /// own borrow) rather than held across it.
+    fn switch_to_next_page(self: &Rc<Self>) {
+        let id = self.core.borrow().next_page_id().map(|s| s.to_string());
+        if let Some(id) = id {
+            self.switch_to(&id);
+        }
+    }
+
+    /// `Action::PreviousPage` (Ctrl+Shift+Tab/Ctrl+PageUp on gtk3) — same as
+    /// `switch_to_next_page`, one position earlier.
+    fn switch_to_previous_page(self: &Rc<Self>) {
+        let id = self.core.borrow().previous_page_id().map(|s| s.to_string());
+        if let Some(id) = id {
+            self.switch_to(&id);
+        }
+    }
+
     fn set_active(&self, id: &str) {
         self.core.borrow_mut().set_active(id);
         for (page_id, container) in self.containers.borrow().iter() {
@@ -1756,6 +1777,8 @@ define_class!(
                 Action::OpenPasswords => state.open_passwords(),
                 Action::ToggleBookmark => state.toggle_bookmark_for_active(),
                 Action::OpenBookmarks => state.open_bookmarks(),
+                Action::NextPage => state.switch_to_next_page(),
+                Action::PreviousPage => state.switch_to_previous_page(),
                 // Reader mode isn't implemented on this front end either yet
                 // — matches browser-windows-winui/reactor's scope.
                 Action::ToggleReaderMode => {}

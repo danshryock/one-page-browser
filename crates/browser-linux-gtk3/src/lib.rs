@@ -110,9 +110,31 @@ pub struct AppState {
     /// The password manager overlay's root widget — same in-window-overlay
     /// pattern as the other five.
     passwords_panel: gtk::Widget,
+    /// The vault locked/setup sub-group — shown instead of
+    /// `passwords_content_box` while `passwords` isn't
+    /// `VaultState::Unlocked`. Replaces the old separate-window
+    /// `show_vault_passphrase_prompt`: the passphrase is now collected
+    /// in-overlay, the same toggled-sub-group shape
+    /// `browser-macos-appkit`'s `rebuild_passwords_view` already uses.
+    passwords_unlock_box: gtk::Box,
+    /// Text toggles "Set Up Password Vault"/"Unlock Password Vault"
+    /// depending on `Profile::has_vault_passphrase()`.
+    passwords_unlock_heading: gtk::Label,
+    passwords_unlock_label: gtk::Label,
+    passwords_unlock_entry: gtk::Entry,
+    passwords_unlock_error_label: gtk::Label,
+    /// Label toggles "Set Up"/"Unlock", same condition as
+    /// `passwords_unlock_heading`.
+    passwords_unlock_button: gtk::Button,
+    /// The vault contents sub-group (saved-logins list + add/edit form) —
+    /// shown once `passwords` is `VaultState::Unlocked`.
+    passwords_content_box: gtk::Box,
     /// Rebuilt from `VaultState::Unlocked`'s `PasswordStore::list()` each
     /// time the overlay opens and after every add/update/delete.
     passwords_list_box: gtk::Box,
+    /// Text toggles "Add Login"/"Edit Login" alongside
+    /// `submit_password_button`'s label.
+    passwords_form_heading: gtk::Label,
     /// Whether the vault has ever been set up, is set up but not opened
     /// this session, or is open and ready to use — see
     /// `decide_vault_unlock_action`'s doc comment for how a profile that
@@ -138,7 +160,7 @@ pub struct AppState {
     /// and which backend it came from — `None` means "add new" mode.
     editing_login: RefCell<Option<(String, LoginSource)>>,
     /// Chooses which backend a brand-new login (`editing_login: None`) gets
-    /// saved to — only meaningfully offered (see `rebuild_passwords_list`)
+    /// saved to — only meaningfully offered (see `rebuild_passwords_panel`)
     /// when Bitwarden integration is enabled; otherwise hidden and every add
     /// goes to the local vault, same as before this field existed.
     save_destination_combo: gtk::ComboBoxText,
@@ -150,8 +172,9 @@ pub struct AppState {
     /// returns the form to "add new" mode.
     cancel_edit_button: gtk::Button,
     /// Surfaces the last add/update/delete failure against either backend
-    /// (a network error, Bitwarden being locked mid-action, etc.) — cleared
-    /// at the top of every `rebuild_passwords_list` call.
+    /// (a network error, Bitwarden being locked mid-action, etc.) or a
+    /// failed inline Bitwarden-unlock attempt — cleared at the top of every
+    /// `rebuild_passwords_panel` call.
     passwords_error_label: gtk::Label,
     /// Snapshot taken by the last `rebuild_switcher_grid` call — the source
     /// of truth `activate_switcher_row` indexes into, so a tile's widget
@@ -804,7 +827,12 @@ impl AppState {
     /// first has to resolve the vault's unlock/setup state (see
     /// `decide_vault_unlock_action`'s doc comment) — opening it might mean
     /// silently reusing an already-known passphrase, silently establishing
-    /// a brand new vault under one, or genuinely needing a prompt.
+    /// a brand new vault under one, or genuinely needing a prompt. Unlike
+    /// this crate's earlier design, a "genuinely needing a prompt" outcome
+    /// no longer opens a separate `gtk::Window` — `rebuild_passwords_panel`
+    /// (called by `show_passwords_panel` below) renders the locked/setup
+    /// sub-group inline instead, same as `browser-macos-appkit` already
+    /// does.
     pub fn open_passwords(self: &Rc<Self>) {
         self.close_switcher();
         self.close_settings();
@@ -813,33 +841,22 @@ impl AppState {
         // Always opens fresh, never mid-edit from a previous visit.
         self.cancel_editing_login();
 
-        if matches!(*self.passwords.borrow(), VaultState::Unlocked(_)) {
-            self.show_passwords_panel();
-            return;
-        }
-
-        match decide_vault_unlock_action(&self.profile, self.session_passphrase.borrow().as_deref()) {
-            VaultUnlockAction::SilentlySetUpWith(passphrase) => {
-                if self.try_open_vault_with(&passphrase, true) {
-                    self.show_passwords_panel();
-                } else {
-                    // The cached passphrase (known from unlocking history)
-                    // somehow doesn't work for the vault — fall back to a
-                    // real prompt rather than looping on a passphrase we
-                    // already know is wrong for this store.
-                    show_vault_passphrase_prompt(Rc::clone(self), true);
+        if !matches!(*self.passwords.borrow(), VaultState::Unlocked(_)) {
+            match decide_vault_unlock_action(&self.profile, self.session_passphrase.borrow().as_deref()) {
+                VaultUnlockAction::SilentlySetUpWith(passphrase) => {
+                    self.try_open_vault_with(&passphrase, true);
                 }
-            }
-            VaultUnlockAction::SilentlyUnlockWith(passphrase) => {
-                if self.try_open_vault_with(&passphrase, false) {
-                    self.show_passwords_panel();
-                } else {
-                    show_vault_passphrase_prompt(Rc::clone(self), false);
+                VaultUnlockAction::SilentlyUnlockWith(passphrase) => {
+                    self.try_open_vault_with(&passphrase, false);
                 }
+                // The cached passphrase (known from unlocking history)
+                // somehow not working for the vault, or no passphrase known
+                // yet at all — either way, `rebuild_passwords_panel` below
+                // renders the locked/setup sub-group for a real prompt.
+                VaultUnlockAction::PromptToSetUp | VaultUnlockAction::PromptToUnlock => {}
             }
-            VaultUnlockAction::PromptToSetUp => show_vault_passphrase_prompt(Rc::clone(self), true),
-            VaultUnlockAction::PromptToUnlock => show_vault_passphrase_prompt(Rc::clone(self), false),
         }
+        self.show_passwords_panel();
     }
 
     /// Tries to open the vault with `passphrase`, updating `self.passwords`/
@@ -847,14 +864,14 @@ impl AppState {
     /// vault's first-ever passphrase (calls `enable_vault_passphrase`) —
     /// see `PasswordStore::open_encrypted`'s doc comment for why "setup"
     /// and "unlock" are otherwise the same call. Returns whether it
-    /// succeeded, so callers can fall back to a real prompt on failure
-    /// instead of silently doing nothing.
+    /// succeeded, so callers can fall back to rendering the in-overlay
+    /// unlock prompt (see `rebuild_passwords_panel`) on failure instead of
+    /// silently doing nothing.
     ///
-    /// `pub` so tests can simulate completing `show_vault_passphrase_prompt`
-    /// directly (driving `AppState` rather than that prompt's real GTK
-    /// widgets, same approach every other test in this suite takes for its
-    /// own prompt-style windows) — not meant to be called from outside this
-    /// crate in real use.
+    /// `pub` so tests can simulate completing the in-overlay unlock prompt
+    /// directly (driving `AppState` rather than the real GTK widgets, same
+    /// approach every other test in this suite takes) — not meant to be
+    /// called from outside this crate in real use.
     pub fn try_open_vault_with(self: &Rc<Self>, passphrase: &str, is_setup: bool) -> bool {
         match PasswordStore::open_encrypted(&self.profile, passphrase) {
             Ok(store) => {
@@ -892,9 +909,29 @@ impl AppState {
     }
 
     fn show_passwords_panel(self: &Rc<Self>) {
-        self.rebuild_passwords_list();
+        self.rebuild_passwords_panel();
         self.stack.set_sensitive(false);
         self.passwords_panel.show();
+    }
+
+    /// The vault unlock/setup button's action (and the passphrase entry's
+    /// Enter-to-submit) — replaces `show_vault_passphrase_prompt`'s
+    /// `try_unlock` closure, now operating on the in-overlay fields instead
+    /// of a popup window's local ones.
+    fn unlock_vault_clicked(self: &Rc<Self>) {
+        let passphrase = self.passwords_unlock_entry.text().to_string();
+        if passphrase.is_empty() {
+            self.passwords_unlock_error_label.set_text("Passphrase can't be empty.");
+            return;
+        }
+        let is_setup = !self.profile.has_vault_passphrase();
+        if self.try_open_vault_with(&passphrase, is_setup) {
+            self.rebuild_passwords_panel();
+        } else {
+            self.passwords_unlock_error_label.set_text("Couldn't open the vault with that passphrase. Try again.");
+            self.passwords_unlock_entry.set_text("");
+            self.passwords_unlock_entry.grab_focus();
+        }
     }
 
     /// Hides the password manager overlay. Always use this (rather than
@@ -981,18 +1018,44 @@ impl AppState {
         row
     }
 
-    /// Rebuilds the password manager overlay's list from scratch, as two
-    /// separate sections rather than one list interleaved by timestamp:
-    /// "Saved" (the local vault) and, if Bitwarden integration is enabled,
-    /// "Bitwarden". They're kept separate because their timestamps aren't
-    /// comparable in any meaningful way (Bitwarden's own `revisionDate`
-    /// isn't even fetched — see `bitwarden.rs`), so merging them into one
-    /// sorted list would just be misleading. Both sections are fully
-    /// read/write (see `build_login_row`) — also rebuilds
-    /// `save_destination_combo`'s contents/visibility and clears any
-    /// leftover error message, since this runs every time the overlay's
-    /// state might have changed underneath it.
-    fn rebuild_passwords_list(self: &Rc<Self>) {
+    /// Rebuilds the password manager overlay: first toggles
+    /// `passwords_unlock_box` vs. `passwords_content_box` based on
+    /// `self.passwords`' state (mirroring
+    /// `browser-macos-appkit::rebuild_passwords_view`) — if not yet
+    /// unlocked, updates the unlock/setup heading/label/button text and
+    /// returns, without touching the list below at all. Once unlocked,
+    /// rebuilds the credential list from scratch, as two separate sections
+    /// rather than one list interleaved by timestamp: "Saved" (the local
+    /// vault) and, if Bitwarden integration is enabled, "Bitwarden". They're
+    /// kept separate because their timestamps aren't comparable in any
+    /// meaningful way (Bitwarden's own `revisionDate` isn't even fetched —
+    /// see `bitwarden.rs`), so merging them into one sorted list would just
+    /// be misleading. Both sections are fully read/write (see
+    /// `build_login_row`) — also rebuilds `save_destination_combo`'s
+    /// contents/visibility and clears any leftover error message, since
+    /// this runs every time the overlay's state might have changed
+    /// underneath it.
+    fn rebuild_passwords_panel(self: &Rc<Self>) {
+        let unlocked = matches!(*self.passwords.borrow(), VaultState::Unlocked(_));
+        let is_setup = !self.profile.has_vault_passphrase();
+
+        self.passwords_unlock_heading.set_text(if is_setup { "Set Up Password Vault" } else { "Unlock Password Vault" });
+        self.passwords_unlock_label.set_text(if is_setup {
+            "Choose a passphrase to encrypt your password vault."
+        } else {
+            "Your password vault is passphrase-protected."
+        });
+        self.passwords_unlock_button.set_label(if is_setup { "Set Up" } else { "Unlock" });
+        self.passwords_unlock_box.set_visible(!unlocked);
+        self.passwords_content_box.set_visible(unlocked);
+
+        if !unlocked {
+            self.passwords_unlock_entry.set_text("");
+            self.passwords_unlock_error_label.set_text("");
+            self.passwords_unlock_entry.grab_focus();
+            return;
+        }
+
         self.passwords_error_label.set_text("");
         for child in self.passwords_list_box.children() {
             self.passwords_list_box.remove(&child);
@@ -1043,18 +1106,53 @@ impl AppState {
                     self.passwords_list_box.pack_start(&label, false, false, 0);
                 }
                 Ok(BitwardenStatus::Locked) => {
+                    // In-overlay unlock, replacing the old
+                    // `show_bitwarden_unlock_prompt` popup window — built
+                    // fresh each rebuild, same as every other row in this
+                    // list, rather than a persistent `AppState` field (this
+                    // is a small, dynamically-shown row, unlike the vault's
+                    // own locked/setup sub-group above, which is the whole
+                    // overlay's alternate state and so gets named fields).
                     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
                     let label = gtk::Label::new(Some("Bitwarden is locked"));
                     label.set_halign(gtk::Align::Start);
-                    label.set_hexpand(true);
-                    row.pack_start(&label, true, true, 0);
+                    row.pack_start(&label, false, false, 0);
+                    let unlock_entry = gtk::Entry::new();
+                    unlock_entry.set_visibility(false);
+                    unlock_entry.set_placeholder_text(Some("Bitwarden master password"));
+                    unlock_entry.set_hexpand(true);
+                    row.pack_start(&unlock_entry, true, true, 0);
                     let unlock_button = gtk::Button::with_label("Unlock");
-                    let app_clone = Rc::clone(self);
-                    unlock_button.connect_clicked(move |_| {
-                        show_bitwarden_unlock_prompt(Rc::clone(&app_clone));
-                    });
                     row.pack_start(&unlock_button, false, false, 0);
                     self.passwords_list_box.pack_start(&row, false, false, 0);
+
+                    let try_unlock: Rc<dyn Fn()> = {
+                        let app = Rc::clone(self);
+                        let unlock_entry = unlock_entry.clone();
+                        Rc::new(move || {
+                            let Some(backend) = app.bitwarden_backend() else { return };
+                            let password = unlock_entry.text().to_string();
+                            if password.is_empty() {
+                                return;
+                            }
+                            match backend.unlock(&password) {
+                                Ok(()) => app.rebuild_passwords_panel(),
+                                Err(err) => {
+                                    app.passwords_error_label.set_text(&format!("Couldn't unlock Bitwarden: {err}"));
+                                    unlock_entry.set_text("");
+                                    unlock_entry.grab_focus();
+                                }
+                            }
+                        })
+                    };
+                    {
+                        let try_unlock = Rc::clone(&try_unlock);
+                        unlock_button.connect_clicked(move |_| try_unlock());
+                    }
+                    {
+                        let try_unlock = Rc::clone(&try_unlock);
+                        unlock_entry.connect_activate(move |_| try_unlock());
+                    }
                 }
                 Ok(BitwardenStatus::Unlocked) => match backend.list() {
                     Ok(entries) if entries.is_empty() => {
@@ -1084,7 +1182,7 @@ impl AppState {
     /// Rebuilds `save_destination_combo`'s entries — "Local vault" always,
     /// plus "Bitwarden" when it's enabled — preserving the current
     /// selection if it's still valid, defaulting to "local" otherwise. Split
-    /// out from `rebuild_passwords_list` since `start_editing_login` also
+    /// out from `rebuild_passwords_panel` since `start_editing_login` also
     /// needs to leave the combo's *contents* alone while just disabling it.
     fn refresh_save_destination_combo(&self) {
         let bitwarden_enabled = self.bitwarden_backend().is_some();
@@ -1112,6 +1210,7 @@ impl AppState {
         // no "move a login between backends" operation.
         self.save_destination_combo.set_sensitive(false);
         self.submit_password_button.set_label("Save");
+        self.passwords_form_heading.set_text("Edit Login");
         self.cancel_edit_button.set_visible(true);
     }
 
@@ -1125,6 +1224,7 @@ impl AppState {
         *self.editing_login.borrow_mut() = None;
         self.save_destination_combo.set_sensitive(true);
         self.submit_password_button.set_label("Add");
+        self.passwords_form_heading.set_text("Add Login");
         self.cancel_edit_button.set_visible(false);
     }
 
@@ -1255,7 +1355,7 @@ impl AppState {
             return;
         }
         self.cancel_editing_login();
-        self.rebuild_passwords_list();
+        self.rebuild_passwords_panel();
     }
 
     /// Deletes the login identified by `id` from whichever backend `source`
@@ -1275,7 +1375,7 @@ impl AppState {
         if let Err(err) = result {
             self.passwords_error_label.set_text(&format!("Failed to delete login: {err}"));
         }
-        self.rebuild_passwords_list();
+        self.rebuild_passwords_panel();
     }
 
     /// Shows a native "Save Screenshot" dialog (suggesting a filename built
@@ -1390,7 +1490,7 @@ impl AppState {
     /// inspection helper. Walks the widget tree (rows/section titles/status
     /// messages are nested `Box`/`Label` combinations, not one flat widget
     /// type) rather than reading `Login`/`VaultState` data directly, since
-    /// this specifically exists to check what `rebuild_passwords_list`
+    /// this specifically exists to check what `rebuild_passwords_panel`
     /// actually rendered (e.g. the Bitwarden section), not the underlying
     /// backend state `password_vault_usernames` already covers for the
     /// local vault.
@@ -1525,6 +1625,30 @@ impl AppState {
             Action::OpenBookmarks => self.open_bookmarks(),
             Action::ToggleReaderMode => self.toggle_reader_mode(),
             Action::OpenPasswords => self.open_passwords(),
+            Action::NextPage => self.switch_to_next_page(),
+            Action::PreviousPage => self.switch_to_previous_page(),
+        }
+    }
+
+    /// Ctrl+Tab/Ctrl+PageDown — switches to the next open page in creation
+    /// order, wrapping around. A no-op with zero or one page (`next_page_id`
+    /// returns the active page's own id, so this is harmless either way).
+    /// The id is copied out of `core`'s borrow before calling `set_active`
+    /// (which needs its own mutable borrow) rather than held across it —
+    /// otherwise this would panic on the `RefCell`'s already-borrowed check.
+    pub fn switch_to_next_page(self: &Rc<Self>) {
+        let id = self.core.borrow().next_page_id().map(|s| s.to_string());
+        if let Some(id) = id {
+            self.set_active(&id);
+        }
+    }
+
+    /// Ctrl+Shift+Tab/Ctrl+PageUp — same as `switch_to_next_page`, one
+    /// position earlier.
+    pub fn switch_to_previous_page(self: &Rc<Self>) {
+        let id = self.core.borrow().previous_page_id().map(|s| s.to_string());
+        if let Some(id) = id {
+            self.set_active(&id);
         }
     }
 
@@ -2012,6 +2136,8 @@ fn theme_css(theme: Theme) -> &'static str {
                border: 1px dashed rgba(90, 200, 180, 0.5); box-shadow: none; border-radius: 10px; \
                color: #fff; opacity: 0.8; } \
              .settings-box label:not(.settings-title) { color: rgba(255, 255, 255, 0.92); } \
+             .settings-box label.settings-subtitle { color: rgba(255, 255, 255, 0.6); font-weight: 600; \
+               font-size: 11px; margin-top: 10px; } \
              .settings-box button.flat, .settings-box button.flat:hover { \
                background-image: none; background-color: transparent; } \
              .settings-box button.flat label { color: rgba(255, 255, 255, 0.92); }"
@@ -2029,6 +2155,8 @@ fn theme_css(theme: Theme) -> &'static str {
                border: 1px dashed rgba(20, 140, 120, 0.4); box-shadow: none; border-radius: 10px; \
                color: #1a1a1a; opacity: 0.9; } \
              .settings-box label:not(.settings-title) { color: rgba(0, 0, 0, 0.82); } \
+             .settings-box label.settings-subtitle { color: rgba(0, 0, 0, 0.55); font-weight: 600; \
+               font-size: 11px; margin-top: 10px; } \
              .settings-box button.flat, .settings-box button.flat:hover { \
                background-image: none; background-color: transparent; } \
              .settings-box button.flat label { color: rgba(0, 0, 0, 0.82); }"
@@ -2066,7 +2194,15 @@ fn gtk_key_to_chord(event: &gtk::gdk::EventKey) -> Option<KeyChord> {
     let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
     let key = match keyval.to_unicode().filter(|c| c.is_ascii_alphanumeric()) {
         Some(c) => c.to_ascii_uppercase().to_string(),
-        None => keyval.name()?.to_string(),
+        // GDK's own keysym names use underscores ("Page_Up"/"Page_Down"),
+        // unlike every other named key this codebase already recognizes
+        // ("Tab", "Left", "Right", "F1", ...) — translated here to match
+        // `Keybindings::default()`'s "PageUp"/"PageDown" convention.
+        None => match keyval.name()?.as_str() {
+            "Page_Up" => "PageUp".to_string(),
+            "Page_Down" => "PageDown".to_string(),
+            name => name.to_string(),
+        },
     };
     Some(KeyChord::new(ctrl, alt, shift, key))
 }
@@ -2311,8 +2447,8 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         .add_provider(&scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
     let settings_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    settings_box.set_halign(gtk::Align::Center);
-    settings_box.set_valign(gtk::Align::Center);
+    settings_box.set_halign(gtk::Align::Fill);
+    settings_box.set_valign(gtk::Align::Start);
     settings_box.style_context().add_class("settings-box");
     settings_box.set_margin(24);
 
@@ -2321,12 +2457,45 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     settings_title.set_halign(gtk::Align::Start);
     settings_box.pack_start(&settings_title, false, false, 0);
 
+    let general_subtitle = gtk::Label::new(Some("General"));
+    general_subtitle.style_context().add_class("settings-subtitle");
+    general_subtitle.set_halign(gtk::Align::Start);
+    settings_box.pack_start(&general_subtitle, false, false, 0);
+
     let start_page_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     start_page_row.pack_start(&gtk::Label::new(Some("Start page")), false, false, 0);
     let start_page_entry = gtk::Entry::new();
     start_page_entry.set_hexpand(true);
     start_page_row.pack_start(&start_page_entry, true, true, 0);
     settings_box.pack_start(&start_page_row, false, false, 0);
+
+    let limit_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    limit_row.pack_start(&gtk::Label::new(Some("Loaded pages limit")), false, false, 0);
+    let unlimited_check = gtk::CheckButton::new();
+    unlimited_check.set_label("Unlimited");
+    let limit_spin = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
+    {
+        let limit_spin = limit_spin.clone();
+        unlimited_check.connect_toggled(move |check| {
+            limit_spin.set_sensitive(!check.is_active());
+        });
+    }
+    limit_row.pack_start(&unlimited_check, false, false, 0);
+    limit_row.pack_start(&limit_spin, false, false, 0);
+    settings_box.pack_start(&limit_row, false, false, 0);
+
+    let theme_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    theme_row.pack_start(&gtk::Label::new(Some("Theme")), false, false, 0);
+    let dark_theme_radio = gtk::RadioButton::with_label("Dark");
+    let light_theme_radio = gtk::RadioButton::with_label_from_widget(&dark_theme_radio, "Light");
+    theme_row.pack_start(&dark_theme_radio, false, false, 0);
+    theme_row.pack_start(&light_theme_radio, false, false, 0);
+    settings_box.pack_start(&theme_row, false, false, 0);
+
+    let search_engines_subtitle = gtk::Label::new(Some("Search Engines"));
+    search_engines_subtitle.style_context().add_class("settings-subtitle");
+    search_engines_subtitle.set_halign(gtk::Align::Start);
+    settings_box.pack_start(&search_engines_subtitle, false, false, 0);
 
     let engine_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     engine_row.pack_start(&gtk::Label::new(Some("Search engine")), false, false, 0);
@@ -2359,28 +2528,10 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     new_engine_row.pack_start(&add_engine_button, false, false, 0);
     settings_box.pack_start(&new_engine_row, false, false, 0);
 
-    let limit_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    limit_row.pack_start(&gtk::Label::new(Some("Loaded pages limit")), false, false, 0);
-    let unlimited_check = gtk::CheckButton::new();
-    unlimited_check.set_label("Unlimited");
-    let limit_spin = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
-    {
-        let limit_spin = limit_spin.clone();
-        unlimited_check.connect_toggled(move |check| {
-            limit_spin.set_sensitive(!check.is_active());
-        });
-    }
-    limit_row.pack_start(&unlimited_check, false, false, 0);
-    limit_row.pack_start(&limit_spin, false, false, 0);
-    settings_box.pack_start(&limit_row, false, false, 0);
-
-    let theme_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    theme_row.pack_start(&gtk::Label::new(Some("Theme")), false, false, 0);
-    let dark_theme_radio = gtk::RadioButton::with_label("Dark");
-    let light_theme_radio = gtk::RadioButton::with_label_from_widget(&dark_theme_radio, "Light");
-    theme_row.pack_start(&dark_theme_radio, false, false, 0);
-    theme_row.pack_start(&light_theme_radio, false, false, 0);
-    settings_box.pack_start(&theme_row, false, false, 0);
+    let bitwarden_subtitle = gtk::Label::new(Some("Bitwarden"));
+    bitwarden_subtitle.style_context().add_class("settings-subtitle");
+    bitwarden_subtitle.set_halign(gtk::Align::Start);
+    settings_box.pack_start(&bitwarden_subtitle, false, false, 0);
 
     // Bitwarden integration: a checkbox plus its server URL, always shown
     // side by side (unlike the loaded-pages limit's conditionally-disabled
@@ -2442,8 +2593,8 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         .add_provider(&scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
     let profile_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    profile_box.set_halign(gtk::Align::Center);
-    profile_box.set_valign(gtk::Align::Center);
+    profile_box.set_halign(gtk::Align::Fill);
+    profile_box.set_valign(gtk::Align::Start);
     profile_box.style_context().add_class("settings-box");
     profile_box.set_margin(24);
 
@@ -2489,8 +2640,8 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         .add_provider(&scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
     let bookmarks_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    bookmarks_box.set_halign(gtk::Align::Center);
-    bookmarks_box.set_valign(gtk::Align::Center);
+    bookmarks_box.set_halign(gtk::Align::Fill);
+    bookmarks_box.set_valign(gtk::Align::Start);
     bookmarks_box.style_context().add_class("settings-box");
     bookmarks_box.set_margin(24);
 
@@ -2524,8 +2675,8 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         .add_provider(&scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
     let passwords_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    passwords_box.set_halign(gtk::Align::Center);
-    passwords_box.set_valign(gtk::Align::Center);
+    passwords_box.set_halign(gtk::Align::Fill);
+    passwords_box.set_valign(gtk::Align::Start);
     passwords_box.style_context().add_class("settings-box");
     passwords_box.set_margin(24);
 
@@ -2534,25 +2685,67 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     passwords_title.set_halign(gtk::Align::Start);
     passwords_box.pack_start(&passwords_title, false, false, 0);
 
+    // ---- vault locked/setup sub-group ----
+    // Shown instead of `passwords_content_box` below while the vault isn't
+    // unlocked — replaces the old separate `show_vault_passphrase_prompt`
+    // window (see `rebuild_passwords_panel`, which toggles between the two
+    // sub-groups and fills in this group's text).
+    let passwords_unlock_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let passwords_unlock_heading = gtk::Label::new(None);
+    passwords_unlock_heading.style_context().add_class("settings-subtitle");
+    passwords_unlock_heading.set_halign(gtk::Align::Start);
+    passwords_unlock_box.pack_start(&passwords_unlock_heading, false, false, 0);
+    let passwords_unlock_label = gtk::Label::new(None);
+    passwords_unlock_label.set_line_wrap(true);
+    passwords_unlock_label.set_halign(gtk::Align::Start);
+    passwords_unlock_box.pack_start(&passwords_unlock_label, false, false, 0);
+    let passwords_unlock_entry = gtk::Entry::new();
+    passwords_unlock_entry.set_visibility(false);
+    passwords_unlock_entry.set_placeholder_text(Some("Passphrase"));
+    passwords_unlock_box.pack_start(&passwords_unlock_entry, false, false, 0);
+    let passwords_unlock_error_label = gtk::Label::new(None);
+    passwords_unlock_error_label.set_halign(gtk::Align::Start);
+    passwords_unlock_box.pack_start(&passwords_unlock_error_label, false, false, 0);
+    let passwords_unlock_button = gtk::Button::with_label("Unlock");
+    passwords_unlock_box.pack_start(&passwords_unlock_button, false, false, 0);
+    passwords_box.pack_start(&passwords_unlock_box, false, false, 0);
+
+    // ---- vault contents sub-group ----
+    // Shown instead of `passwords_unlock_box` once the vault is unlocked.
+    let passwords_content_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+
+    let saved_logins_subtitle = gtk::Label::new(Some("Saved Logins"));
+    saved_logins_subtitle.style_context().add_class("settings-subtitle");
+    saved_logins_subtitle.set_halign(gtk::Align::Start);
+    passwords_content_box.pack_start(&saved_logins_subtitle, false, false, 0);
+
     let passwords_list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    passwords_box.pack_start(&passwords_list_box, false, false, 0);
+    passwords_content_box.pack_start(&passwords_list_box, false, false, 0);
+
+    // Text toggles "Add Login"/"Edit Login" alongside
+    // `submit_password_button`'s label (see `start_editing_login`/
+    // `cancel_editing_login`).
+    let passwords_form_heading = gtk::Label::new(Some("Add Login"));
+    passwords_form_heading.style_context().add_class("settings-subtitle");
+    passwords_form_heading.set_halign(gtk::Align::Start);
+    passwords_content_box.pack_start(&passwords_form_heading, false, false, 0);
 
     let new_password_site_entry = gtk::Entry::new();
     new_password_site_entry.set_placeholder_text(Some("Site (e.g. https://example.com)"));
-    passwords_box.pack_start(&new_password_site_entry, false, false, 0);
+    passwords_content_box.pack_start(&new_password_site_entry, false, false, 0);
     let new_password_username_entry = gtk::Entry::new();
     new_password_username_entry.set_placeholder_text(Some("Username"));
-    passwords_box.pack_start(&new_password_username_entry, false, false, 0);
+    passwords_content_box.pack_start(&new_password_username_entry, false, false, 0);
     let new_password_password_entry = gtk::Entry::new();
     new_password_password_entry.set_visibility(false);
     new_password_password_entry.set_placeholder_text(Some("Password"));
-    passwords_box.pack_start(&new_password_password_entry, false, false, 0);
+    passwords_content_box.pack_start(&new_password_password_entry, false, false, 0);
     let new_password_notes_entry = gtk::Entry::new();
     new_password_notes_entry.set_placeholder_text(Some("Notes (optional)"));
-    passwords_box.pack_start(&new_password_notes_entry, false, false, 0);
+    passwords_content_box.pack_start(&new_password_notes_entry, false, false, 0);
 
     // Hidden entirely unless Bitwarden integration is enabled (see
-    // `rebuild_passwords_list`, which rebuilds this combo's contents and
+    // `rebuild_passwords_panel`, which rebuilds this combo's contents and
     // this row's visibility every time it runs) — a brand-new login always
     // goes to the local vault when this isn't shown, same as before this
     // field existed.
@@ -2560,12 +2753,12 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     save_destination_row.pack_start(&gtk::Label::new(Some("Save to")), false, false, 0);
     let save_destination_combo = gtk::ComboBoxText::new();
     save_destination_row.pack_start(&save_destination_combo, true, true, 0);
-    passwords_box.pack_start(&save_destination_row, false, false, 0);
+    passwords_content_box.pack_start(&save_destination_row, false, false, 0);
 
     let passwords_error_label = gtk::Label::new(None);
     passwords_error_label.set_halign(gtk::Align::Start);
     passwords_error_label.set_line_wrap(true);
-    passwords_box.pack_start(&passwords_error_label, false, false, 0);
+    passwords_content_box.pack_start(&passwords_error_label, false, false, 0);
 
     let password_form_button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let cancel_edit_button = gtk::Button::with_label("Cancel edit");
@@ -2573,8 +2766,12 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     let submit_password_button = gtk::Button::with_label("Add");
     password_form_button_row.pack_start(&cancel_edit_button, false, false, 0);
     password_form_button_row.pack_start(&submit_password_button, false, false, 0);
-    passwords_box.pack_start(&password_form_button_row, false, false, 0);
+    passwords_content_box.pack_start(&password_form_button_row, false, false, 0);
 
+    passwords_box.pack_start(&passwords_content_box, false, false, 0);
+
+    // Close stays outside both sub-groups above — dismissing the overlay
+    // shouldn't depend on the vault's unlock state.
     let passwords_close_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     passwords_close_row.set_halign(gtk::Align::End);
     let passwords_close_button = gtk::Button::with_label("Close");
@@ -2635,7 +2832,15 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         bookmark_toggle_button: bookmark_toggle_button.clone(),
         bookmarks: RefCell::new(bookmarks),
         passwords_panel: passwords_overlay.clone().upcast::<gtk::Widget>(),
+        passwords_unlock_box: passwords_unlock_box.clone(),
+        passwords_unlock_heading: passwords_unlock_heading.clone(),
+        passwords_unlock_label: passwords_unlock_label.clone(),
+        passwords_unlock_entry: passwords_unlock_entry.clone(),
+        passwords_unlock_error_label: passwords_unlock_error_label.clone(),
+        passwords_unlock_button: passwords_unlock_button.clone(),
+        passwords_content_box: passwords_content_box.clone(),
         passwords_list_box: passwords_list_box.clone(),
+        passwords_form_heading: passwords_form_heading.clone(),
         passwords: RefCell::new(initial_vault_state),
         session_passphrase: RefCell::new(None),
         new_password_site_entry: new_password_site_entry.clone(),
@@ -2951,6 +3156,18 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     }
     {
         let app = Rc::clone(&app);
+        passwords_unlock_button.connect_clicked(move |_| {
+            app.unlock_vault_clicked();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        passwords_unlock_entry.connect_activate(move |_| {
+            app.unlock_vault_clicked();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
         window.connect_key_press_event(move |_, event| {
             let is_escape = event.keyval() == gtk::gdk::keys::Key::from_name("Escape");
             if is_escape && app.is_switcher_open() {
@@ -3235,182 +3452,3 @@ pub fn show_passphrase_prompt(profile: Profile, setup: bool) -> anyhow::Result<(
     Ok(())
 }
 
-/// Shows a small standalone window collecting a passphrase for `app`'s
-/// password vault — either to set up a *new* one (`setup: true`, when
-/// `decide_vault_unlock_action` returns `PromptToSetUp`) or to *unlock* an
-/// already-protected one (`setup: false`, `PromptToUnlock`). Unlike
-/// `show_passphrase_prompt` (which bootstraps a whole new window/app at
-/// process startup, before any main window exists), this operates on an
-/// **already-running** app: on success it fills in `app.passwords`/
-/// `app.session_passphrase` (via `try_open_vault_with`) and shows the
-/// passwords overlay directly, rather than building anything new. Retries
-/// in place on a wrong passphrase, same as `show_passphrase_prompt`.
-fn show_vault_passphrase_prompt(app: Rc<AppState>, setup: bool) {
-    let window = gtk::Window::new(gtk::WindowType::Toplevel);
-    window.set_title(if setup { "Set a vault passphrase" } else { "Unlock password vault" });
-    window.set_default_size(420, 160);
-
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.set_margin(16);
-
-    let prompt_text = if setup {
-        "Choose a passphrase to encrypt your password vault."
-    } else {
-        "Your password vault is passphrase-protected."
-    };
-    let prompt_label = gtk::Label::new(Some(prompt_text));
-    prompt_label.set_line_wrap(true);
-    prompt_label.set_halign(gtk::Align::Start);
-    content.pack_start(&prompt_label, false, false, 0);
-
-    let passphrase_entry = gtk::Entry::new();
-    passphrase_entry.set_visibility(false);
-    passphrase_entry.set_placeholder_text(Some("Passphrase"));
-    content.pack_start(&passphrase_entry, false, false, 0);
-
-    let error_label = gtk::Label::new(None);
-    error_label.set_halign(gtk::Align::Start);
-    content.pack_start(&error_label, false, false, 0);
-
-    let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    button_row.set_halign(gtk::Align::End);
-    let cancel_button = gtk::Button::with_label("Cancel");
-    let confirm_button = gtk::Button::with_label(if setup { "Set Passphrase" } else { "Unlock" });
-    button_row.pack_start(&cancel_button, false, false, 0);
-    button_row.pack_start(&confirm_button, false, false, 0);
-    content.pack_start(&button_row, false, false, 0);
-
-    window.add(&content);
-    window.show_all();
-
-    {
-        let window = window.clone();
-        cancel_button.connect_clicked(move |_| {
-            window.close();
-        });
-    }
-    // Unlike `show_passphrase_prompt`'s window (which, before the main
-    // window exists, quitting on close is the only sensible behavior),
-    // this one always has a real running browser window underneath it —
-    // closing it (Cancel, Escape, the WM close button) should just dismiss
-    // the prompt, never quit the app.
-    window.connect_delete_event(|_, _| gtk::glib::Propagation::Proceed);
-
-    let try_unlock: Rc<dyn Fn()> = {
-        let window = window.clone();
-        let passphrase_entry = passphrase_entry.clone();
-        let error_label = error_label.clone();
-        let app = Rc::clone(&app);
-        Rc::new(move || {
-            let passphrase = passphrase_entry.text().to_string();
-            if passphrase.is_empty() {
-                error_label.set_text("Passphrase can't be empty.");
-                return;
-            }
-            if app.try_open_vault_with(&passphrase, setup) {
-                window.close();
-                app.show_passwords_panel();
-            } else {
-                error_label.set_text("Couldn't open the vault with that passphrase. Try again.");
-                passphrase_entry.set_text("");
-                passphrase_entry.grab_focus();
-            }
-        })
-    };
-    {
-        let try_unlock = Rc::clone(&try_unlock);
-        confirm_button.connect_clicked(move |_| try_unlock());
-    }
-    {
-        let try_unlock = Rc::clone(&try_unlock);
-        passphrase_entry.connect_activate(move |_| try_unlock());
-    }
-}
-
-/// Shows a small standalone window collecting the Bitwarden account's
-/// master password, to unlock the `bw serve` instance backing
-/// `app.bitwarden_backend()` — entirely separate from, and unrelated to,
-/// this browser's own vault passphrase (`show_vault_passphrase_prompt`).
-/// Retries in place on a wrong password, same shape as that prompt.
-fn show_bitwarden_unlock_prompt(app: Rc<AppState>) {
-    let window = gtk::Window::new(gtk::WindowType::Toplevel);
-    window.set_title("Unlock Bitwarden");
-    window.set_default_size(420, 160);
-
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.set_margin(16);
-
-    let prompt_label = gtk::Label::new(Some("Enter your Bitwarden master password to unlock it."));
-    prompt_label.set_line_wrap(true);
-    prompt_label.set_halign(gtk::Align::Start);
-    content.pack_start(&prompt_label, false, false, 0);
-
-    let password_entry = gtk::Entry::new();
-    password_entry.set_visibility(false);
-    password_entry.set_placeholder_text(Some("Bitwarden master password"));
-    content.pack_start(&password_entry, false, false, 0);
-
-    let error_label = gtk::Label::new(None);
-    error_label.set_halign(gtk::Align::Start);
-    content.pack_start(&error_label, false, false, 0);
-
-    let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    button_row.set_halign(gtk::Align::End);
-    let cancel_button = gtk::Button::with_label("Cancel");
-    let confirm_button = gtk::Button::with_label("Unlock");
-    button_row.pack_start(&cancel_button, false, false, 0);
-    button_row.pack_start(&confirm_button, false, false, 0);
-    content.pack_start(&button_row, false, false, 0);
-
-    window.add(&content);
-    window.show_all();
-
-    {
-        let window = window.clone();
-        cancel_button.connect_clicked(move |_| {
-            window.close();
-        });
-    }
-    // Same reasoning as `show_vault_passphrase_prompt`'s equivalent: a real
-    // browser window already exists underneath this one, so closing it
-    // (Cancel, Escape, the WM close button) should just dismiss the prompt,
-    // never quit the app.
-    window.connect_delete_event(|_, _| gtk::glib::Propagation::Proceed);
-
-    let try_unlock: Rc<dyn Fn()> = {
-        let window = window.clone();
-        let password_entry = password_entry.clone();
-        let error_label = error_label.clone();
-        let app = Rc::clone(&app);
-        Rc::new(move || {
-            let password = password_entry.text().to_string();
-            if password.is_empty() {
-                error_label.set_text("Password can't be empty.");
-                return;
-            }
-            let Some(backend) = app.bitwarden_backend() else {
-                error_label.set_text("Bitwarden is no longer enabled in settings.");
-                return;
-            };
-            match backend.unlock(&password) {
-                Ok(()) => {
-                    window.close();
-                    app.rebuild_passwords_list();
-                }
-                Err(err) => {
-                    error_label.set_text(&format!("Couldn't unlock Bitwarden: {err}"));
-                    password_entry.set_text("");
-                    password_entry.grab_focus();
-                }
-            }
-        })
-    };
-    {
-        let try_unlock = Rc::clone(&try_unlock);
-        confirm_button.connect_clicked(move |_| try_unlock());
-    }
-    {
-        let try_unlock = Rc::clone(&try_unlock);
-        password_entry.connect_activate(move |_| try_unlock());
-    }
-}
