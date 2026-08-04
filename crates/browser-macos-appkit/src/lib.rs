@@ -99,7 +99,7 @@ use browser_core::{
     decide_vault_unlock_action, domain_of, launch_new_encrypted_profile_process, launch_new_profile_process,
     list_profile_names, resolve_address_input, resolve_profile_name, resolve_url_argument, Action, BitwardenBackend,
     BitwardenStatus, Bookmark, Bookmarks, HistoryStore, Keybindings, Login, LoginFields, PageManager, PasswordBackend,
-    PasswordStore, Profile, Settings, Theme, VaultUnlockAction, HOME_URL,
+    PasswordStore, Profile, Session, SessionPage, Settings, Theme, VaultUnlockAction, HOME_URL,
 };
 use render_engine::{RenderEngine, WryEngine};
 
@@ -1133,6 +1133,55 @@ impl AppState {
         }
     }
 
+    /// Opens either the saved session's pages (if any) or `start_page` —
+    /// this crate's single startup call site. Individual `add_page`
+    /// failures are logged and skipped rather than aborting the whole
+    /// restore (a URL that no longer resolves shouldn't cost the user
+    /// every *other* restored tab).
+    fn open_start_page_or_restored_session(self: &Rc<Self>, start_page: &str) {
+        let session = Session::load(&self.profile);
+        let plan = browser_chrome_core::resolve_restore_plan(&session, start_page);
+        for url in &plan.urls {
+            if let Err(err) = self.add_page(url) {
+                eprintln!("failed to open restored page {url:?}: {err}");
+            }
+        }
+        // `add_page` makes each newly-added page active in turn, so without
+        // this the *last* URL in `plan.urls` would end up active regardless
+        // of which one was actually active when the session was saved. The
+        // id is copied out of `core`'s borrow into its own statement before
+        // calling `set_active` (which needs its own borrow) rather than
+        // held across it — otherwise this would panic on the `RefCell`'s
+        // already-borrowed check.
+        let active_page_id = plan.active_index.and_then(|idx| self.core.borrow().pages().get(idx).map(|p| p.id.clone()));
+        if let Some(id) = active_page_id {
+            self.set_active(&id);
+        }
+    }
+
+    /// Snapshots the currently-open pages (URL + title, in `PageManager`'s
+    /// own creation order) plus which one is active, for `windowWillClose:`
+    /// to save before the app actually terminates.
+    fn build_session(&self) -> Session {
+        let core = self.core.borrow();
+        let active_id = core.active_id();
+        let active_index = core.pages().iter().position(|p| p.id == active_id);
+        let pages = core.pages().iter().map(|p| SessionPage { url: p.current_url(), title: p.title.borrow().clone() }).collect();
+        Session { pages, active_index }
+    }
+
+    /// The real "the whole app is closing" hook's save half — called from
+    /// `windowWillClose:` (both the red-traffic-light button and
+    /// `Action::Quit`'s `self.window.close()` route through it, since
+    /// closing the window is what triggers that delegate method) before
+    /// `NSApplication::terminate` actually exits the process.
+    fn save_session(&self) {
+        let session = self.build_session();
+        if let Err(err) = session.save(&self.profile) {
+            eprintln!("failed to save session: {err}");
+        }
+    }
+
     fn switch_to(self: &Rc<Self>, id: &str) {
         self.ensure_engine_loaded(id);
         self.set_active(id);
@@ -1779,6 +1828,11 @@ define_class!(
                 Action::OpenBookmarks => state.open_bookmarks(),
                 Action::NextPage => state.switch_to_next_page(),
                 Action::PreviousPage => state.switch_to_previous_page(),
+                // Routes through the same `windowWillClose:` delegate
+                // method the red-traffic-light button already uses (see
+                // its doc comment) — one save-then-quit implementation,
+                // not two.
+                Action::Quit => state.window.close(),
                 // Reader mode isn't implemented on this front end either yet
                 // — matches browser-windows-winui/reactor's scope.
                 Action::ToggleReaderMode => {}
@@ -1796,8 +1850,17 @@ define_class!(
             }
         }
 
+        // The real "the whole app is closing" hook — both the window's own
+        // red-traffic-light button and `Action::Quit` (via
+        // `self.window.close()`) end up here, so this is the one place
+        // that needs to save the session before the process actually
+        // exits, rather than each route separately implementing
+        // save-then-quit.
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
+            if let Some(state) = self.ivars().state.borrow().as_ref() {
+                state.save_session();
+            }
             if let Some(mtm) = MainThreadMarker::new() {
                 NSApplication::sharedApplication(mtm).terminate(None);
             }
@@ -2276,9 +2339,7 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
         }
     }
 
-    if let Err(err) = state.add_page(&initial_url) {
-        eprintln!("failed to open the start page: {err}");
-    }
+    state.open_start_page_or_restored_session(&initial_url);
     state.relayout();
 
     let menu = shortcuts::build_menu(&delegate, &state.keybindings.borrow(), mtm);

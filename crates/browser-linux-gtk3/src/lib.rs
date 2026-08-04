@@ -14,8 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use browser_core::{
     decide_vault_unlock_action, domain_of, list_profile_names, resolve_address_input, Action, BitwardenBackend, BitwardenStatus,
-    Bookmarks, HistoryStore, KeyChord, Keybindings, Login, LoginFields, PageManager, PasswordBackend, PasswordStore, Profile, Settings,
-    Theme, VaultUnlockAction,
+    Bookmarks, HistoryStore, KeyChord, Keybindings, Login, LoginFields, PageManager, PasswordBackend, PasswordStore, Profile, Session,
+    SessionPage, Settings, Theme, VaultUnlockAction,
 };
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WryEngine};
@@ -284,6 +284,76 @@ impl AppState {
         self.set_active(&id);
         self.rebuild_switcher_grid();
         Ok(())
+    }
+
+    /// Opens either the saved session's pages (if any) or `start_page` —
+    /// the two real startup call sites (a plain launch, and an encrypted
+    /// profile's post-unlock handoff) both funnel through this instead of
+    /// each duplicating the loop. Individual `add_page` failures are logged
+    /// and skipped rather than aborting the whole restore (a URL that no
+    /// longer resolves shouldn't cost the user every *other* restored tab).
+    pub fn open_start_page_or_restored_session(self: &Rc<Self>) {
+        let session = Session::load(&self.profile);
+        let start_page = self.settings.borrow().start_page.clone();
+        let plan = browser_chrome_core::resolve_restore_plan(&session, &start_page);
+        for url in &plan.urls {
+            if let Err(err) = self.add_page(url) {
+                eprintln!("failed to open restored page {url:?}: {err}");
+            }
+        }
+        // `add_page` makes each newly-added page active in turn, so without
+        // this the *last* URL in `plan.urls` would end up active regardless
+        // of which one was actually active when the session was saved. The
+        // id is copied out of `core`'s borrow into its own statement before
+        // calling `set_active` (which needs its own borrow) rather than
+        // held across it — otherwise this would panic on the `RefCell`'s
+        // already-borrowed check (a temporary from the borrow in an `if
+        // let` scrutinee lives for the whole `if let`, body included, not
+        // just the condition).
+        let active_page_id = plan.active_index.and_then(|idx| self.core.borrow().pages().get(idx).map(|p| p.id.clone()));
+        if let Some(id) = active_page_id {
+            self.set_active(&id);
+        }
+    }
+
+    /// Snapshots the currently-open pages (URL + title, in `PageManager`'s
+    /// own creation order) plus which one is active, for `quit` to save.
+    fn build_session(&self) -> Session {
+        let core = self.core.borrow();
+        let active_id = core.active_id();
+        let active_index = core.pages().iter().position(|p| p.id == active_id);
+        let pages = core.pages().iter().map(|p| SessionPage { url: p.current_url(), title: p.title.borrow().clone() }).collect();
+        Session { pages, active_index }
+    }
+
+    /// The real "the whole app is closing" hook — saves the session, then
+    /// exits. Both `Action::Quit` (Ctrl+Q) and the window's own close
+    /// button (`connect_delete_event`) call this same method rather than
+    /// each separately implementing save-then-quit, so there's exactly one
+    /// save path to keep correct.
+    fn quit(&self) {
+        self.save_session();
+        gtk::main_quit();
+    }
+
+    /// The save half of `quit`, split out so tests can exercise a real
+    /// save-then-restore round trip without also calling `gtk::main_quit()`
+    /// — the shared GTK worker thread every test in this suite runs on
+    /// (see `gtk_tests.rs`'s module doc comment) never actually calls
+    /// `gtk::main()` itself (each test's job runs directly, not inside a
+    /// driven main loop), so quitting it for real isn't something a test
+    /// should risk relying on being harmless.
+    fn save_session(&self) {
+        let session = self.build_session();
+        if let Err(err) = session.save(&self.profile) {
+            eprintln!("failed to save session: {err}");
+        }
+    }
+
+    /// Test helper for `save_session` — see its doc comment for why tests
+    /// don't call the real `quit()` (which also calls `gtk::main_quit()`).
+    pub fn save_session_for_test(&self) {
+        self.save_session();
     }
 
     /// Records a history visit for page `id`'s current URL/title — called
@@ -1666,6 +1736,7 @@ impl AppState {
             Action::OpenPasswords => self.open_passwords(),
             Action::NextPage => self.switch_to_next_page(),
             Action::PreviousPage => self.switch_to_previous_page(),
+            Action::Quit => self.quit(),
         }
     }
 
@@ -2311,10 +2382,10 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
     window.set_title(if profile.ephemeral { "claude-browser (Private)" } else { "claude-browser" });
     window.set_default_size(1024, 768);
-    window.connect_delete_event(|_, _| {
-        gtk::main_quit();
-        gtk::glib::Propagation::Proceed
-    });
+    // `connect_delete_event` is wired further down, once `app` exists —
+    // see the comment there (search "the window's own close button") for
+    // why it needs to call `AppState::quit` rather than `gtk::main_quit()`
+    // directly.
 
     let header_bar = gtk::HeaderBar::new();
     header_bar.set_show_close_button(true);
@@ -3023,6 +3094,17 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     }
 
     {
+        // The window's own close button (Ctrl+Q's `Action::Quit` arm calls
+        // the same `AppState::quit` method — see its doc comment for why
+        // both routes converge on one save-then-quit implementation rather
+        // than each separately calling `gtk::main_quit()`).
+        let app = Rc::clone(&app);
+        window.connect_delete_event(move |_, _| {
+            app.quit();
+            gtk::glib::Propagation::Proceed
+        });
+    }
+    {
         let app = Rc::clone(&app);
         back_button.connect_clicked(move |_| app.with_active(|p| p.go_back()));
     }
@@ -3507,10 +3589,7 @@ pub fn show_passphrase_prompt(profile: Profile, setup: bool) -> anyhow::Result<(
                             // vault-open failure is logged early, not
                             // silently deferred.
                             app.note_unlocked_with_passphrase(&passphrase);
-                            let start_page = app.settings().start_page.clone();
-                            if let Err(err) = app.add_page(&start_page) {
-                                eprintln!("failed to open the start page: {err}");
-                            }
+                            app.open_start_page_or_restored_session();
                         }
                         Err(err) => eprintln!("failed to open the browser window: {err}"),
                     }

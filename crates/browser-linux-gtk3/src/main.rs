@@ -33,8 +33,7 @@ fn main() -> anyhow::Result<()> {
             show_passphrase_prompt(profile, false)?;
         } else {
             let (_window, app) = build_window_and_app(profile)?;
-            let start_page = app.settings().start_page.clone();
-            app.add_page(&start_page)?;
+            app.open_start_page_or_restored_session();
         }
     }
 

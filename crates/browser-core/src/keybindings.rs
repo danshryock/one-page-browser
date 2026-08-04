@@ -29,6 +29,7 @@ pub enum Action {
     OpenPasswords,
     NextPage,
     PreviousPage,
+    Quit,
 }
 
 impl Action {
@@ -47,6 +48,7 @@ impl Action {
         Action::OpenPasswords,
         Action::NextPage,
         Action::PreviousPage,
+        Action::Quit,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -65,6 +67,7 @@ impl Action {
             Action::OpenPasswords => "Open password manager",
             Action::NextPage => "Next page",
             Action::PreviousPage => "Previous page",
+            Action::Quit => "Quit",
         }
     }
 }
@@ -187,6 +190,7 @@ impl Default for Keybindings {
             Action::PreviousPage,
             vec![KeyChord::new(true, false, true, "Tab"), KeyChord::new(true, false, false, "PageUp")],
         );
+        map.insert(Action::Quit, vec![KeyChord::new(true, false, false, "Q")]);
         // OpenSettings/OpenProfilePicker/OpenBookmarks/ToggleReaderMode/
         // OpenPasswords: unbound by default — toolbar-button-only, used far
         // less often than the other six.
@@ -226,6 +230,12 @@ mod tests {
         assert_eq!(defaults.action_for(&KeyChord::new(true, false, false, "PageDown")), Some(Action::NextPage));
         assert_eq!(defaults.action_for(&KeyChord::new(true, false, true, "Tab")), Some(Action::PreviousPage));
         assert_eq!(defaults.action_for(&KeyChord::new(true, false, false, "PageUp")), Some(Action::PreviousPage));
+    }
+
+    #[test]
+    fn default_binds_quit() {
+        let defaults = Keybindings::default();
+        assert_eq!(defaults.action_for(&KeyChord::new(true, false, false, "Q")), Some(Action::Quit));
     }
 
     #[test]

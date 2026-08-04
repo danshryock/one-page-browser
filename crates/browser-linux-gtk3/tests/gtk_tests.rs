@@ -516,6 +516,64 @@ fn settings_overlay_mutual_exclusion_and_save() {
 }
 
 #[test]
+fn session_saved_on_quit_is_restored_on_next_launch() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("session-restore");
+        let url_a = fixture_url("page_a.html");
+        let url_b = fixture_url("page_b.html");
+
+        {
+            let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+            app.add_page(&url_a).expect("add_page should succeed");
+            let id_a = app.active_id();
+            assert!(wait_until(|| app.page_title(&id_a).as_deref() == Some("Page A")));
+            app.add_page(&url_b).expect("add_page should succeed");
+            assert!(wait_until(|| app.active_url().as_deref() == Some(url_b.as_str())));
+            // Switch back to A so it — not the most-recently-added B — is
+            // the one the saved session should remember as active.
+            app.switch_to(&id_a);
+            assert_eq!(app.active_id(), id_a);
+
+            app.save_session_for_test();
+        }
+
+        // A fresh AppState against the same profile, as a real second
+        // launch would build — build_window_and_app never opens a page
+        // itself (confirmed by its own doc comment), so this starts with
+        // zero pages, exactly the state a real startup begins in.
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        assert!(app.page_ids().is_empty(), "sanity check: a fresh AppState shouldn't have any pages yet");
+
+        app.open_start_page_or_restored_session();
+        assert_eq!(app.page_ids().len(), 2, "both saved pages should be restored");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())), "the previously-active page (A, not the most-recently-added B) should be active again");
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn no_saved_session_falls_back_to_the_configured_start_page() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("session-restore-fallback");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        // A local fixture, not Settings::default()'s real HOME_URL — this
+        // suite has no real network access, and current_url() reflects the
+        // real webview's URL, not just whatever was requested.
+        let start_page = fixture_url("page_a.html");
+        app.open_settings();
+        app.set_settings_start_page(&start_page);
+        app.save_settings();
+
+        app.open_start_page_or_restored_session();
+        assert_eq!(app.page_ids().len(), 1, "a fresh profile with no saved session should open exactly the start page");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(start_page.as_str())));
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
 fn closing_every_page_leaves_one_fallback() {
     run_on_gtk_thread(|| {
         let profile = test_profile("close-to-fallback");

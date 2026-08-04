@@ -54,9 +54,8 @@ fn run() -> anyhow::Result<()> {
         browser_windows_winui::trace("run: about to call build_window_and_app");
         let app = build_window_and_app(profile)?;
         browser_windows_winui::trace("run: after build_window_and_app");
-        let start_page = app.settings().start_page.clone();
-        app.add_page(&start_page)?;
-        browser_windows_winui::trace("run: after add_page");
+        app.open_start_page_or_restored_session();
+        browser_windows_winui::trace("run: after open_start_page_or_restored_session");
         app.activate()?;
         browser_windows_winui::trace("run: after activate");
     }

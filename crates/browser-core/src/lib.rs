@@ -20,6 +20,7 @@ mod history;
 mod keybindings;
 mod passwords;
 mod profile;
+mod session;
 mod settings;
 pub mod testing;
 pub use bitwarden::{BitwardenBackend, BitwardenStatus};
@@ -31,6 +32,7 @@ pub use profile::{
     launch_new_encrypted_profile_process, launch_new_ephemeral_process, launch_new_profile_process, list_profile_names,
     resolve_ephemeral_requested, resolve_passphrase_setup_requested, resolve_profile_name, resolve_url_argument, Profile,
 };
+pub use session::{Session, SessionPage};
 pub use settings::{SearchEngine, Settings, Theme};
 
 pub const HOME_URL: &str = "https://www.google.com";

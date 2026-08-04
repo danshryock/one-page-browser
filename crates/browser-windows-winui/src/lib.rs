@@ -37,8 +37,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use browser_core::{
-    list_profile_names, resolve_address_input, Action, HistoryStore, KeyChord, Keybindings, PageManager, Profile,
-    Settings,
+    list_profile_names, resolve_address_input, Action, HistoryStore, KeyChord, Keybindings, PageManager, Profile, Session,
+    SessionPage, Settings,
 };
 use render_engine::{AssertSend, RenderEngine, WebView2Engine};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -180,6 +180,50 @@ impl AppState {
         self.set_active(&id);
         self.rebuild_switcher_grid();
         Ok(())
+    }
+
+    /// Opens either the saved session's pages (if any) or `start_page` —
+    /// this crate's single startup call site. Individual `add_page`
+    /// failures are logged and skipped rather than aborting the whole
+    /// restore (a URL that no longer resolves shouldn't cost the user
+    /// every *other* restored tab).
+    pub fn open_start_page_or_restored_session(self: &Rc<Self>) {
+        let session = Session::load(&self.profile);
+        let start_page = self.settings.borrow().start_page.clone();
+        let plan = browser_chrome_core::resolve_restore_plan(&session, &start_page);
+        for url in &plan.urls {
+            if let Err(err) = self.add_page(url) {
+                eprintln!("failed to open restored page {url:?}: {err}");
+            }
+        }
+        // `add_page` makes each newly-added page active in turn, so without
+        // this the *last* URL in `plan.urls` would end up active regardless
+        // of which one was actually active when the session was saved. The
+        // id is copied out of `core`'s borrow into its own statement before
+        // calling `set_active` (which needs its own borrow) rather than
+        // held across it — otherwise this would panic on the `RefCell`'s
+        // already-borrowed check.
+        let active_page_id = plan.active_index.and_then(|idx| self.core.borrow().pages().get(idx).map(|p| p.id.clone()));
+        if let Some(id) = active_page_id {
+            self.set_active(&id);
+        }
+    }
+
+    /// Snapshots the currently-open pages (URL + title, in `PageManager`'s
+    /// own creation order) plus which one is active — called from
+    /// `subclass_proc`'s `WM_DESTROY` arm before it exits the application,
+    /// the one hook both the window's own close button and `Action::Quit`
+    /// (via `self.window.Close()`) route through.
+    pub fn save_session(&self) {
+        let core = self.core.borrow();
+        let active_id = core.active_id();
+        let active_index = core.pages().iter().position(|p| p.id == active_id);
+        let pages = core.pages().iter().map(|p| SessionPage { url: p.current_url(), title: p.title.borrow().clone() }).collect();
+        drop(core);
+        let session = Session { pages, active_index };
+        if let Err(err) = session.save(&self.profile) {
+            eprintln!("failed to save session: {err}");
+        }
     }
 
     /// Records a history visit for page `id`'s current URL/title — called
@@ -540,6 +584,16 @@ impl AppState {
             // dispatch any of these to yet.
             Action::NextPage => self.switch_to_next_page(),
             Action::PreviousPage => self.switch_to_previous_page(),
+            // Triggers a real Win32 window close → WM_DESTROY → the
+            // existing `subclass_proc` arm already calls
+            // `Application::Current()?.Exit()` there (now saving the
+            // session first too) — one save-then-quit implementation,
+            // reached whether the user picks Ctrl+Q or the OS close button.
+            Action::Quit => {
+                if let Err(err) = self.window.Close() {
+                    eprintln!("failed to close the window: {err}");
+                }
+            }
             Action::ToggleBookmark
             | Action::OpenBookmarks
             | Action::EditUrl
@@ -1302,6 +1356,13 @@ unsafe extern "system" fn subclass_proc(
             unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
         }
         WM_DESTROY => {
+            // The real "the whole app is closing" hook — both the window's
+            // own close button (which sends WM_DESTROY via normal Win32
+            // teardown) and `Action::Quit` (via `self.window.Close()`,
+            // which triggers the exact same teardown) end up here, so this
+            // is the one place that needs to save the session before
+            // `Application::Exit()` actually ends the process.
+            app.save_session();
             let _ = winui3::Microsoft::UI::Xaml::Application::Current().and_then(|a| a.Exit());
             unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
         }

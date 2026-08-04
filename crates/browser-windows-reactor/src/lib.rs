@@ -84,7 +84,7 @@ use std::rc::Rc;
 
 use browser_core::{
     launch_new_profile_process, list_profile_names, resolve_address_input, Action, HistoryStore, KeyChord, Keybindings,
-    PageManager, Profile, Settings, HOME_URL,
+    PageManager, Profile, Session, SessionPage, Settings, HOME_URL,
 };
 use engine::ReactorWebViewEngine;
 use windows_reactor::*;
@@ -158,14 +158,6 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     let (listening_for, set_listening_for) = cx.use_state(Option::<Action>::None);
     let (new_binding_text, set_new_binding_text) = cx.use_state(String::new());
 
-    // Bootstrap: open the start page on the very first render (core starts
-    // empty — there's no separate "startup" hook, so this just runs
-    // in-line, same render pass, before anything below reads `core`).
-    if core.borrow().is_empty() {
-        let start_page = shared.settings.borrow().start_page.clone();
-        do_add_page(&core, &start_page, &set_active_id, &active_id_ref, &set_address);
-    }
-
     // Closures shared across multiple event handlers/`switcher_overlay` are
     // wrapped in reactor's own `Callback<T>` (an `Rc<dyn Fn(T)>` newtype) —
     // plain closures aren't `Clone` even when every captured variable is,
@@ -194,6 +186,34 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
             bump.invoke(());
         }
     });
+
+    // Bootstrap: open either the saved session's pages or the start page,
+    // on the very first render (core starts empty — there's no separate
+    // "startup" hook, so this just runs in-line, same render pass; placed
+    // after `switch_to`'s own definition above, not before it like the
+    // single-URL version this replaced, since restoring which page was
+    // active needs to call it). Individual `do_add_page` calls have no
+    // failure mode to report (unlike the other three frontends' `add_page`,
+    // this one returns nothing — see its own doc comment), so there's
+    // nothing to skip-and-log here.
+    if core.borrow().is_empty() {
+        let session = Session::load(&shared.profile);
+        let start_page = shared.settings.borrow().start_page.clone();
+        let plan = browser_chrome_core::resolve_restore_plan(&session, &start_page);
+        for url in &plan.urls {
+            do_add_page(&core, url, &set_active_id, &active_id_ref, &set_address);
+        }
+        // `do_add_page` makes each newly-added page active in turn, so
+        // without this the *last* URL in `plan.urls` would end up active
+        // regardless of which one was actually active when the session was
+        // saved. The id is copied out of `core`'s borrow into its own
+        // statement before calling `switch_to` (which needs its own
+        // borrow) rather than held across it.
+        let active_page_id = plan.active_index.and_then(|idx| core.borrow().pages().get(idx).map(|p| p.id.clone()));
+        if let Some(id) = active_page_id {
+            switch_to.invoke(id);
+        }
+    }
 
     let add_page_and_switch: Callback<String> = Callback::new({
         let core = core.clone();
@@ -401,6 +421,7 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         let open_settings = open_settings.clone();
         let open_profile = open_profile.clone();
         let switch_to = switch_to.clone();
+        let shared = Rc::clone(shared);
         move |action: Action| {
             trace(&format!("dispatch_action: fired for {action:?}"));
             use render_engine::RenderEngine;
@@ -449,6 +470,23 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
                     if let Some(id) = id {
                         switch_to.invoke(id);
                     }
+                }
+                // `windows-reactor`'s `Window::Closed`/`Close` are
+                // `pub(crate)` — confirmed by direct compile error, not
+                // assumed — so unlike the other three front ends, this one
+                // has no way to trigger a real window close (or intercept
+                // one) from outside the crate at all. Saves synchronously
+                // and exits directly instead — mirrors `run_chooser`'s own
+                // `std::process::exit(0)` elsewhere in this crate for the
+                // same "no other way to end this process" reason. One real,
+                // honest gap versus the other three front ends: the *OS*
+                // close button (the window chrome's own X) has no save hook
+                // reachable from this crate either, so only this Ctrl+Q
+                // path actually saves a session on this front end — see
+                // ROADMAP.md.
+                Action::Quit => {
+                    save_session(&core, &shared.profile);
+                    std::process::exit(0);
                 }
                 Action::ToggleBookmark
                 | Action::OpenBookmarks
@@ -627,6 +665,22 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     root
 }
 
+/// Snapshots the currently-open pages (URL + title, in `PageManager`'s own
+/// creation order) plus which one is active, and saves it — called from
+/// `Action::Quit`'s dispatch arm (see its own comment for why that's the
+/// *only* save point on this front end, unlike the other three).
+fn save_session(core: &HookRef<PageManager<ReactorWebViewEngine>>, profile: &Profile) {
+    let core = core.borrow();
+    let active_id = core.active_id();
+    let active_index = core.pages().iter().position(|p| p.id == active_id);
+    let pages = core.pages().iter().map(|p| SessionPage { url: p.current_url(), title: p.title.borrow().clone() }).collect();
+    drop(core);
+    let session = Session { pages, active_index };
+    if let Err(err) = session.save(profile) {
+        eprintln!("failed to save session: {err}");
+    }
+}
+
 /// Allocates a fresh page id, inserts an empty `ReactorWebViewEngine` (its
 /// `WebView` is filled in later by `page_element`'s `on_ready`), unloads
 /// whatever `PageManager::insert` evicted to make room, and makes it active
@@ -645,6 +699,16 @@ fn do_add_page(
     let evicted = core.borrow_mut().insert(id.clone(), engine, title);
     for evicted_id in evicted {
         core.borrow_mut().take_engine(&evicted_id);
+    }
+    // `insert` always starts a fresh page with an empty `last_url` — without
+    // this, `page_element`'s `on_ready` (which reads `last_url`, not this
+    // function's own `url` parameter — see its doc comment) navigates every
+    // new page to `HOME_URL` regardless of what was actually requested here.
+    // A real, pre-existing gap independent of session restore (both this
+    // bootstrap and the "+" add-tile already pass a real `url`), just never
+    // exercised until something — restore — actually needed `url` honored.
+    if let Some(page) = core.borrow_mut().page_mut(&id) {
+        page.last_url = url.to_string();
     }
     *active_id_ref.borrow_mut() = id.clone();
     set_active_id.call(id);

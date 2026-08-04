@@ -19,12 +19,15 @@
 //! doc comment for why it's exposed, not `#[cfg(test)]`-gated, in the first
 //! place).
 //!
-//! Currently just `switcher` (`ARCHITECTURE.md` §7's rollout starts there —
+//! Currently `switcher` (`ARCHITECTURE.md` §7's rollout starts there —
 //! highest duplication count, and already nearly pure data in two of the
-//! four frontends that have it). `PageController`/`SettingsController`/
-//! `KeybindingsController`/`ProfilePickerModel` are follow-up work, per that
-//! same rollout plan.
+//! four frontends that have it) and `restore` (the startup "which pages
+//! should we open" decision — one of the `PageController`-shaped follow-ups
+//! that doc comment already called out). `SettingsController`/
+//! `KeybindingsController`/`ProfilePickerModel` remain future work.
 
+mod restore;
 mod switcher;
 
+pub use restore::{resolve_restore_plan, RestorePlan};
 pub use switcher::{activate_row, build_switcher_rows, SwitcherActivation, SwitcherRow};

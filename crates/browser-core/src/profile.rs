@@ -53,6 +53,13 @@ impl Profile {
         Some(dirs.config_dir().join(&self.name).join("bookmarks.json"))
     }
 
+    /// The currently-open pages (URLs + which one was active), saved on
+    /// quit and reopened on next launch — see `Session`'s doc comment.
+    pub fn session_path(&self) -> Option<PathBuf> {
+        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        Some(dirs.config_dir().join(&self.name).join("session.json"))
+    }
+
     /// Reserved for the per-profile history database — resolved here so the
     /// path is settled and testable, but nothing opens a connection at this
     /// path yet (a separate step: `libsql`'s core API is async, and this
@@ -366,6 +373,13 @@ mod tests {
         let profile = Profile::new("work");
         let path = profile.bookmarks_path().expect("a config dir should be available in tests");
         assert!(path.ends_with("work/bookmarks.json"), "{path:?}");
+    }
+
+    #[test]
+    fn session_path_is_scoped_under_the_profile_name() {
+        let profile = Profile::new("work");
+        let path = profile.session_path().expect("a config dir should be available in tests");
+        assert!(path.ends_with("work/session.json"), "{path:?}");
     }
 
     #[test]

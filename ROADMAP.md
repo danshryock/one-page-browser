@@ -214,6 +214,35 @@ build/run instructions.
   focus-opens-switcher guard (`!is_switcher_open()`) is real production logic, not just a reentrancy guard:
   refocusing the address bar while the switcher is already open (e.g. clicking back into it mid-filter)
   must not clobber whatever the user already typed, covered by its own test.
+- `Action::Quit` (Ctrl+Q) and session restore, in all four front ends per explicit request (real work in
+  each one's own page-lifecycle/startup code, not just a shared dispatch arm — compile/link-checked only
+  for the three unrunnable from this machine). New `browser-core::Session`/`SessionPage` — small,
+  JSON-backed, per-profile, mirroring `Bookmarks`' exact shape rather than a SQLite database (a handful of
+  open tabs needs no querying) — and `browser_chrome_core::resolve_restore_plan`, the shared toolkit-free
+  "which URLs to open, and which one was active" decision every front end's own bootstrap now calls into.
+  Every front end already had exactly one real "the whole app is closing" hook to save the session from
+  before exiting — gtk3's `window.connect_delete_event` (now capturing `app`, previously a bare
+  `gtk::main_quit()`), macOS's `windowWillClose:`, and WinUI's `subclass_proc`'s `WM_DESTROY` arm — with
+  `Action::Quit` routed through each same hook (`window.close()`/`self.window.Close()`) rather than
+  duplicating save logic.
+
+  One real, honest exception found by direct compile error, not assumed: `browser-windows-reactor`'s
+  `Window::Closed`/`Close` turned out to be `pub(crate)` inside the vendored `windows-reactor` crate — the
+  planned "subscribe a second, independent `Closed` handler to save the session, covering both the OS
+  close button and Ctrl+Q" approach simply doesn't compile from outside that crate, and grepping the
+  vendored source found no public "on window close" hook at all (the declarative on-close builder exists
+  only for other widgets like `InfoBar`/`TabView`, not the top-level window). Fell back to the plan's own
+  documented fallback: `Action::Quit` saves synchronously and calls `std::process::exit(0)` directly
+  (mirroring `run_chooser`'s identical pattern elsewhere in this crate) — meaning on this one front end,
+  only Ctrl+Q saves a session; the native window-chrome close button doesn't, a real gap versus the other
+  three, worth revisiting if `windows-reactor` ever exposes a public hook.
+
+  Also fixed a genuine pre-existing bug in `browser-windows-reactor`, found during research and required
+  for restore to actually work there: `do_add_page` never actually navigated a new page to the URL it was
+  given — real navigation reads `Page::last_url`, which `PageManager::insert` always left empty, so every
+  new page silently landed on `HOME_URL` regardless of what was requested (masked until now since both
+  existing callers' typed/default URLs also happened to get echoed into the address bar's own separate
+  state). Fixed by setting `last_url` on the freshly-inserted page via the already-`pub` `page_mut`.
 - Separate `EditUrl`/`OpenSwitcher` actions (`browser-core` + `browser-linux-gtk3`): Ctrl+L now opens the
   switcher with the current URL preloaded and fully selected (not blanked); Ctrl+T/F1 keep the old
   blank-search behavior. See `summaries/edit-url-vs-new-page-actions.md`.
