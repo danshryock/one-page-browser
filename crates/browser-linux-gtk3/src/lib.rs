@@ -426,6 +426,45 @@ impl AppState {
         }
     }
 
+    /// The address bar's `focus-in-event` handler's target — opens the
+    /// switcher (preloaded with the active page's URL, same as Ctrl+L) the
+    /// moment the address bar becomes focused, unless the switcher is
+    /// already open. That guard matters for two reasons:
+    /// `open_switcher_common`'s own `grab_focus()` call would otherwise
+    /// recurse back into this same handler (harmless in practice — GTK
+    /// doesn't re-emit focus-in for a widget that's already focused — but
+    /// the guard is what actually matters), and, more importantly,
+    /// refocusing the address bar while the switcher is *already* open
+    /// (e.g. clicking back into it mid-filter) must not clobber whatever
+    /// the user already typed.
+    ///
+    /// `pub` so tests can call this directly rather than relying on a real
+    /// `focus-in-event` firing — confirmed by direct experiment that this
+    /// headless test compositor never actually gives the window real
+    /// window-manager-level focus (`window.is_active()` stays `false` even
+    /// after `Window::present()` and a multi-second settle), so GDK never
+    /// dispatches the underlying focus signal here at all, though
+    /// `Widget::grab_focus()` still updates the widget's own internal focus
+    /// state correctly (`is_focus()` does flip). Same category of gap this
+    /// crate's tests already document for `gtk-test`'s synthetic input,
+    /// just reached from the real-signal side instead.
+    pub fn address_bar_focused(self: &Rc<Self>) {
+        if !self.is_switcher_open() {
+            self.open_switcher_editing_url();
+        }
+    }
+
+    /// Moves keyboard focus from the address bar into the switcher grid —
+    /// Down arrow's role while the address bar has focus (see the
+    /// `address_bar.connect_key_press_event` handler). `FlowBox` already
+    /// supports arrow-key navigation among its children once focus is
+    /// inside it, so this is the only push needed; `child_focus` is the
+    /// standard GTK API for "a container receiving focus from outside via
+    /// keyboard navigation," landing on its first (or last-focused) child.
+    pub fn focus_switcher_grid(&self) {
+        self.flowbox.child_focus(gtk::DirectionType::Down);
+    }
+
     /// Shows the settings overlay, populated from the current `Settings`,
     /// and rebuilds the keybindings editor's rows into the same overlay
     /// (moved here rather than being its own separate overlay/toolbar
@@ -1937,6 +1976,16 @@ impl AppState {
         })
     }
 
+    /// Whether keyboard focus is currently on one of the switcher grid's
+    /// tiles — test/inspection helper for confirming `focus_switcher_grid`
+    /// (Down arrow in the address bar) actually landed somewhere, not just
+    /// that it didn't crash. `FlowBox`'s Browse selection mode keeps exactly
+    /// the keyboard-focused child selected, so this is the same signal the
+    /// Delete-key-closes-a-tile handler already reads.
+    pub fn switcher_grid_has_focused_tile(&self) -> bool {
+        !self.flowbox.selected_children().is_empty()
+    }
+
     /// Currently active page id — test/inspection helper.
     pub fn active_id(&self) -> String {
         self.core.borrow().active_id().to_string()
@@ -2897,11 +2946,26 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         });
     }
     {
+        // Focusing the address bar (a click, Tab, or any other way it
+        // becomes the focus widget) opens the switcher — see
+        // `AppState::address_bar_focused`'s doc comment for the full
+        // reasoning, including why it's guarded on `!is_switcher_open()`.
+        let app = Rc::clone(&app);
+        address_bar.connect_focus_in_event(move |_, _| {
+            app.address_bar_focused();
+            gtk::glib::Propagation::Proceed
+        });
+    }
+    {
         // Ctrl+Enter always opens a fresh page, even when the typed text
         // matches an open page/history entry — checked ahead of the plain
         // `connect_activate` handler below (which GtkEntry still emits
         // afterward for a bare Enter, since we only `Stop` when Ctrl is
-        // actually held).
+        // actually held). Down arrow moves keyboard focus into the tile grid
+        // (`FlowBox` already supports arrow-key navigation among tiles once
+        // focus is inside it — see the Delete-key handler below, which reads
+        // back `flowbox.selected_children()`), so keyboard-only users can
+        // reach the grid without a mouse.
         let app = Rc::clone(&app);
         address_bar.connect_key_press_event(move |entry, event| {
             if !app.is_switcher_open() {
@@ -2911,6 +2975,10 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
             let ctrl_held = event.state().contains(gtk::gdk::ModifierType::CONTROL_MASK);
             if is_enter && ctrl_held {
                 app.force_new_page_from_search(&entry.text());
+                return gtk::glib::Propagation::Stop;
+            }
+            if event.keyval() == gtk::gdk::keys::Key::from_name("Down") {
+                app.focus_switcher_grid();
                 return gtk::glib::Propagation::Stop;
             }
             gtk::glib::Propagation::Proceed

@@ -999,6 +999,84 @@ fn edit_url_opens_switcher_with_current_url_selected_not_blanked() {
 }
 
 #[test]
+fn focusing_address_bar_opens_the_switcher_preloaded_with_current_url() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("focus-opens-switcher");
+        let url_a = fixture_url("page_a.html");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&url_a).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())));
+        assert!(!app.is_switcher_open(), "sanity check: the switcher shouldn't already be open");
+
+        // Exercises the same `AppState::address_bar_focused` the address
+        // bar's real `focus-in-event` handler calls — driven directly
+        // rather than via a real focus change, since this headless test
+        // compositor never actually gives the window real window-manager
+        // focus (confirmed by direct experiment — see that method's doc
+        // comment), so the underlying GDK signal never fires here at all.
+        app.address_bar_focused();
+        assert!(app.is_switcher_open(), "focusing the address bar should open the switcher");
+        assert_eq!(
+            app.address_bar_text(),
+            url_a,
+            "focusing should preload the current URL, same as Ctrl+L, not blank the bar"
+        );
+        assert!(app.address_bar_is_fully_selected(), "the preloaded URL should be fully selected, ready to be typed over");
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn refocusing_address_bar_while_switcher_already_open_does_not_clobber_a_typed_filter() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("refocus-does-not-clobber");
+        let url_a = fixture_url("page_a.html");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&url_a).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())));
+
+        app.open_switcher();
+        app.set_address_bar_text("something the user is mid-typing");
+
+        // Refocusing (e.g. clicking back into the bar) while the switcher is
+        // already open must not reset it back to the current URL — only a
+        // *fresh* focus-in (switcher not yet open) should do that.
+        app.address_bar_focused();
+        assert_eq!(
+            app.address_bar_text(),
+            "something the user is mid-typing",
+            "refocusing an already-open switcher's address bar shouldn't clobber what's typed"
+        );
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn focus_switcher_grid_moves_keyboard_focus_onto_a_tile() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("down-arrow-focuses-grid");
+        let url_a = fixture_url("page_a.html");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&url_a).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())));
+
+        app.open_switcher();
+        assert!(!app.switcher_grid_has_focused_tile(), "sanity check: focus starts in the address bar, not the grid");
+
+        // Exercises the same `AppState::focus_switcher_grid` the address
+        // bar's real Down-arrow key-press handler calls — driven directly
+        // rather than via a synthetic key event, this suite's established
+        // approach for GTK behavior (see this file's module doc comment).
+        app.focus_switcher_grid();
+        assert!(app.switcher_grid_has_focused_tile(), "should move keyboard focus onto a tile in the grid");
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
 fn ctrl_enter_forces_a_new_page_even_when_one_match_exists() {
     run_on_gtk_thread(|| {
         let profile = test_profile("ctrl-enter-force-open");

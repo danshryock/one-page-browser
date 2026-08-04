@@ -197,6 +197,23 @@ build/run instructions.
   reusing `browser_chrome_core`'s palette's first color) — echoing how an open page's tile gets a real color
   while the add-tile stays neutral. Verified with the same throwaway `gdk::Window::pixbuf` screenshot
   technique as the prior entry, removed afterward for the same reason.
+- `browser-linux-gtk3`: focusing the address bar (click, Tab, anything that makes it the focus widget) now
+  opens the switcher immediately, preloaded with the active page's URL — the same "grid, to edit the URL"
+  role `open_switcher_editing_url` already gives Ctrl+L, just triggered by focus instead of a chord. Down
+  arrow while the address bar has focus moves keyboard focus into the tile grid (`FlowBox::child_focus`,
+  the standard GTK API for a container receiving focus from outside via keyboard navigation — the grid
+  already supported arrow-key navigation among tiles once focus was inside it, nothing new needed there).
+  Both handlers' actual logic lives in new `pub` `AppState` methods (`address_bar_focused`/
+  `focus_switcher_grid`) called by the real `connect_focus_in_event`/`connect_key_press_event` handlers,
+  rather than inlined in the closures — confirmed by direct experiment that this headless test compositor
+  never gives the window real window-manager-level focus (`window.is_active()` stays `false` even after
+  `Window::present()` and a multi-second settle, though `Widget::grab_focus()` still updates the widget's
+  own internal focus state), so a real `focus-in-event` can never be exercised here; the extracted methods
+  let tests drive the same logic directly instead — the same category of gap this crate's tests already
+  document for `gtk-test`'s synthetic input, just reached from the real-signal side instead. The
+  focus-opens-switcher guard (`!is_switcher_open()`) is real production logic, not just a reentrancy guard:
+  refocusing the address bar while the switcher is already open (e.g. clicking back into it mid-filter)
+  must not clobber whatever the user already typed, covered by its own test.
 - Separate `EditUrl`/`OpenSwitcher` actions (`browser-core` + `browser-linux-gtk3`): Ctrl+L now opens the
   switcher with the current URL preloaded and fully selected (not blanked); Ctrl+T/F1 keep the old
   blank-search behavior. See `summaries/edit-url-vs-new-page-actions.md`.
