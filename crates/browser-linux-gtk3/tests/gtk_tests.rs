@@ -558,6 +558,57 @@ fn session_saved_on_quit_is_restored_on_next_launch() {
 }
 
 #[test]
+fn restoring_a_session_only_eagerly_loads_the_active_page() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("session-restore-lazy");
+        let url_a = fixture_url("page_a.html");
+        let url_b = fixture_url("page_b.html");
+        let url_c = fixture_url("page_c.html");
+        let id_a;
+
+        {
+            let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+            app.add_page(&url_a).expect("add_page should succeed");
+            id_a = app.active_id();
+            app.add_page(&url_b).expect("add_page should succeed");
+            app.add_page(&url_c).expect("add_page should succeed");
+            app.switch_to(&id_a);
+            app.save_session_for_test();
+        }
+
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.open_start_page_or_restored_session();
+        assert_eq!(app.page_ids().len(), 3, "all three saved pages should be tracked, not just the active one");
+
+        // Restoring shouldn't construct a real webview for anything but the
+        // previously-active page — see `open_start_page_or_restored_session`'s
+        // doc comment for why (avoiding a hang this session's own audio
+        // feature exposed, caused by real, synchronous engine construction
+        // for every restored page piling up before the window is shown).
+        let active_id = app.active_id();
+        assert_eq!(active_id, id_a, "A, not the most-recently-added C, should be active again");
+        assert!(app.is_page_loaded(&active_id), "the previously-active page should be loaded eagerly");
+        assert_eq!(app.page_container_child_count(&active_id), 1, "the active page's webview should be a real, live widget");
+
+        let inactive_ids: Vec<_> = app.page_ids().into_iter().filter(|id| *id != active_id).collect();
+        assert_eq!(inactive_ids.len(), 2);
+        for id in &inactive_ids {
+            assert!(!app.is_page_loaded(id), "restored pages other than the active one shouldn't be eagerly loaded");
+            assert_eq!(app.page_container_child_count(id), 0, "an unloaded restored page shouldn't have a live webview widget yet");
+        }
+
+        // Switching to one lazily builds a real engine for it, same as any
+        // other unloaded page (see `ensure_engine_loaded`).
+        let other_id = inactive_ids[0].clone();
+        app.switch_to(&other_id);
+        assert!(app.is_page_loaded(&other_id));
+        assert_eq!(app.page_container_child_count(&other_id), 1);
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
 fn no_saved_session_falls_back_to_the_configured_start_page() {
     run_on_gtk_thread(|| {
         let profile = test_profile("session-restore-fallback");

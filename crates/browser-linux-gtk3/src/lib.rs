@@ -297,33 +297,51 @@ impl AppState {
         Ok(())
     }
 
+    /// Registers a restored page's URL/title without constructing a real
+    /// engine for it yet — used by `open_start_page_or_restored_session` for
+    /// every restored page except the one that ends up active, so restoring
+    /// a session with several saved tabs doesn't eagerly spin up that many
+    /// real webviews (each a real, synchronous `WryEngine::new` call) before
+    /// the window has even been shown. The engine gets built lazily, the
+    /// same way any other unloaded page's does, the first time the user
+    /// switches to it (`ensure_engine_loaded`).
+    fn add_unloaded_page(&self, url: &str, title: &str) {
+        let id = self.core.borrow_mut().allocate_id();
+
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        self.stack.add_named(&container, &id);
+        container.show_all();
+        self.containers.borrow_mut().insert(id.clone(), container);
+
+        self.core.borrow_mut().insert_unloaded(id, Rc::new(RefCell::new(title.to_string())), url.to_string());
+    }
+
     /// Opens either the saved session's pages (if any) or `start_page` —
     /// the two real startup call sites (a plain launch, and an encrypted
     /// profile's post-unlock handoff) both funnel through this instead of
-    /// each duplicating the loop. Individual `add_page` failures are logged
-    /// and skipped rather than aborting the whole restore (a URL that no
-    /// longer resolves shouldn't cost the user every *other* restored tab).
+    /// each duplicating the loop. Only the page that ends up active gets a
+    /// real engine constructed eagerly (via `add_page`); every other
+    /// restored page is registered via `add_unloaded_page` and loads lazily
+    /// the first time it's switched to — restoring a session with several
+    /// saved tabs shouldn't mean constructing that many real webviews before
+    /// the window is even shown. `add_page` failures are logged and skipped
+    /// rather than aborting the whole restore (a URL that no longer
+    /// resolves shouldn't cost the user every *other* restored tab).
     pub fn open_start_page_or_restored_session(self: &Rc<Self>) {
         let session = Session::load(&self.profile);
         let start_page = self.settings.borrow().start_page.clone();
         let plan = browser_chrome_core::resolve_restore_plan(&session, &start_page);
-        for url in &plan.urls {
-            if let Err(err) = self.add_page(url) {
-                eprintln!("failed to open restored page {url:?}: {err}");
+        let active_index = plan.active_index.unwrap_or(0);
+
+        for (idx, url) in plan.urls.iter().enumerate() {
+            if idx == active_index {
+                if let Err(err) = self.add_page(url) {
+                    eprintln!("failed to open restored page {url:?}: {err}");
+                }
+            } else {
+                let title = session.pages.get(idx).map(|p| p.title.as_str()).unwrap_or_default();
+                self.add_unloaded_page(url, title);
             }
-        }
-        // `add_page` makes each newly-added page active in turn, so without
-        // this the *last* URL in `plan.urls` would end up active regardless
-        // of which one was actually active when the session was saved. The
-        // id is copied out of `core`'s borrow into its own statement before
-        // calling `set_active` (which needs its own borrow) rather than
-        // held across it — otherwise this would panic on the `RefCell`'s
-        // already-borrowed check (a temporary from the borrow in an `if
-        // let` scrutinee lives for the whole `if let`, body included, not
-        // just the condition).
-        let active_page_id = plan.active_index.and_then(|idx| self.core.borrow().pages().get(idx).map(|p| p.id.clone()));
-        if let Some(id) = active_page_id {
-            self.set_active(&id);
         }
     }
 
@@ -391,11 +409,27 @@ impl AppState {
     /// backend, so the real WebKitGTK signal can't be reliably exercised
     /// end-to-end here (same class of gap as `address_bar_focused`'s
     /// real-focus-event limitation).
+    ///
+    /// The flag is set synchronously (so `is_page_playing_audio` reflects it
+    /// immediately), but the switcher-grid rebuild is deferred to the next
+    /// idle main-loop iteration via `idle_add_local_once`, not called
+    /// inline. `connect_is_playing_audio_notify` can fire from deep inside
+    /// `WryEngine::new`'s post-build event-pump workaround (see that
+    /// function's doc comment) — i.e. reentrantly, while GTK is still in
+    /// the middle of processing events for a page that's still under
+    /// construction. Rebuilding the whole grid (destroying and recreating
+    /// every tile) from inside that nested call risks wedging the GTK main
+    /// thread; WebKit's actual media pipeline runs in a separate process,
+    /// so audio can keep playing audibly even while the main process never
+    /// gets back around to mapping its window. Deferring runs the rebuild
+    /// from the top-level main loop instead, once the nested call has
+    /// unwound.
     pub fn set_page_audio_playing(self: &Rc<Self>, id: &str, playing: bool) {
         if let Some(page) = self.core.borrow_mut().page_mut(id) {
             page.is_playing_audio = playing;
         }
-        self.rebuild_switcher_grid();
+        let app = Rc::clone(self);
+        gtk::glib::idle_add_local_once(move || app.rebuild_switcher_grid());
     }
 
     /// Actually tears down the engines for pages `PageManager` just flipped
@@ -487,9 +521,12 @@ impl AppState {
         self.close_profile_picker();
         self.close_bookmarks();
         self.close_passwords();
-        self.rebuild_switcher_grid();
         self.stack.set_sensitive(false);
+        // Shown *before* rebuilding: `rebuild_switcher_grid` skips its work
+        // while the panel isn't visible (see its own doc comment), so this
+        // order is what makes the panel actually populated when it appears.
         self.switcher_panel.show();
+        self.rebuild_switcher_grid();
         self.address_bar.grab_focus();
     }
 
@@ -1894,7 +1931,28 @@ impl AppState {
     /// into `switcher_rows`, which both `connect_child_activated` and
     /// `activate_switcher_row` key off of — one shared activation path for
     /// every row kind, mouse or keyboard.
+    ///
+    /// No-ops while the switcher panel isn't visible: every page-lifecycle
+    /// event that can trigger this (`add_page`, a title/audio-state change,
+    /// closing a page, an eviction) calls it unconditionally, but destroying
+    /// and recreating every tile is real, non-trivial GTK widget work with
+    /// nothing to show for it while the panel is hidden — the common case
+    /// during ordinary single-tab browsing and, especially, during startup
+    /// (`open_start_page_or_restored_session`, which can call `add_page`
+    /// before the window's event loop is even running). Skipping it there
+    /// also closes off a real reentrancy risk: a title/audio-state callback
+    /// can fire from *inside* `WryEngine::new`'s own post-build event-pump
+    /// workaround (see that function's doc comment), i.e. while GTK is
+    /// still mid-construction of that very page's widgets — rebuilding the
+    /// grid from inside that nested call risked wedging the GTK main thread
+    /// (see `set_page_audio_playing`'s doc comment for how that surfaced).
+    /// `open_switcher_common` shows the panel *then* calls this directly
+    /// (not nested inside another pending operation) so it's always
+    /// up to date the moment it becomes visible.
     fn rebuild_switcher_grid(self: &Rc<Self>) {
+        if !self.switcher_panel.is_visible() {
+            return;
+        }
         for child in self.flowbox.children() {
             self.flowbox.remove(&child);
         }

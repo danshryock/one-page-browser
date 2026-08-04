@@ -361,6 +361,47 @@ build/run instructions.
   mechanism, same halign/valign/margin approach, just the opposite corner and `set_no_show_all(true)` +
   conditional `set_visible` instead of always-visible).
 
+  **Follow-up fix**: shipped with a real regression — on a real desktop, restoring a session left the
+  window never appearing at all (confirmed by the reporter: with a page that actually plays audio, audio
+  was audibly playing and stopped when the process was killed, but no window ever showed; reproduced even
+  with a fresh, unrelated profile with no audio involved at all). A first attempt (deferring
+  `set_page_audio_playing`'s `rebuild_switcher_grid()` call to the next idle main-loop tick via
+  `gtk::glib::idle_add_local_once`, reasoning from `connect_is_playing_audio_notify` firing reentrantly
+  from inside `WryEngine::new`'s post-build event-pump workaround) did **not** fix it — confirmed directly
+  by the reporter after rebuilding. The "fresh profile also fails" report ruled out an audio-specific
+  cause and pointed at something more fundamental in the startup path itself, which the reporter correctly
+  diagnosed and proposed the fix for:
+
+  1. `open_start_page_or_restored_session` was eagerly constructing a real `WryEngine` (a real, synchronous
+     `WebViewBuilder::build_gtk` call) for *every* saved page in a loop, all before `gtk::main()` even
+     starts — a session with several saved tabs meant several real webview constructions piling up
+     synchronously pre-event-loop. New `PageManager::insert_unloaded` (`browser-core`) and
+     `AppState::add_unloaded_page` (`browser-linux-gtk3`) register a restored page's URL/title and reserve
+     its stack container *without* building a real engine — the same "unloaded" state
+     `max_loaded_pages` eviction already uses — so restore now only ever eagerly constructs one real
+     engine (whichever page ends up active); every other restored page loads lazily the first time the
+     user switches to it, via the existing `ensure_engine_loaded`.
+  2. `rebuild_switcher_grid()` — a full destroy/recreate of every switcher tile — was called unconditionally
+     from `add_page`, every title-changed and audio-state-changed callback, `close_page`, and eviction,
+     even while the switcher panel is hidden (the common case: normal single-tab browsing, and especially
+     startup, which never opens the switcher at all). It's now a no-op whenever `switcher_panel` isn't
+     visible; `open_switcher_common` was reordered to show the panel *then* call it directly, so it's
+     always fresh the moment it becomes visible. This closes off the general version of the reentrancy risk
+     the first fix attempt only patched for the audio path specifically — any callback (title-changed
+     included) firing reentrantly from inside a nested GTK event-pump can no longer trigger real widget
+     churn while there's nothing on screen to show for it.
+
+  New `browser-core` test (`insert_unloaded_registers_a_page_without_an_engine_or_touching_active_id`) and
+  `browser-linux-gtk3` test (`restoring_a_session_only_eagerly_loads_the_active_page`, verifying via
+  `page_container_child_count` that only the active page gets a real widget and that switching to another
+  restored page lazily builds one) both pass; full regression (`browser-core`'s 124 tests,
+  `browser-chrome-core`, the gtk3 headless suite — now 37 tests — workspace-wide `cargo check`) stayed
+  green throughout. As with the first attempt, the real bug could only be partially verified from this
+  session: this session's own window-visibility reproduction methodology (checking `xwininfo` for a newly
+  mapped window around a background-launched process) turned out unable to detect a window either way, even
+  for the last known-good commit used as a control, so this fix — like the first — needs a real
+  confirm-it-shows-a-window check on an actual desktop before being trusted as fully resolved.
+
 ## Next
 
 **`crates/browser-windows-reactor`** — a new, sixth front end, replacing `browser-windows-winui`'s

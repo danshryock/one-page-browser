@@ -144,6 +144,28 @@ impl<E> PageManager<E> {
         id
     }
 
+    /// Registers a page with no live engine yet and does *not* make it
+    /// active — used by session restore for every saved page except the one
+    /// that ends up active, so restoring a session with several saved tabs
+    /// doesn't eagerly construct that many real engines (each a real,
+    /// synchronous webview construction) before the window has even been
+    /// shown. `install_engine` builds the real engine lazily, the same way
+    /// any other unloaded page's does, the first time the caller switches
+    /// to it.
+    pub fn insert_unloaded(&mut self, id: String, title: Rc<RefCell<String>>, last_url: String) {
+        let color = PALETTE[self.pages.len() % PALETTE.len()];
+        self.pages.push(Page {
+            id,
+            engine: None,
+            title,
+            color,
+            loaded: false,
+            is_playing_audio: false,
+            last_accessed: Instant::now(),
+            last_url,
+        });
+    }
+
     /// Adds an already-constructed page and makes it active. `title` is
     /// taken as a parameter (rather than created here) so the caller can
     /// clone it into the engine's title-changed callback before this call —
@@ -334,6 +356,23 @@ mod tests {
         assert_eq!(mgr.active_id(), id);
         assert!(mgr.is_page_loaded(&id));
         assert_eq!(mgr.loaded_page_count(), 1);
+    }
+
+    #[test]
+    fn insert_unloaded_registers_a_page_without_an_engine_or_touching_active_id() {
+        let mut mgr: PageManager<MockEngine> = PageManager::new(None);
+        let existing_active = insert_page(&mut mgr, "https://a.example");
+
+        let id = mgr.allocate_id();
+        mgr.insert_unloaded(id.clone(), Rc::new(RefCell::new("Saved Title".to_string())), "https://b.example".to_string());
+
+        assert_eq!(mgr.active_id(), existing_active, "insert_unloaded shouldn't steal active-page status");
+        assert!(!mgr.is_page_loaded(&id));
+        assert_eq!(mgr.loaded_page_count(), 1, "the unloaded page shouldn't count against the loaded limit");
+        let page = mgr.page(&id).expect("the page should still be tracked");
+        assert!(page.engine.is_none());
+        assert_eq!(page.title.borrow().as_str(), "Saved Title");
+        assert_eq!(page.current_url(), "https://b.example");
     }
 
     #[test]
