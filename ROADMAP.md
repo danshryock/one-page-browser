@@ -187,6 +187,16 @@ build/run instructions.
   bookmarks/passwords/profile's simpler ones — confirmed experimentally, not guessed) — removed afterward,
   since this codebase doesn't do pixel-diff regression testing and a screenshot-capture test would just be
   ongoing maintenance burden for a one-time visual check.
+- `browser-linux-gtk3` settings tabs follow-up: Bitwarden moved out of the General tab into its own
+  "Password Managers" tab (a generic name, not "Bitwarden" — other backends are a real possibility per
+  ROADMAP's Backlog, each landing as its own subsection there later). The tab switcher itself (`gtk::
+  StackSwitcher`) now looks like the switcher grid's page tiles rather than plain text: removed the
+  `.linked` style GTK applies by default (a fused, segmented-control look) so each tab renders as its own
+  separately rounded card, and added CSS (`.settings-box stackswitcher > button`) giving inactive tabs the
+  same translucent-white look as the switcher's add-tile and the active tab a solid accent color (`#3b6fd4`,
+  reusing `browser_chrome_core`'s palette's first color) — echoing how an open page's tile gets a real color
+  while the add-tile stays neutral. Verified with the same throwaway `gdk::Window::pixbuf` screenshot
+  technique as the prior entry, removed afterward for the same reason.
 - Separate `EditUrl`/`OpenSwitcher` actions (`browser-core` + `browser-linux-gtk3`): Ctrl+L now opens the
   switcher with the current URL preloaded and fully selected (not blanked); Ctrl+T/F1 keep the old
   blank-search behavior. See `summaries/edit-url-vs-new-page-actions.md`.

@@ -2249,7 +2249,11 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
                 font-size: 11px; margin-top: 10px; } \
               .settings-box button, .settings-box button:hover { background-image: none; \
                 background-color: transparent; border: none; box-shadow: none; } \
-              .settings-box button label { color: rgba(255, 255, 255, 0.92); }",
+              .settings-box button label { color: rgba(255, 255, 255, 0.92); } \
+              .settings-box stackswitcher > button { background-image: none; \
+                background-color: rgba(255, 255, 255, 0.15); border: none; box-shadow: none; \
+                border-radius: 10px; margin: 0 4px 0 0; padding: 8px 14px; } \
+              .settings-box stackswitcher > button:checked { background-color: #3b6fd4; }",
         );
         gtk::StyleContext::add_provider_for_screen(&screen, &base_provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
         gtk::StyleContext::add_provider_for_screen(&screen, &theme_provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -2451,17 +2455,23 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     settings_title.set_halign(gtk::Align::Start);
     settings_box.pack_start(&settings_title, false, false, 0);
 
-    // Three tabs (General, Search Engines, Keybindings) via a plain
-    // `gtk::Stack`/`gtk::StackSwitcher` pair — reuses the exact widget
-    // classes already in this dependency (no new crate), distinct from
-    // `self.stack` (the *page* stack, an unrelated concept). Each tab's own
-    // heading label (redundant with the switcher's own tab title) is
-    // dropped; "Bitwarden" keeps its subtitle since it's a subsection
-    // within the General tab, not a tab of its own.
+    // Four tabs (General, Search Engines, Password Managers, Keybindings)
+    // via a plain `gtk::Stack`/`gtk::StackSwitcher` pair — reuses the exact
+    // widget classes already in this dependency (no new crate), distinct
+    // from `self.stack` (the *page* stack, an unrelated concept). Each
+    // tab's own heading label (redundant with the switcher's own tab
+    // title) is dropped.
     let settings_stack = gtk::Stack::new();
     settings_stack.set_vexpand(true);
     let settings_stack_switcher = gtk::StackSwitcher::new();
     settings_stack_switcher.set_stack(Some(&settings_stack));
+    // `StackSwitcher` applies GTK's own "linked" style by default (a fused,
+    // segmented-control look — square-jointed buttons sharing edges).
+    // Removed so each tab renders as its own separate, individually
+    // rounded card instead, matching the switcher grid's tiles (see the
+    // `.settings-box stackswitcher > button` CSS in `build_window_and_app`)
+    // — the look this was actually asked to match.
+    settings_stack_switcher.style_context().remove_class("linked");
     settings_box.pack_start(&settings_stack_switcher, false, false, 0);
     settings_box.pack_start(&settings_stack, true, true, 0);
 
@@ -2497,24 +2507,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     theme_row.pack_start(&dark_theme_radio, false, false, 0);
     theme_row.pack_start(&light_theme_radio, false, false, 0);
     general_page.pack_start(&theme_row, false, false, 0);
-
-    let bitwarden_subtitle = gtk::Label::new(Some("Bitwarden"));
-    bitwarden_subtitle.style_context().add_class("settings-subtitle");
-    bitwarden_subtitle.set_halign(gtk::Align::Start);
-    general_page.pack_start(&bitwarden_subtitle, false, false, 0);
-
-    // Bitwarden integration: a checkbox plus its server URL, always shown
-    // side by side (unlike the loaded-pages limit's conditionally-disabled
-    // spin button) since there's only one field to fill in.
-    let bitwarden_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let bitwarden_check = gtk::CheckButton::new();
-    bitwarden_check.set_label("Enable Bitwarden (via bw serve)");
-    let bitwarden_url_entry = gtk::Entry::new();
-    bitwarden_url_entry.set_placeholder_text(Some("http://127.0.0.1:8087"));
-    bitwarden_url_entry.set_hexpand(true);
-    bitwarden_row.pack_start(&bitwarden_check, false, false, 0);
-    bitwarden_row.pack_start(&bitwarden_url_entry, true, true, 0);
-    general_page.pack_start(&bitwarden_row, false, false, 0);
 
     settings_stack.add_titled(&general_page, "general", "General");
 
@@ -2553,6 +2545,34 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     search_engines_page.pack_start(&new_engine_row, false, false, 0);
 
     settings_stack.add_titled(&search_engines_page, "search-engines", "Search Engines");
+
+    // ---- Password Managers tab ----
+    // Just Bitwarden for now — a generic name rather than a per-backend one
+    // since other backends are a real, if not-yet-built, possibility (see
+    // ROADMAP.md's Backlog: KeePassXC/secret-service, 1Password), each of
+    // which would land as its own subsection here, "Bitwarden" keeping its
+    // subtitle to distinguish it from whichever else eventually joins it.
+    let password_managers_page = gtk::Box::new(gtk::Orientation::Vertical, 8);
+
+    let bitwarden_subtitle = gtk::Label::new(Some("Bitwarden"));
+    bitwarden_subtitle.style_context().add_class("settings-subtitle");
+    bitwarden_subtitle.set_halign(gtk::Align::Start);
+    password_managers_page.pack_start(&bitwarden_subtitle, false, false, 0);
+
+    // A checkbox plus its server URL, always shown side by side (unlike the
+    // loaded-pages limit's conditionally-disabled spin button) since
+    // there's only one field to fill in.
+    let bitwarden_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let bitwarden_check = gtk::CheckButton::new();
+    bitwarden_check.set_label("Enable Bitwarden (via bw serve)");
+    let bitwarden_url_entry = gtk::Entry::new();
+    bitwarden_url_entry.set_placeholder_text(Some("http://127.0.0.1:8087"));
+    bitwarden_url_entry.set_hexpand(true);
+    bitwarden_row.pack_start(&bitwarden_check, false, false, 0);
+    bitwarden_row.pack_start(&bitwarden_url_entry, true, true, 0);
+    password_managers_page.pack_start(&bitwarden_row, false, false, 0);
+
+    settings_stack.add_titled(&password_managers_page, "password-managers", "Password Managers");
 
     // ---- Keybindings tab ----
     // One row per `Action::ALL`, rebuilt from the current `Keybindings` each
