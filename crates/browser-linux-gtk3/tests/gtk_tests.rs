@@ -1202,14 +1202,17 @@ fn switching_to_light_theme_reloads_the_theme_css() {
         let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
 
         // Dark is the default, so the theme provider should start out with
-        // dark-theme rules (a dark settings-box background) applied at
-        // startup by `apply_theme`. Checking for GTK's own re-serialized
-        // form (`rgb(46,46,44)`, not the literal `#2e2e2c` source text) —
-        // `CssProvider::to_str()` returns the *parsed* stylesheet rendered
-        // back out in its own canonical form, confirmed by inspecting the
-        // actual output while writing this test, not assumed.
+        // dark-theme rules — the switcher grid's `.history-tile` background
+        // is the surface that's still actually theme-dependent (the
+        // settings/profile/keybindings/bookmarks/passwords overlay boxes no
+        // longer have a background of their own — see `base_provider`'s doc
+        // comment in `build_window_and_app`). Checking for GTK's own
+        // re-serialized form, not the literal source text — `CssProvider::
+        // to_str()` returns the *parsed* stylesheet rendered back out in its
+        // own canonical form, confirmed by inspecting the actual output
+        // while writing this test, not assumed.
         assert!(
-            app.theme_provider_css().contains("rgb(46,46,44)"),
+            app.theme_provider_css().contains("rgba(255,255,255,0.12)"),
             "the theme provider should start with the default dark theme's CSS"
         );
 
@@ -1218,11 +1221,11 @@ fn switching_to_light_theme_reloads_the_theme_css() {
         app.save_settings();
 
         assert!(
-            app.theme_provider_css().contains("rgb(242,242,240)"),
+            app.theme_provider_css().contains("rgba(0,0,0,0.06)"),
             "saving with the light theme selected should reload the theme provider with light-theme CSS"
         );
         assert!(
-            !app.theme_provider_css().contains("rgb(46,46,44)"),
+            !app.theme_provider_css().contains("rgba(255,255,255,0.12)"),
             "the old dark-theme CSS shouldn't still be loaded after switching to light"
         );
 

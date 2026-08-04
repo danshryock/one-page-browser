@@ -2115,18 +2115,16 @@ fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// CSS for the theme-dependent rules only — everything that has a real
-/// background surface of its own: the settings/profile/keybindings/
-/// bookmarks overlay boxes (all share `.settings-box`) and the switcher
-/// grid's history/bookmark search-result tiles. See the comment where
-/// `theme_provider` is created in `build_window_and_app` for why nothing
-/// else needs to vary by theme.
+/// CSS for the theme-dependent rules only — the switcher grid's history/
+/// bookmark/similar search-result tiles, the only surfaces left with a real
+/// background of their own now that the settings/profile/keybindings/
+/// bookmarks/passwords overlay boxes sit directly on the scrim (see
+/// `base_provider`'s doc comment in `build_window_and_app`). Nothing else
+/// needs to vary by theme.
 fn theme_css(theme: Theme) -> &'static str {
     match theme {
         Theme::Dark => {
-            ".settings-box { background-color: #2e2e2c; border-radius: 10px; padding: 16px; } \
-             .settings-title { color: #ffffff; font-weight: 600; font-size: 14px; } \
-             .history-tile { background-image: none; background-color: rgba(255, 255, 255, 0.12); \
+            ".history-tile { background-image: none; background-color: rgba(255, 255, 255, 0.12); \
                border: 1px dashed rgba(255, 255, 255, 0.3); box-shadow: none; border-radius: 10px; \
                color: #fff; opacity: 0.75; } \
              .bookmark-tile { background-image: none; background-color: rgba(212, 175, 55, 0.18); \
@@ -2134,18 +2132,10 @@ fn theme_css(theme: Theme) -> &'static str {
                color: #fff; opacity: 0.85; } \
              .similar-tile { background-image: none; background-color: rgba(90, 200, 180, 0.16); \
                border: 1px dashed rgba(90, 200, 180, 0.5); box-shadow: none; border-radius: 10px; \
-               color: #fff; opacity: 0.8; } \
-             .settings-box label:not(.settings-title) { color: rgba(255, 255, 255, 0.92); } \
-             .settings-box label.settings-subtitle { color: rgba(255, 255, 255, 0.6); font-weight: 600; \
-               font-size: 11px; margin-top: 10px; } \
-             .settings-box button.flat, .settings-box button.flat:hover { \
-               background-image: none; background-color: transparent; } \
-             .settings-box button.flat label { color: rgba(255, 255, 255, 0.92); }"
+               color: #fff; opacity: 0.8; }"
         }
         Theme::Light => {
-            ".settings-box { background-color: #f2f2f0; border-radius: 10px; padding: 16px; } \
-             .settings-title { color: #1a1a1a; font-weight: 600; font-size: 14px; } \
-             .history-tile { background-image: none; background-color: rgba(0, 0, 0, 0.06); \
+            ".history-tile { background-image: none; background-color: rgba(0, 0, 0, 0.06); \
                border: 1px dashed rgba(0, 0, 0, 0.25); box-shadow: none; border-radius: 10px; \
                color: #1a1a1a; opacity: 0.85; } \
              .bookmark-tile { background-image: none; background-color: rgba(180, 140, 20, 0.14); \
@@ -2153,13 +2143,7 @@ fn theme_css(theme: Theme) -> &'static str {
                color: #1a1a1a; opacity: 0.9; } \
              .similar-tile { background-image: none; background-color: rgba(20, 140, 120, 0.12); \
                border: 1px dashed rgba(20, 140, 120, 0.4); box-shadow: none; border-radius: 10px; \
-               color: #1a1a1a; opacity: 0.9; } \
-             .settings-box label:not(.settings-title) { color: rgba(0, 0, 0, 0.82); } \
-             .settings-box label.settings-subtitle { color: rgba(0, 0, 0, 0.55); font-weight: 600; \
-               font-size: 11px; margin-top: 10px; } \
-             .settings-box button.flat, .settings-box button.flat:hover { \
-               background-image: none; background-color: transparent; } \
-             .settings-box button.flat label { color: rgba(0, 0, 0, 0.82); }"
+               color: #1a1a1a; opacity: 0.9; }"
         }
     }
 }
@@ -2236,12 +2220,14 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         // sit over the scrim (a dark, translucent dimmer over the page
         // behind — see `scrim_css` below), which stays the same dark tone
         // regardless of the app's own light/dark theme, the same convention
-        // most apps' modal dimmers use. Only surfaces with a real
-        // *background of their own* (the settings/profile/keybindings/
-        // bookmarks overlay boxes, and the history/bookmark search-result
-        // tiles) actually need theme-dependent colors — those live in
-        // `theme_provider`/`theme_css` instead, reloaded by `apply_theme`
-        // whenever the theme changes.
+        // most apps' modal dimmers use. The settings/profile/keybindings/
+        // bookmarks/passwords overlay boxes used to have a real background
+        // of their own (hence theme-dependent colors, in `theme_provider`/
+        // `theme_css`) — they no longer do (`.settings-box` sits directly on
+        // the scrim now, same as the switcher grid), so their text/button
+        // rules moved here too: only the history/bookmark/similar
+        // search-result tiles (which *do* still have their own background)
+        // remain theme-dependent.
         let base_provider = gtk::CssProvider::new();
         let _ = base_provider.load_from_data(
             b".tile-title { color: #ffffff; font-weight: 600; } \
@@ -2255,7 +2241,15 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
               .tile-close-label { color: #ffffff; } \
               .switcher-hint { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
               .switcher-profile-label { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
-              .page-tile-unloaded { opacity: 0.5; }",
+              .page-tile-unloaded { opacity: 0.5; } \
+              .settings-box { padding: 16px; } \
+              .settings-title { color: #ffffff; font-weight: 600; font-size: 14px; } \
+              .settings-box label:not(.settings-title) { color: rgba(255, 255, 255, 0.92); } \
+              .settings-box label.settings-subtitle { color: rgba(255, 255, 255, 0.6); font-weight: 600; \
+                font-size: 11px; margin-top: 10px; } \
+              .settings-box button, .settings-box button:hover { background-image: none; \
+                background-color: transparent; border: none; box-shadow: none; } \
+              .settings-box button label { color: rgba(255, 255, 255, 0.92); }",
         );
         gtk::StyleContext::add_provider_for_screen(&screen, &base_provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
         gtk::StyleContext::add_provider_for_screen(&screen, &theme_provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -2457,17 +2451,29 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     settings_title.set_halign(gtk::Align::Start);
     settings_box.pack_start(&settings_title, false, false, 0);
 
-    let general_subtitle = gtk::Label::new(Some("General"));
-    general_subtitle.style_context().add_class("settings-subtitle");
-    general_subtitle.set_halign(gtk::Align::Start);
-    settings_box.pack_start(&general_subtitle, false, false, 0);
+    // Three tabs (General, Search Engines, Keybindings) via a plain
+    // `gtk::Stack`/`gtk::StackSwitcher` pair — reuses the exact widget
+    // classes already in this dependency (no new crate), distinct from
+    // `self.stack` (the *page* stack, an unrelated concept). Each tab's own
+    // heading label (redundant with the switcher's own tab title) is
+    // dropped; "Bitwarden" keeps its subtitle since it's a subsection
+    // within the General tab, not a tab of its own.
+    let settings_stack = gtk::Stack::new();
+    settings_stack.set_vexpand(true);
+    let settings_stack_switcher = gtk::StackSwitcher::new();
+    settings_stack_switcher.set_stack(Some(&settings_stack));
+    settings_box.pack_start(&settings_stack_switcher, false, false, 0);
+    settings_box.pack_start(&settings_stack, true, true, 0);
+
+    // ---- General tab ----
+    let general_page = gtk::Box::new(gtk::Orientation::Vertical, 8);
 
     let start_page_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     start_page_row.pack_start(&gtk::Label::new(Some("Start page")), false, false, 0);
     let start_page_entry = gtk::Entry::new();
     start_page_entry.set_hexpand(true);
     start_page_row.pack_start(&start_page_entry, true, true, 0);
-    settings_box.pack_start(&start_page_row, false, false, 0);
+    general_page.pack_start(&start_page_row, false, false, 0);
 
     let limit_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     limit_row.pack_start(&gtk::Label::new(Some("Loaded pages limit")), false, false, 0);
@@ -2482,7 +2488,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     }
     limit_row.pack_start(&unlimited_check, false, false, 0);
     limit_row.pack_start(&limit_spin, false, false, 0);
-    settings_box.pack_start(&limit_row, false, false, 0);
+    general_page.pack_start(&limit_row, false, false, 0);
 
     let theme_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     theme_row.pack_start(&gtk::Label::new(Some("Theme")), false, false, 0);
@@ -2490,48 +2496,12 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     let light_theme_radio = gtk::RadioButton::with_label_from_widget(&dark_theme_radio, "Light");
     theme_row.pack_start(&dark_theme_radio, false, false, 0);
     theme_row.pack_start(&light_theme_radio, false, false, 0);
-    settings_box.pack_start(&theme_row, false, false, 0);
-
-    let search_engines_subtitle = gtk::Label::new(Some("Search Engines"));
-    search_engines_subtitle.style_context().add_class("settings-subtitle");
-    search_engines_subtitle.set_halign(gtk::Align::Start);
-    settings_box.pack_start(&search_engines_subtitle, false, false, 0);
-
-    let engine_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    engine_row.pack_start(&gtk::Label::new(Some("Search engine")), false, false, 0);
-    // Populated for real (from the live per-profile Settings, not this
-    // hardcoded default) by `refresh_engine_combo`, called from
-    // `open_settings` every time it opens — left empty here since nothing
-    // shows until the overlay is opened anyway.
-    let engine_combo = gtk::ComboBoxText::new();
-    engine_row.pack_start(&engine_combo, true, true, 0);
-    settings_box.pack_start(&engine_row, false, false, 0);
-
-    // Search engine management: add/remove entries from Settings::search_engines.
-    // Unlike the fields above (staged until Save), these take effect and save
-    // immediately on each add/remove — the same immediate-save convention this
-    // session's bookmarks/keybindings editors already use, rather than adding a
-    // separate staged/cancel-able list-editing model just for this section.
-    let engines_list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    settings_box.pack_start(&engines_list_box, false, false, 0);
-
-    let new_engine_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let new_engine_name_entry = gtk::Entry::new();
-    new_engine_name_entry.set_placeholder_text(Some("Name"));
-    new_engine_name_entry.set_hexpand(true);
-    let new_engine_url_entry = gtk::Entry::new();
-    new_engine_url_entry.set_placeholder_text(Some("https://example.com/search?q={query}"));
-    new_engine_url_entry.set_hexpand(true);
-    let add_engine_button = gtk::Button::with_label("Add engine");
-    new_engine_row.pack_start(&new_engine_name_entry, true, true, 0);
-    new_engine_row.pack_start(&new_engine_url_entry, true, true, 0);
-    new_engine_row.pack_start(&add_engine_button, false, false, 0);
-    settings_box.pack_start(&new_engine_row, false, false, 0);
+    general_page.pack_start(&theme_row, false, false, 0);
 
     let bitwarden_subtitle = gtk::Label::new(Some("Bitwarden"));
     bitwarden_subtitle.style_context().add_class("settings-subtitle");
     bitwarden_subtitle.set_halign(gtk::Align::Start);
-    settings_box.pack_start(&bitwarden_subtitle, false, false, 0);
+    general_page.pack_start(&bitwarden_subtitle, false, false, 0);
 
     // Bitwarden integration: a checkbox plus its server URL, always shown
     // side by side (unlike the loaded-pages limit's conditionally-disabled
@@ -2544,29 +2514,61 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     bitwarden_url_entry.set_hexpand(true);
     bitwarden_row.pack_start(&bitwarden_check, false, false, 0);
     bitwarden_row.pack_start(&bitwarden_url_entry, true, true, 0);
-    settings_box.pack_start(&bitwarden_row, false, false, 0);
+    general_page.pack_start(&bitwarden_row, false, false, 0);
 
-    // Keybindings editor, folded into the settings overlay rather than
-    // being its own separate destination — one row per `Action::ALL`,
-    // rebuilt from the current `Keybindings` each time settings opens and
-    // after every add/remove. Wrapped in a `ScrolledWindow` (rather than
-    // just packed straight into `settings_box`) since ~10 actions' worth of
-    // rows alongside the settings fields above would otherwise make the
-    // overlay taller than comfortably fits on screen.
-    settings_box.pack_start(&gtk::Separator::new(gtk::Orientation::Horizontal), false, false, 4);
+    settings_stack.add_titled(&general_page, "general", "General");
 
-    let keybindings_title = gtk::Label::new(Some("Keybindings"));
-    keybindings_title.style_context().add_class("settings-title");
-    keybindings_title.set_halign(gtk::Align::Start);
-    settings_box.pack_start(&keybindings_title, false, false, 0);
+    // ---- Search Engines tab ----
+    let search_engines_page = gtk::Box::new(gtk::Orientation::Vertical, 8);
 
+    let engine_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    engine_row.pack_start(&gtk::Label::new(Some("Search engine")), false, false, 0);
+    // Populated for real (from the live per-profile Settings, not this
+    // hardcoded default) by `refresh_engine_combo`, called from
+    // `open_settings` every time it opens — left empty here since nothing
+    // shows until the overlay is opened anyway.
+    let engine_combo = gtk::ComboBoxText::new();
+    engine_row.pack_start(&engine_combo, true, true, 0);
+    search_engines_page.pack_start(&engine_row, false, false, 0);
+
+    // Search engine management: add/remove entries from Settings::search_engines.
+    // Unlike the fields above (staged until Save), these take effect and save
+    // immediately on each add/remove — the same immediate-save convention this
+    // session's bookmarks/keybindings editors already use, rather than adding a
+    // separate staged/cancel-able list-editing model just for this section.
+    let engines_list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    search_engines_page.pack_start(&engines_list_box, false, false, 0);
+
+    let new_engine_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let new_engine_name_entry = gtk::Entry::new();
+    new_engine_name_entry.set_placeholder_text(Some("Name"));
+    new_engine_name_entry.set_hexpand(true);
+    let new_engine_url_entry = gtk::Entry::new();
+    new_engine_url_entry.set_placeholder_text(Some("https://example.com/search?q={query}"));
+    new_engine_url_entry.set_hexpand(true);
+    let add_engine_button = gtk::Button::with_label("Add engine");
+    new_engine_row.pack_start(&new_engine_name_entry, true, true, 0);
+    new_engine_row.pack_start(&new_engine_url_entry, true, true, 0);
+    new_engine_row.pack_start(&add_engine_button, false, false, 0);
+    search_engines_page.pack_start(&new_engine_row, false, false, 0);
+
+    settings_stack.add_titled(&search_engines_page, "search-engines", "Search Engines");
+
+    // ---- Keybindings tab ----
+    // One row per `Action::ALL`, rebuilt from the current `Keybindings` each
+    // time settings opens and after every add/remove. `vexpand` on the
+    // `ScrolledWindow` rather than a fixed `max_content_height` — this tab
+    // now has the overlay's full height to itself, not a shared column
+    // alongside every other setting.
+    let keybindings_page = gtk::Box::new(gtk::Orientation::Vertical, 8);
     let keybindings_list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let keybindings_scroll = gtk::ScrolledWindow::new(gtk::Adjustment::NONE, gtk::Adjustment::NONE);
     keybindings_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    keybindings_scroll.set_propagate_natural_height(true);
-    keybindings_scroll.set_max_content_height(260);
+    keybindings_scroll.set_vexpand(true);
     keybindings_scroll.add(&keybindings_list_box);
-    settings_box.pack_start(&keybindings_scroll, true, true, 0);
+    keybindings_page.pack_start(&keybindings_scroll, true, true, 0);
+
+    settings_stack.add_titled(&keybindings_page, "keybindings", "Keybindings");
 
     let settings_buttons_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     settings_buttons_row.set_halign(gtk::Align::End);

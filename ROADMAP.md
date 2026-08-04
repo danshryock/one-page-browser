@@ -164,6 +164,29 @@ build/run instructions.
   arms (not stubs) calling the same `PageManager` helper, but deliberately no raw-key-table recognition of
   Tab/PageUp/PageDown this pass — unverifiable-from-Linux work for Windows/macOS specifically scoped out, so
   the binding exists in `Keybindings::default()` but isn't reachable via a physical key on those three yet.
+- `browser-linux-gtk3` overlay redesign follow-up: removed `.settings-box`'s own opaque background
+  (`#2e2e2c`/`#f2f2f0` per theme) entirely — these overlays now sit directly on the scrim, the same way the
+  switcher grid always has, rather than a solid card. Since that background was the only thing making
+  `.settings-box`'s text/button colors theme-*dependent*, those rules moved from `theme_css`/`theme_provider`
+  into `base_provider` (loaded once, theme-invariant) — only the switcher grid's history/bookmark/similar
+  tiles (which do still have their own background) remain theme-dependent. Also fixed illegible white-on-white
+  text on every *non-flat* button in these overlays (Cancel/Save/Close/Unlock/Add engine/etc.) — the prior
+  `.settings-box label:not(.settings-title)` rule already forced light text onto every label including button
+  labels, but only flat buttons (transparent background) had their own background stripped to match;
+  non-flat buttons kept the system theme's default (often light/white) button chrome underneath that same
+  light text. Fixed by broadening the CSS selector from `.settings-box button.flat` to plain
+  `.settings-box button` — every button in these four overlays is transparent/borderless now, not just the
+  ones explicitly marked `.flat` in Rust, so no button-construction code needed touching. Settings also split
+  into three tabs (`gtk::Stack`/`gtk::StackSwitcher`, reusing widget classes already in this dependency) —
+  General (start page, loaded-pages limit, theme, Bitwarden), Search Engines, and Keybindings — replacing the
+  single long scrolling column; each tab's own heading label was dropped as redundant with the switcher's tab
+  title, but "Bitwarden" keeps its subtitle since it's a subsection within General, not a tab of its own.
+  Verified visually, not just via the test suite: wrote a throwaway integration test using
+  `gdk::Window::pixbuf` to grab real window screenshots under `xwfb-run -c cage` (this headless compositor
+  needs several warm-up frames after first showing a window, and settings' heavier layout needed more than
+  bookmarks/passwords/profile's simpler ones — confirmed experimentally, not guessed) — removed afterward,
+  since this codebase doesn't do pixel-diff regression testing and a screenshot-capture test would just be
+  ongoing maintenance burden for a one-time visual check.
 - Separate `EditUrl`/`OpenSwitcher` actions (`browser-core` + `browser-linux-gtk3`): Ctrl+L now opens the
   switcher with the current URL preloaded and fully selected (not blanked); Ctrl+T/F1 keep the old
   blank-search behavior. See `summaries/edit-url-vs-new-page-actions.md`.
