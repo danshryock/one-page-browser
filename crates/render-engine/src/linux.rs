@@ -13,11 +13,19 @@ impl WryEngine {
         container: &W,
         initial_url: &str,
         on_title_changed: impl Fn(String) + 'static,
+        on_audio_playing_changed: impl Fn(bool) + 'static,
     ) -> anyhow::Result<Self> {
         let webview = WebViewBuilder::new()
             .with_url(initial_url)
             .with_document_title_changed_handler(move |title| on_title_changed(title))
             .build_gtk(container)?;
+
+        // `is-playing-audio` isn't a wry builder hook — connect straight to
+        // the underlying webkit2gtk object via the same Unix escape hatch
+        // `screenshot()` below already uses.
+        webview.webview().connect_is_playing_audio_notify(move |wv| {
+            on_audio_playing_changed(wv.is_playing_audio());
+        });
 
         // WebKitGTK's fire-and-forget `evaluate_script` (no callback, used by
         // go_back/go_forward) is unreliable on a freshly-built webview — it

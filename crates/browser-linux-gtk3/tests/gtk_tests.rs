@@ -183,7 +183,7 @@ fn navigation_back_forward_reload() {
         window.add(&content);
         window.show_all();
 
-        let engine = WryEngine::new(&content, &url_a, |_| {}).expect("WryEngine::new should succeed");
+        let engine = WryEngine::new(&content, &url_a, |_| {}, |_| {}).expect("WryEngine::new should succeed");
         assert!(
             wait_until(|| engine.current_url().ok().as_deref() == Some(url_a.as_str())),
             "initial load should reach page A"
@@ -227,9 +227,14 @@ fn reader_mode_toggles_on_and_off() {
 
         let title = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
         let title_for_cb = std::rc::Rc::clone(&title);
-        let engine = WryEngine::new(&content, &url_a, move |new_title| {
-            *title_for_cb.borrow_mut() = new_title;
-        })
+        let engine = WryEngine::new(
+            &content,
+            &url_a,
+            move |new_title| {
+                *title_for_cb.borrow_mut() = new_title;
+            },
+            |_| {},
+        )
         .expect("WryEngine::new should succeed");
         assert!(wait_until(|| *title.borrow() == "Page A"), "initial load should reach page A");
 
@@ -1392,6 +1397,59 @@ fn encrypted_profile_records_visits_through_the_real_app() {
             wait_until(|| !verify.search("page a", 10).unwrap_or_default().is_empty()),
             "a visit made through the app should be readable back from a separate connection to the same encrypted database"
         );
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn set_page_audio_playing_toggles_the_tracked_state() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("audio-playing-toggle");
+        let url_a = fixture_url("page_a.html");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&url_a).expect("add_page should succeed");
+        let id_a = app.active_id();
+        assert!(!app.is_page_playing_audio(&id_a), "sanity check: a freshly added page shouldn't start out playing audio");
+
+        // Exercises the same `AppState::set_page_audio_playing` the real
+        // `connect_is_playing_audio_notify` handler (wired in `add_page`/
+        // `ensure_engine_loaded`) calls — driven directly rather than via a
+        // real WebKitGTK audio-state change, since this headless test
+        // compositor has no confirmed audio backend to actually play
+        // anything and exercise the real signal end-to-end (same class of
+        // gap as `address_bar_focused`'s real-focus-event limitation).
+        app.set_page_audio_playing(&id_a, true);
+        assert!(app.is_page_playing_audio(&id_a), "should track that the page started playing audio");
+
+        app.set_page_audio_playing(&id_a, false);
+        assert!(!app.is_page_playing_audio(&id_a), "should track that the page stopped playing audio");
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn unloading_a_page_clears_its_audio_playing_state() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("audio-playing-unload");
+        let url_a = fixture_url("page_a.html");
+        let url_b = fixture_url("page_b.html");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&url_a).expect("add_page should succeed");
+        let id_a = app.active_id();
+        app.add_page(&url_b).expect("add_page should succeed");
+
+        app.set_page_audio_playing(&id_a, true);
+        assert!(app.is_page_playing_audio(&id_a), "sanity check: the flag should be set before eviction");
+
+        // Tightening the limit to 1 with B active forces A's engine to be
+        // torn down (same eviction path `loaded_page_limit_evicts_and_reclaims`
+        // exercises) — a page with no live engine can't be playing audio,
+        // so the stale flag should be cleared, not left dangling.
+        app.set_max_loaded_pages(Some(1));
+        assert!(!app.is_page_loaded(&id_a), "sanity check: A should have been evicted to make room under the tightened limit");
+        assert!(!app.is_page_playing_audio(&id_a), "unloading a page should clear its stale audio-playing state");
 
         cleanup_test_profile(&profile);
     });

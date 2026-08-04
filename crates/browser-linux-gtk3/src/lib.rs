@@ -270,13 +270,24 @@ impl AppState {
         let title_for_cb = Rc::clone(&title);
         let app_weak = Rc::downgrade(self);
         let id_for_cb = id.clone();
-        let engine = WryEngine::new(&container, url, move |new_title| {
-            *title_for_cb.borrow_mut() = new_title;
-            if let Some(app) = app_weak.upgrade() {
-                app.record_visit(&id_for_cb);
-                app.rebuild_switcher_grid();
-            }
-        })?;
+        let app_weak_audio = Rc::downgrade(self);
+        let id_for_audio_cb = id.clone();
+        let engine = WryEngine::new(
+            &container,
+            url,
+            move |new_title| {
+                *title_for_cb.borrow_mut() = new_title;
+                if let Some(app) = app_weak.upgrade() {
+                    app.record_visit(&id_for_cb);
+                    app.rebuild_switcher_grid();
+                }
+            },
+            move |playing| {
+                if let Some(app) = app_weak_audio.upgrade() {
+                    app.set_page_audio_playing(&id_for_audio_cb, playing);
+                }
+            },
+        )?;
 
         let evicted = self.core.borrow_mut().insert(id.clone(), engine, title);
         self.unload_engines(&evicted);
@@ -372,6 +383,21 @@ impl AppState {
         }
     }
 
+    /// Updates page `id`'s tracked audio-playing state and refreshes the
+    /// switcher grid so its tile's speaker icon reflects it. Split out from
+    /// the real `connect_is_playing_audio_notify` signal handler (wired in
+    /// `add_page`/`ensure_engine_loaded`) so tests can drive it directly —
+    /// this codebase's headless test compositor has no confirmed audio
+    /// backend, so the real WebKitGTK signal can't be reliably exercised
+    /// end-to-end here (same class of gap as `address_bar_focused`'s
+    /// real-focus-event limitation).
+    pub fn set_page_audio_playing(self: &Rc<Self>, id: &str, playing: bool) {
+        if let Some(page) = self.core.borrow_mut().page_mut(id) {
+            page.is_playing_audio = playing;
+        }
+        self.rebuild_switcher_grid();
+    }
+
     /// Actually tears down the engines for pages `PageManager` just flipped
     /// to unloaded — this is what turns the `loaded` bookkeeping flag into
     /// real resource reclamation. Dropping a `WryEngine` destroys its
@@ -384,6 +410,7 @@ impl AppState {
             if let Some(page) = core.page_mut(id) {
                 if let Some(engine) = page.engine.take() {
                     page.last_url = engine.current_url().unwrap_or_else(|_| page.last_url.clone());
+                    page.is_playing_audio = false;
                     drop(engine);
                 }
             }
@@ -408,13 +435,24 @@ impl AppState {
         let title_for_cb = Rc::clone(&title);
         let app_weak = Rc::downgrade(self);
         let id_for_cb = id.to_string();
-        match WryEngine::new(&container, &url, move |new_title| {
-            *title_for_cb.borrow_mut() = new_title;
-            if let Some(app) = app_weak.upgrade() {
-                app.record_visit(&id_for_cb);
-                app.rebuild_switcher_grid();
-            }
-        }) {
+        let app_weak_audio = Rc::downgrade(self);
+        let id_for_audio_cb = id.to_string();
+        match WryEngine::new(
+            &container,
+            &url,
+            move |new_title| {
+                *title_for_cb.borrow_mut() = new_title;
+                if let Some(app) = app_weak.upgrade() {
+                    app.record_visit(&id_for_cb);
+                    app.rebuild_switcher_grid();
+                }
+            },
+            move |playing| {
+                if let Some(app) = app_weak_audio.upgrade() {
+                    app.set_page_audio_playing(&id_for_audio_cb, playing);
+                }
+            },
+        ) {
             Ok(engine) => self.core.borrow_mut().install_engine(id, engine),
             Err(err) => eprintln!("failed to reload unloaded page: {err}"),
         }
@@ -1872,7 +1910,8 @@ impl AppState {
         for (idx, row) in rows.iter().enumerate() {
             let flow_child = match row {
                 browser_chrome_core::SwitcherRow::Open { id, title, domain, color } => {
-                    self.build_open_tile(idx, id, title, domain, color)
+                    let is_playing_audio = self.core.borrow().page(id).map(|p| p.is_playing_audio).unwrap_or(false);
+                    self.build_open_tile(idx, id, title, domain, color, is_playing_audio)
                 }
                 browser_chrome_core::SwitcherRow::Add => self.build_add_tile(idx),
                 browser_chrome_core::SwitcherRow::History { title, domain, .. } => {
@@ -1896,9 +1935,19 @@ impl AppState {
     /// Builds one open-page tile — real per-page palette color (see the CSS
     /// comment below), a close button overlaid on top (closing a page is
     /// not part of `activate_row`'s model — see `activate_switcher_row`'s
-    /// doc comment — so it stays wired directly to `close_page` here), and
-    /// the tile body itself wired to `activate_switcher_row(idx)`.
-    fn build_open_tile(self: &Rc<Self>, idx: usize, id: &str, title: &str, domain: &str, color: &str) -> gtk::FlowBoxChild {
+    /// doc comment — so it stays wired directly to `close_page` here), a
+    /// speaker icon overlaid in the opposite corner when `is_playing_audio`
+    /// is set (see `set_page_audio_playing`), and the tile body itself wired
+    /// to `activate_switcher_row(idx)`.
+    fn build_open_tile(
+        self: &Rc<Self>,
+        idx: usize,
+        id: &str,
+        title: &str,
+        domain: &str,
+        color: &str,
+        is_playing_audio: bool,
+    ) -> gtk::FlowBoxChild {
         let tile = gtk::Button::new();
         tile.style_context().add_class("page-tile");
         let css = gtk::CssProvider::new();
@@ -1960,9 +2009,19 @@ impl AppState {
             app_clone.close_page(&id_clone);
         });
 
+        let audio_icon = gtk::Image::from_icon_name(Some("audio-volume-high-symbolic"), gtk::IconSize::Button);
+        audio_icon.style_context().add_class("tile-audio-icon");
+        audio_icon.set_halign(gtk::Align::Start);
+        audio_icon.set_valign(gtk::Align::Start);
+        audio_icon.set_margin_top(10);
+        audio_icon.set_margin_start(10);
+        audio_icon.set_visible(is_playing_audio);
+        audio_icon.set_no_show_all(true);
+
         let tile_overlay = gtk::Overlay::new();
         tile_overlay.add(&tile);
         tile_overlay.add_overlay(&close_btn);
+        tile_overlay.add_overlay(&audio_icon);
 
         let flow_child = gtk::FlowBoxChild::new();
         flow_child.add(&tile_overlay);
@@ -2094,6 +2153,12 @@ impl AppState {
     /// inspection helper.
     pub fn page_url(&self, id: &str) -> Option<String> {
         self.core.borrow().page(id).map(|p| p.current_url())
+    }
+
+    /// A page's tracked audio-playing state (see `set_page_audio_playing`)
+    /// — test/inspection helper.
+    pub fn is_page_playing_audio(&self, id: &str) -> bool {
+        self.core.borrow().page(id).map(|p| p.is_playing_audio).unwrap_or(false)
     }
 
     /// Whether the switcher grid is currently shown — test/inspection helper.
@@ -2359,6 +2424,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
                 border: none; box-shadow: none; border-radius: 9999px; padding: 0; \
                 min-width: 0; min-height: 0; } \
               .tile-close-label { color: #ffffff; } \
+              .tile-audio-icon { color: #ffffff; } \
               .switcher-hint { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
               .switcher-profile-label { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
               .page-tile-unloaded { opacity: 0.5; } \

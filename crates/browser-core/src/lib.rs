@@ -83,6 +83,13 @@ pub struct Page<E> {
     /// `PageManager::active_id`, which already means "the page currently
     /// shown in the UI" — an unrelated concept.
     pub loaded: bool,
+    /// Whether the page's engine last reported it's playing audio (currently
+    /// only ever set on `browser-linux-gtk3`, via WebKitGTK's
+    /// `is-playing-audio` signal — other front ends leave this permanently
+    /// `false`). Cleared whenever the engine is unloaded (see
+    /// `unload_engines`), since there's no live engine left to be playing
+    /// anything.
+    pub is_playing_audio: bool,
     /// Last time this page was created or switched to. Used to pick which
     /// loaded page to unload first when over the limit (oldest first).
     pub last_accessed: Instant,
@@ -152,6 +159,7 @@ impl<E> PageManager<E> {
             title,
             color,
             loaded: true,
+            is_playing_audio: false,
             last_accessed: Instant::now(),
             last_url: String::new(),
         });

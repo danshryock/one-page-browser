@@ -332,6 +332,35 @@ build/run instructions.
   (previously compile-checked only, via the crate being `#![cfg(target_os = "macos")]`-gated to an empty
   stub everywhere else). See `summaries/macos-appkit-scaffold.md`.
 
+- Track whether an open page is playing audio, shown as a speaker icon on its switcher tile —
+  `browser-linux-gtk3` only (real WebKitGTK API access; scoped there deliberately, not all four front ends).
+  `render-engine::WryEngine::new` (Linux) gained a new `on_audio_playing_changed: impl Fn(bool)` constructor
+  closure, mirroring the existing `on_title_changed` parameter's shape exactly — wired to the real
+  `webkit2gtk::WebViewExt::connect_is_playing_audio_notify` signal via the same `WebViewExtUnix::webview()`
+  escape hatch `screenshot()` already used. `browser_core::Page` gained a plain `is_playing_audio: bool`
+  field (not a shared `Rc<RefCell<_>>` like `title` — nothing needs to construct its initial value the way
+  the title-changed callback does), defaulted `false` in `PageManager::insert` with no signature change, so
+  the other three front ends needed zero changes. Confirmed via direct research of the vendored crates (not
+  assumed) that WKWebView (macOS) has no public "is playing audio" API at all, and WebView2 (both Windows
+  front ends) would need real per-crate wrapper work of its own — both explicitly out of scope for this pass
+  per a direct scoping question.
+
+  Verified end-to-end via two new `browser-linux-gtk3` tests exercising `AppState::set_page_audio_playing`
+  directly (the same "extract the real signal handler's logic into a directly-callable method" pattern
+  `address_bar_focused` already established) — this headless test compositor has no confirmed audio backend,
+  so the real WebKitGTK signal can't be exercised end-to-end here. Also attempted a real visual capture of
+  the tile's speaker icon via `gdk::Window::pixbuf` (this session's established verification pattern for
+  gtk3 UI changes) but abandoned it: every capture came back a byte-for-byte blank frame regardless of how
+  long the test waited (tried up to 40 warmup iterations, ~12s, and separately a blocking `gtk::main_iteration()`
+  loop, which hung entirely) — `window.is_active()` stayed `false` throughout, consistent with this same
+  headless compositor never granting real window-manager focus (already documented for
+  `address_bar_focused`), but this specific capture mechanism apparently needs more than that to produce a
+  real frame here, unlike earlier UI work this session where it did succeed. Left unresolved rather than
+  forced; the icon-rendering code itself (`build_open_tile`'s new `audio_icon` overlay) is a structural
+  mirror of the tile's already-shipped, real close-button overlay (same `gtk::Overlay`/`add_overlay`
+  mechanism, same halign/valign/margin approach, just the opposite corner and `set_no_show_all(true)` +
+  conditional `set_visible` instead of always-visible).
+
 ## Next
 
 **`crates/browser-windows-reactor`** — a new, sixth front end, replacing `browser-windows-winui`'s
