@@ -18,7 +18,7 @@ use browser_core::{
     SessionPage, Settings, Theme, VaultUnlockAction,
 };
 use gtk::prelude::*;
-use render_engine::{RenderEngine, WryEngine};
+use render_engine::{RenderEngine, WebContext, WryEngine};
 
 /// The password vault's session state — UI-level bookkeeping distinct from
 /// `PasswordStore`/`PasswordBackend` (the storage/abstraction layer, in
@@ -182,6 +182,13 @@ pub struct AppState {
     /// separate id/url stashed on the widget itself.
     switcher_rows: RefCell<Vec<browser_chrome_core::SwitcherRow>>,
     core: RefCell<PageManager<WryEngine>>,
+    /// One `wry::WebContext` shared by every page this profile ever opens —
+    /// what actually makes cookies/localStorage/cache persist across
+    /// restarts (and be shared between tabs in the same session), instead of
+    /// each page silently getting its own throwaway context. `None`
+    /// directory for an `ephemeral` profile, matching every other
+    /// `Profile`-scoped store's convention of never touching disk.
+    web_context: RefCell<render_engine::WebContext>,
     /// GTK `Stack` children, keyed by page id — `browser_core::Page` doesn't
     /// hold these since they're a GTK-only concept.
     containers: RefCell<HashMap<String, gtk::Box>>,
@@ -275,6 +282,7 @@ impl AppState {
         let engine = WryEngine::new(
             &container,
             url,
+            &mut *self.web_context.borrow_mut(),
             move |new_title| {
                 *title_for_cb.borrow_mut() = new_title;
                 if let Some(app) = app_weak.upgrade() {
@@ -474,6 +482,7 @@ impl AppState {
         match WryEngine::new(
             &container,
             &url,
+            &mut *self.web_context.borrow_mut(),
             move |new_title| {
                 *title_for_cb.borrow_mut() = new_title;
                 if let Some(app) = app_weak.upgrade() {
@@ -3068,6 +3077,30 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     let bookmarks = Bookmarks::load(&profile);
     let core = PageManager::new(settings.max_loaded_pages);
     let initial_vault_state = if profile.has_vault_passphrase() { VaultState::Locked } else { VaultState::NotSetUp };
+    // One context for every page this profile ever opens (see
+    // `WryEngine::new`'s doc comment). For an `ephemeral` profile this is
+    // *not* simply `WebContext::new(None)` — confirmed by a real, initially-
+    // failing test that two separate `None`-directory contexts still saw
+    // each other's data: passing `None` doesn't mean "no persistence", it
+    // means "whatever webkit2gtk's own built-in default `WebsiteDataManager`
+    // is", which turned out to be a single shared, deterministic location,
+    // not a fresh one per context. `WebContext`'s own dedicated
+    // `new_ephemeral()` constructor exists for exactly this but is
+    // `pub(crate)`-only inside `wry`, unreachable from here — so instead
+    // each ephemeral profile gets its own uniquely-named temp directory,
+    // guaranteeing it never shares data with any other session (this one
+    // included, across separate `--incognito` launches) even though,
+    // unlike every other `Profile`-scoped store, it does mean some bytes
+    // briefly touch disk during the session rather than staying purely
+    // in-memory.
+    let web_context = if profile.ephemeral {
+        static EPHEMERAL_WEBVIEW_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = EPHEMERAL_WEBVIEW_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("claude-browser-ephemeral-{}-{n}", std::process::id()));
+        WebContext::new(Some(dir))
+    } else {
+        WebContext::new(profile.webview_data_dir())
+    };
     let app = Rc::new(AppState {
         address_bar: address_bar.clone(),
         stack,
@@ -3121,6 +3154,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         passwords_error_label: passwords_error_label.clone(),
         switcher_rows: RefCell::new(Vec::new()),
         core: RefCell::new(core),
+        web_context: RefCell::new(web_context),
         containers: RefCell::new(HashMap::new()),
         settings: RefCell::new(settings),
         history,

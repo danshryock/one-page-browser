@@ -47,10 +47,15 @@ fn run() -> anyhow::Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     if let Some(url) = resolve_url_argument(args.clone()) {
+        // Never constructs a `WebView2` control (confirmed: no
+        // "webview"/"WebView2" reference anywhere in
+        // `show_external_link_chooser`'s body) — no user-data-folder setup
+        // needed for this path.
         show_external_link_chooser(url, resolve_profile_name(args))?;
         browser_windows_winui::trace("run: after show_external_link_chooser");
     } else {
         let profile = Profile::new(resolve_profile_name(args));
+        set_webview2_user_data_folder(&profile);
         browser_windows_winui::trace("run: about to call build_window_and_app");
         let app = build_window_and_app(profile)?;
         browser_windows_winui::trace("run: after build_window_and_app");
@@ -60,6 +65,39 @@ fn run() -> anyhow::Result<()> {
         browser_windows_winui::trace("run: after activate");
     }
     Ok(())
+}
+
+/// `WebView2`, for an unpackaged app like this one, defaults its user data
+/// folder to a location *next to the executable* — a real, documented
+/// `WebView2` behavior, but a fragile one (unwritable install locations,
+/// UNC paths, etc. — see `browser-windows-reactor/src/main.rs`'s identical
+/// function for the full reasoning and the real user report that motivated
+/// it there). `WEBVIEW2_USER_DATA_FOLDER` is a real, Microsoft-documented
+/// override (must be set before the first `WebView2` control initializes,
+/// which here means before `build_window_and_app` constructs the first
+/// page), honored by the WebView2 Runtime itself regardless of which host
+/// (this `winio-winui3` XAML control, or `windows-webview`'s reactor
+/// element) actually embeds it — not something specific to either crate.
+/// Scoped by profile name so different profiles get separate cookie/
+/// localStorage/cache data. Left unset for an `ephemeral` profile: not true
+/// incognito isolation (no reachable "give this session its own ephemeral
+/// environment" API was found for `winio-winui3`'s `WebView2` control — see
+/// this feature's ROADMAP entry), but not a regression either.
+#[cfg(all(target_os = "windows", target_env = "msvc"))]
+fn set_webview2_user_data_folder(profile: &browser_core::Profile) {
+    if profile.ephemeral {
+        return;
+    }
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let path = std::path::Path::new(&local_app_data).join("claude-browser").join("webview2").join(&profile.name);
+        // SAFETY: called from `run`, itself called from
+        // `Application::Start`'s callback before any other thread exists and
+        // before `build_window_and_app` constructs the first `WebView2`
+        // control — nothing has read or written this variable yet.
+        unsafe {
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", path);
+        }
+    }
 }
 
 #[cfg(not(all(target_os = "windows", target_env = "msvc")))]

@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 use browser_core::{Action, HistoryStore, PasswordBackend, Profile};
 use browser_linux_gtk3::{build_window_and_app, build_window_and_app_with_history, AppState};
 use gtk::prelude::*;
-use render_engine::{RenderEngine, WryEngine};
+use render_engine::{RenderEngine, WebContext, WryEngine};
 
 type Job = Box<dyn FnOnce() + Send>;
 
@@ -183,7 +183,9 @@ fn navigation_back_forward_reload() {
         window.add(&content);
         window.show_all();
 
-        let engine = WryEngine::new(&content, &url_a, |_| {}, |_| {}).expect("WryEngine::new should succeed");
+        let mut web_context = WebContext::new(None);
+        let engine =
+            WryEngine::new(&content, &url_a, &mut web_context, |_| {}, |_| {}).expect("WryEngine::new should succeed");
         assert!(
             wait_until(|| engine.current_url().ok().as_deref() == Some(url_a.as_str())),
             "initial load should reach page A"
@@ -227,9 +229,11 @@ fn reader_mode_toggles_on_and_off() {
 
         let title = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
         let title_for_cb = std::rc::Rc::clone(&title);
+        let mut web_context = WebContext::new(None);
         let engine = WryEngine::new(
             &content,
             &url_a,
+            &mut web_context,
             move |new_title| {
                 *title_for_cb.borrow_mut() = new_title;
             },
@@ -1503,5 +1507,87 @@ fn unloading_a_page_clears_its_audio_playing_state() {
         assert!(!app.is_page_playing_audio(&id_a), "unloading a page should clear its stale audio-playing state");
 
         cleanup_test_profile(&profile);
+    });
+}
+
+/// Polls `app`'s active page (via `evaluate_script_on_active_page_for_test`)
+/// until evaluating `script` equals `expected`, or `TIMEOUT` elapses — same
+/// approach `wait_until_login_form_shows` uses, generalized to an arbitrary
+/// script instead of always reading the login form's fields.
+fn wait_until_script_equals(app: &Rc<AppState>, script: &str, expected: &str) -> bool {
+    use std::sync::{Arc, Mutex};
+    let result: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    wait_until(|| {
+        let matched =
+            result.lock().unwrap().as_deref().and_then(|json| serde_json::from_str::<String>(json).ok()).as_deref() == Some(expected);
+        if !matched {
+            let slot = Arc::clone(&result);
+            app.evaluate_script_on_active_page_for_test(script, move |value| {
+                *slot.lock().unwrap() = Some(value);
+            });
+        }
+        matched
+    })
+}
+
+#[test]
+fn webview_data_persists_across_a_second_app_instance_for_the_same_profile() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("webview-persistence");
+        let url_a = fixture_url("page_a.html");
+
+        {
+            let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+            app.add_page(&url_a).expect("add_page should succeed");
+            assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())));
+            // localStorage rather than document.cookie — WebKitGTK's cookie
+            // policy for file:// origins (what these fixtures use) isn't
+            // something this suite can assume either way, and this only
+            // needs to prove the *mechanism* (a shared, profile-scoped
+            // `wry::WebContext`) actually persists real browsing data, not
+            // specifically cookies.
+            app.evaluate_script_on_active_page_for_test("localStorage.setItem('persist_test', 'hello'); 'done'", |_| {});
+            assert!(wait_until_script_equals(&app, "localStorage.getItem('persist_test')", "hello"), "the value should be readable back within the same instance before ever testing a second one");
+        }
+
+        // A fresh AppState against the same profile, as a real second launch
+        // would build — same "second instance, same profile" shape as
+        // `session_saved_on_quit_is_restored_on_next_launch`.
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&url_a).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())));
+        assert!(
+            wait_until_script_equals(&app, "localStorage.getItem('persist_test')", "hello"),
+            "a second AppState against the same profile should see the first instance's persisted webview data"
+        );
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn webview_data_does_not_persist_for_an_ephemeral_profile() {
+    run_on_gtk_thread(|| {
+        let profile = Profile::ephemeral();
+        let url_a = fixture_url("page_a.html");
+
+        {
+            let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+            app.add_page(&url_a).expect("add_page should succeed");
+            assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())));
+            app.evaluate_script_on_active_page_for_test("localStorage.setItem('persist_test', 'hello'); 'done'", |_| {});
+            assert!(wait_until_script_equals(&app, "localStorage.getItem('persist_test')", "hello"));
+        }
+
+        // A second ephemeral AppState is a distinct, unlinked session (see
+        // `Profile::ephemeral`'s doc comment) — nothing should carry over,
+        // unlike the real-profile case above.
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&url_a).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())));
+        assert!(
+            !wait_until_script_equals(&app, "localStorage.getItem('persist_test')", "hello"),
+            "an ephemeral profile's webview data shouldn't survive into a second instance"
+        );
     });
 }

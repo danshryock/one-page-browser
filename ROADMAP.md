@@ -402,6 +402,74 @@ build/run instructions.
   for the last known-good commit used as a control, so this fix — like the first — needs a real
   confirm-it-shows-a-window check on an actual desktop before being trusted as fully resolved.
 
+  **Resolution**: neither fix attempt was actually the cause. A `git bisect`-by-hand session (a dedicated
+  branch built up commit-by-commit from before audio tracking, with the reporter testing each slice on
+  their real desktop) found that even a completely unmodified pre-audio-tracking commit failed identically
+  — which meant the regression wasn't in this codebase's history at all. It turned out to be the reporter's
+  window manager/compositor stuck in a bad state from before a reboot; a reboot alone fixed it, with zero
+  code changes. Both fix attempts were kept anyway (lazy session restore and skip-rebuild-while-hidden are
+  genuine, independent improvements on their own merits, confirmed by the reporter after the fact), but the
+  investigation is a useful cautionary note: a real, well-reasoned root-cause theory (confirmed via direct
+  source reading, not guesswork) can still be entirely wrong about *causation* if the underlying symptom
+  was never actually caused by the code being investigated in the first place.
+- Cookies/localStorage/cache now persist per profile across restarts — all four front ends. Root-caused by
+  direct source reading of `wry` 0.55.1 (not assumed): `render_engine::{linux,macos}::WryEngine::new`
+  always called plain `WebViewBuilder::new()`, never `_with_web_context(...)`, so `wry`'s own
+  `impl Default for WebContext { fn default() -> Self { Self::new(None) } }` gave **every single page its
+  own throwaway, non-shared context** — not just "doesn't survive a restart," not even shared between tabs
+  in the same session. `browser-windows-reactor` already set `WEBVIEW2_USER_DATA_FOLDER` once, process-wide
+  (not scoped per `--profile`); `browser-windows-winui` had no persistence configuration at all.
+
+  New `Profile::webview_data_dir()` (`browser-core`, mirrors `history_db_path`/`passwords_db_path`'s
+  `data_dir().join(&self.name).join(...)` convention exactly). `browser-linux-gtk3` and
+  `browser-macos-appkit` each gained one `web_context: RefCell<render_engine::WebContext>` field on
+  `AppState`, built once per profile (not per page) and threaded into both `WryEngine::new` call sites
+  (`add_page`/`ensure_engine_loaded`) via the momentary-borrow pattern already used for `core.borrow_mut()`
+  elsewhere. `render_engine` re-exports `wry::WebContext` (gated the same as `WryEngine` itself) so callers
+  never need to depend on `wry` directly, preserving that crate's own stated boundary. `WebContext` is
+  itself re-exported/threaded identically on both platforms since it's the same `wry` type and gap — only
+  `linux.rs`'s and `macos.rs`'s own `WryEngine::new` bodies differ (`build_gtk`/`build_as_child`).
+
+  A genuinely useful finding from writing the regression test: `WebContext::new(None)` is **not** "no
+  persistence" — it falls back to `wry`'s own shared default `WebsiteDataManager`, the same underlying class
+  of bug this whole fix was for. A first attempt at `ephemeral`-profile handling (pass `None` for the
+  directory) failed a real test — two separate ephemeral `AppState`s in the same test still saw each other's
+  `localStorage` value — confirming this the hard way rather than assuming. `WebContext`'s own dedicated
+  `new_ephemeral()` constructor is `pub(crate)`-only inside `wry`, unreachable from outside it, so each
+  `ephemeral` profile instead gets a uniquely-named temp directory (`std::env::temp_dir()` + PID + an
+  atomic per-process counter) — real isolation between sessions, though unlike every other `Profile`-scoped
+  store this does mean an ephemeral session's webview data briefly touches disk during the session, just
+  never in a location any other session (this one included) will ever look at again.
+
+  Both Windows front ends use `WEBVIEW2_USER_DATA_FOLDER` instead (a real, Microsoft-documented environment
+  variable honored by the WebView2 Runtime itself, not specific to either crate) — `browser-windows-reactor`
+  had this already but un-profile-scoped, fixed by moving the call to after profile resolution and joining
+  `&profile.name` into the path; `browser-windows-winui` gained the identical function fresh. Considered the
+  more "proper" `CoreWebView2Environment::CreateWithOptionsAsync` +
+  `WebView2::EnsureCoreWebView2WithEnvironmentAsync` API for `browser-windows-winui` (confirmed real,
+  present bindings in `winio-winui3`) but deliberately didn't use it — it would mean hand-chaining two
+  previously-unused WinRT async operations (no blocking `.get()` in this vendor tree) through
+  completion-handler callbacks with zero ability to compile-check the real behavior from this machine, for
+  a mechanism that's meaningfully riskier than the env var, which is already known-working (per
+  `browser-windows-reactor` having been run for real in a Windows VM). Both Windows front ends leave the env
+  var unset for `ephemeral` profiles — not a regression, but not true incognito isolation either; a
+  documented gap rather than solved, since neither `windows-webview`'s reactor `webview()` element nor
+  `winio-winui3`'s `WebView2` control expose a reachable "ephemeral environment" lever for this specific
+  case.
+
+  Verified via two new real `browser-linux-gtk3` tests: `webview_data_persists_across_a_second_app_instance_for_the_same_profile`
+  (set a `localStorage` value in one `AppState`, tear it down, build a second one against the same profile,
+  confirm the value survives — same "second instance, same profile, real round trip" shape as
+  `session_saved_on_quit_is_restored_on_next_launch`) and `webview_data_does_not_persist_for_an_ephemeral_profile`
+  (same shape, confirms it does *not* survive). Deliberately used `localStorage` rather than `document.cookie`
+  — WebKitGTK's cookie policy for `file://` origins (what these test fixtures use) isn't something to assume
+  either way, and the test only needs to prove the underlying mechanism works, not specifically cookies.
+  Full regression (`browser-core`'s 125 tests, the gtk3 headless suite — now 39 tests — workspace-wide
+  `cargo check`) stayed green. `browser-macos-appkit` cross-compiled/linked clean for both
+  `aarch64-apple-darwin`/`x86_64-apple-darwin`; `browser-windows-winui`/`browser-windows-reactor` both
+  compiled/linked clean via `cargo build-windows-winui`/`-reactor` — none of the three could be run to
+  verify real behavior from this machine.
+
 ## Next
 
 **`crates/browser-windows-reactor`** — a new, sixth front end, replacing `browser-windows-winui`'s

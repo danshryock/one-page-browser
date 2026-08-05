@@ -30,3 +30,12 @@ pub use winui::{AssertSend, WebView2Engine};
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::WryEngine;
+
+/// Re-exported rather than left implicit so callers can hold one
+/// `WebContext` per profile (shared across every page it opens — see
+/// `WryEngine::new`'s doc comment) without depending on `wry` directly,
+/// preserving the "never depends on `wry` directly" boundary this module
+/// doc comment describes — it's still literally `wry`'s type, just named
+/// through here the same way `WryEngine` itself is.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use wry::WebContext;

@@ -15,15 +15,18 @@
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
 fn main() -> anyhow::Result<()> {
     browser_windows_reactor::trace("main: start");
-    set_webview2_user_data_folder();
     windows_reactor::bootstrap()?;
     browser_windows_reactor::trace("main: after bootstrap");
     let args: Vec<String> = std::env::args().collect();
     let result = if let Some(url) = browser_core::resolve_url_argument(args.clone()) {
+        // Never constructs a `WebView2` control at all (confirmed: neither
+        // `run_chooser` nor its window tree touches WebView2/`CoreWebView2`
+        // anywhere) — no user-data-folder setup needed for this path.
         let default_profile = browser_core::resolve_profile_name(args);
         browser_windows_reactor::run_chooser(url, default_profile)
     } else {
         let profile = browser_core::Profile::new(browser_core::resolve_profile_name(args));
+        set_webview2_user_data_folder(&profile);
         browser_windows_reactor::run(profile)
     };
     browser_windows_reactor::trace(&format!("main: run returned {result:?}"));
@@ -48,16 +51,30 @@ fn main() -> anyhow::Result<()> {
 ///
 /// `WEBVIEW2_USER_DATA_FOLDER` is a real, Microsoft-documented override
 /// (must be set before the first `WebView2` control initializes) — pointing
-/// it at `%LOCALAPPDATA%\claude-browser\webview2` instead gives every
-/// `WebView2` control in this process a location guaranteed writable by the
-/// current user, regardless of where the exe itself lives.
+/// it at `%LOCALAPPDATA%\claude-browser\webview2\<profile-name>` instead
+/// gives every `WebView2` control in this process a location guaranteed
+/// writable by the current user, regardless of where the exe itself lives.
+///
+/// Scoped by profile name (not just a single fixed `...\webview2` path, as
+/// this originally was) so different profiles get separate cookie/
+/// localStorage/cache data — same reasoning and fix as
+/// `browser-linux-gtk3`/`browser-macos-appkit`'s per-profile `wry::WebContext`.
+/// Left unset for an `ephemeral` profile: not a regression (matches this
+/// function's pre-existing behavior before profiles were scoped at all), but
+/// not true incognito isolation either — `windows-webview`'s reactor
+/// `webview()` element only binds the parameterless `EnsureCoreWebView2Async()`
+/// overload, so there's no reachable "give this session its own ephemeral
+/// environment" lever from here, unlike the two `wry`-based front ends.
 #[cfg(all(target_os = "windows", target_env = "msvc"))]
-fn set_webview2_user_data_folder() {
+fn set_webview2_user_data_folder(profile: &browser_core::Profile) {
+    if profile.ephemeral {
+        return;
+    }
     if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-        let path = std::path::Path::new(&local_app_data).join("claude-browser").join("webview2");
-        // SAFETY: called once, at the very start of `main`, before any
-        // other thread exists (nothing has spawned one yet) and before
-        // anything reads this variable.
+        let path = std::path::Path::new(&local_app_data).join("claude-browser").join("webview2").join(&profile.name);
+        // SAFETY: called once, before any other thread exists (nothing has
+        // spawned one yet) and before anything reads this variable, and
+        // before `run(profile)` constructs the first `WebView2` control.
         unsafe {
             std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", path);
         }

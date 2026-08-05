@@ -2,7 +2,7 @@ use std::ptr::NonNull;
 
 use objc2_app_kit::NSView;
 use wry::raw_window_handle::{AppKitWindowHandle, HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
-use wry::{Rect, WebView, WebViewBuilder};
+use wry::{Rect, WebContext, WebView, WebViewBuilder};
 
 use crate::RenderEngine;
 
@@ -26,14 +26,23 @@ pub struct WryEngine {
 impl WryEngine {
     /// `parent` is the `NSView` this webview is embedded into as a subview
     /// (typically the window's content view, below whatever native toolbar
-    /// strip `browser-macos-appkit` places above it).
+    /// strip `browser-macos-appkit` places above it). `web_context` is
+    /// shared across every page in the same profile (see `wry::WebContext`'s
+    /// own doc comment: "A browser would have a context for all the normal
+    /// tabs and a different context for all the private/incognito tabs") —
+    /// the caller owns it for the lifetime of the whole profile, not
+    /// per-page, so cookies/localStorage/cache persist (and are shared
+    /// between tabs) instead of each page silently getting its own
+    /// throwaway context (`WebViewBuilder::new()`'s default when no context
+    /// is supplied at all).
     pub fn new(
         parent: &NSView,
         initial_url: &str,
+        web_context: &mut WebContext,
         on_title_changed: impl Fn(String) + 'static,
     ) -> anyhow::Result<Self> {
         let handle = NsViewHandle(NonNull::from(parent));
-        let webview = WebViewBuilder::new()
+        let webview = WebViewBuilder::new_with_web_context(web_context)
             .with_url(initial_url)
             .with_document_title_changed_handler(move |title| on_title_changed(title))
             .build_as_child(&handle)?;

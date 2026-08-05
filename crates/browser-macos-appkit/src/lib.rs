@@ -101,7 +101,7 @@ use browser_core::{
     BitwardenStatus, Bookmark, Bookmarks, HistoryStore, Keybindings, Login, LoginFields, PageManager, PasswordBackend,
     PasswordStore, Profile, Session, SessionPage, Settings, Theme, VaultUnlockAction, HOME_URL,
 };
-use render_engine::{RenderEngine, WryEngine};
+use render_engine::{RenderEngine, WebContext, WryEngine};
 
 const TOOLBAR_HEIGHT: f64 = 36.0;
 const BUTTON_WIDTH: f64 = 32.0;
@@ -183,6 +183,12 @@ struct AppState {
     /// `browser-linux-gtk3`'s `containers` field.
     containers: RefCell<HashMap<String, Retained<NSView>>>,
     core: RefCell<PageManager<WryEngine>>,
+    /// One `wry::WebContext` shared by every page this profile ever opens —
+    /// what actually makes cookies/localStorage/cache persist across
+    /// restarts (and be shared between tabs in the same session), instead of
+    /// each page silently getting its own throwaway context. Same fix and
+    /// reasoning as `browser-linux-gtk3`'s field of the same name.
+    web_context: RefCell<WebContext>,
     overlay: Cell<Overlay>,
 
     switcher_view: Retained<NSView>,
@@ -1057,7 +1063,7 @@ impl AppState {
         // `Rc::downgrade(self)` in the same spot.
         let self_for_title = Rc::downgrade(self);
         let id_for_title = id.clone();
-        let engine = WryEngine::new(&container, url, move |title| {
+        let engine = WryEngine::new(&container, url, &mut *self.web_context.borrow_mut(), move |title| {
             let Some(app) = self_for_title.upgrade() else { return };
             if let Some(page) = app.core.borrow_mut().page_mut(&id_for_title) {
                 *page.title.borrow_mut() = title;
@@ -1118,7 +1124,7 @@ impl AppState {
         // Weak — see the identical comment in `add_page`.
         let self_for_title = Rc::downgrade(self);
         let id_for_title = id.to_string();
-        match WryEngine::new(&container, &url, move |title| {
+        match WryEngine::new(&container, &url, &mut *self.web_context.borrow_mut(), move |title| {
             let Some(app) = self_for_title.upgrade() else { return };
             if let Some(page) = app.core.borrow_mut().page_mut(&id_for_title) {
                 *page.title.borrow_mut() = title;
@@ -2264,6 +2270,21 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
 
     let initial_vault_state = if profile.has_vault_passphrase() { VaultState::Locked } else { VaultState::NotSetUp };
 
+    // One context for every page this profile ever opens (see
+    // `WryEngine::new`'s doc comment) — see `browser-linux-gtk3`'s identical
+    // field/comment for why an `ephemeral` profile gets its own uniquely-
+    // named temp directory rather than simply `WebContext::new(None)`
+    // (confirmed by a real test there that `None` falls back to wry's
+    // shared default location, not a fresh one per context).
+    let web_context = if profile.ephemeral {
+        static EPHEMERAL_WEBVIEW_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = EPHEMERAL_WEBVIEW_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("claude-browser-ephemeral-{}-{n}", std::process::id()));
+        WebContext::new(Some(dir))
+    } else {
+        WebContext::new(profile.webview_data_dir())
+    };
+
     let state = Rc::new(AppState {
         window: window.clone(),
         toolbar_view,
@@ -2277,6 +2298,7 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
         content_view,
         containers: RefCell::new(HashMap::new()),
         core: RefCell::new(PageManager::new(settings.max_loaded_pages)),
+        web_context: RefCell::new(web_context),
         overlay: Cell::new(Overlay::None),
         switcher_view,
         switcher_rows_container,

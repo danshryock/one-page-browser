@@ -87,6 +87,17 @@ impl Profile {
         Some(dirs.data_dir().join(&self.name).join("screenshots"))
     }
 
+    /// Where this profile's web engine keeps its persistent browsing data —
+    /// cookies, localStorage, cache — so it survives across restarts. Same
+    /// resolve-the-path-without-opening-anything split as `history_db_path`;
+    /// each front end's own engine construction is what actually points its
+    /// web context/environment at this directory (or skips doing so for an
+    /// `ephemeral` profile, same convention as every other path here).
+    pub fn webview_data_dir(&self) -> Option<PathBuf> {
+        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        Some(dirs.data_dir().join(&self.name).join("webview"))
+    }
+
     /// Path to this profile's passphrase marker — an empty sentinel file
     /// (never holds the passphrase itself, or anything derived from it)
     /// whose mere *existence* means `history_db_path()` is encrypted and a
@@ -387,6 +398,13 @@ mod tests {
         let profile = Profile::new("work");
         let path = profile.screenshots_dir().expect("a data dir should be available in tests");
         assert!(path.ends_with("work/screenshots"), "{path:?}");
+    }
+
+    #[test]
+    fn webview_data_dir_is_scoped_under_the_profile_name() {
+        let profile = Profile::new("work");
+        let path = profile.webview_data_dir().expect("a data dir should be available in tests");
+        assert!(path.ends_with("work/webview"), "{path:?}");
     }
 
     #[test]
