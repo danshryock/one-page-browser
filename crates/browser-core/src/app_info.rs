@@ -51,7 +51,7 @@ pub fn init_app_id<I: IntoIterator<Item = String>>(args: I) {
             let _ = EFFECTIVE_APP_ID.set(id);
         }
         None => {
-            migrate_legacy_app_id_data(APP_ID);
+            migrate_legacy_app_id_data(APP_ID, LEGACY_APP_IDS);
             let _ = EFFECTIVE_APP_ID.set(APP_ID.to_string());
         }
     }
@@ -101,9 +101,17 @@ fn resolve_app_id_override_with_env<I: IntoIterator<Item = String>>(args: I, env
 /// failed rename is logged, not propagated — this must never block the app
 /// from starting, worst case a user just doesn't see their old data until
 /// they notice and file a bug.
-fn migrate_legacy_app_id_data(new_app_id: &str) {
+///
+/// Takes `new_app_id`/`legacy_app_ids` as parameters rather than reading
+/// `APP_ID`/`LEGACY_APP_IDS` directly — `init_app_id` passes those real
+/// constants for the real run, but a test can pass arbitrary throwaway ids
+/// instead, exercising the *real* `directories::ProjectDirs` resolution
+/// (via `project_dirs` below) end to end without ever touching this
+/// machine's real config/data directories the compiled-in constants would
+/// resolve to.
+fn migrate_legacy_app_id_data(new_app_id: &str, legacy_app_ids: &[&str]) {
     let Some((new_config, new_data)) = project_dirs(new_app_id) else { return };
-    let legacy: Vec<(PathBuf, PathBuf)> = LEGACY_APP_IDS.iter().filter_map(|id| project_dirs(id)).collect();
+    let legacy: Vec<(PathBuf, PathBuf)> = legacy_app_ids.iter().filter_map(|id| project_dirs(id)).collect();
     migrate_legacy_app_id_data_at(&new_config, &new_data, &legacy);
 }
 
@@ -264,5 +272,39 @@ mod tests {
         assert!(!real_config.exists(), "the legacy id that actually has data should still be found and migrated");
         assert!(new_config.exists());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `migrate_legacy_app_id_data_at`'s tests above cover the actual rename
+    /// logic thoroughly, but never touch `project_dirs`/
+    /// `directories::ProjectDirs::from` at all. This exercises the *whole*
+    /// public `migrate_legacy_app_id_data` end to end — real
+    /// `ProjectDirs`-resolved paths, a real profile-shaped config file, a
+    /// real rename — using throwaway ids unique to this test run (not the
+    /// real compiled-in `APP_ID`/`LEGACY_APP_IDS`, which would mean either
+    /// touching this machine's real config/data directories or needing a
+    /// pre-existing rename to have already happened) so it's safe to run
+    /// anywhere, repeatedly, without leaving anything behind.
+    #[test]
+    fn migrate_legacy_app_id_data_end_to_end_via_real_project_dirs() {
+        let suffix = std::process::id();
+        let new_id = format!("claude-browser-test-app-id-migrate-new-{suffix}");
+        let legacy_id = format!("claude-browser-test-app-id-migrate-legacy-{suffix}");
+        let unrelated_id = format!("claude-browser-test-app-id-migrate-unrelated-{suffix}");
+
+        let legacy_dirs = directories::ProjectDirs::from("", "", &legacy_id).expect("a config dir should be available in tests");
+        std::fs::create_dir_all(legacy_dirs.config_dir().join("work")).unwrap();
+        std::fs::write(legacy_dirs.config_dir().join("work").join("settings.json"), r#"{"start_page":"https://example.com"}"#).unwrap();
+
+        migrate_legacy_app_id_data(&new_id, &[&unrelated_id, &legacy_id]);
+
+        let new_dirs = directories::ProjectDirs::from("", "", &new_id).expect("a config dir should be available in tests");
+        assert!(
+            new_dirs.config_dir().join("work").join("settings.json").exists(),
+            "the legacy profile's settings should have moved to the new app id's real, ProjectDirs-resolved location"
+        );
+        assert!(!legacy_dirs.config_dir().exists(), "the legacy location should be gone — a real move, not a copy");
+
+        std::fs::remove_dir_all(new_dirs.config_dir()).ok();
+        std::fs::remove_dir_all(new_dirs.data_dir()).ok();
     }
 }

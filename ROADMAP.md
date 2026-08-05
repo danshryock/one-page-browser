@@ -522,6 +522,19 @@ build/run instructions.
   suite — workspace-wide `cargo check`) stayed green; both macOS architectures and both Windows front ends
   compiled/linked clean.
 
+  **Follow-up**: closed that last gap. `migrate_legacy_app_id_data` now takes `new_app_id`/`legacy_app_ids`
+  as parameters instead of reading `APP_ID`/`LEGACY_APP_IDS` directly (`init_app_id` passes the real
+  constants for the real run) — letting a test drive the *real* `directories::ProjectDirs` resolution with
+  arbitrary throwaway ids instead of only the pure rename logic (`migrate_legacy_app_id_data_at`, unchanged)
+  against synthetic paths. New `browser-core` test
+  (`migrate_legacy_app_id_data_end_to_end_via_real_project_dirs`, 136 tests total) creates a real profile
+  (`work/settings.json`) under a throwaway legacy id via real `ProjectDirs`, runs the real migration, and
+  confirms it lands at the new id's real `ProjectDirs`-resolved location — process-id-scoped throwaway ids
+  (`claude-browser-test-app-id-migrate-*-<pid>`) so it's safe to run anywhere, repeatedly, self-cleaning,
+  and never touches this machine's real `claude-browser` directories. Full regression stayed green
+  throughout (workspace-wide `cargo check`, the gtk3 headless suite unaffected since nothing outside
+  `browser-core` calls `migrate_legacy_app_id_data` directly).
+
 **`crates/browser-windows-reactor`** — a new, sixth front end, replacing `browser-windows-winui`'s
 `winio-winui3` dependency with Microsoft's own in-tree `windows-reactor`/`windows-webview` (see
 `summaries/windows-github-actions-ci.md`'s comparison-test section for why). Being built incrementally,
