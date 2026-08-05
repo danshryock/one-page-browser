@@ -10,6 +10,19 @@ run-gtk3 = "run -p browser-linux-gtk3"
 # crates/browser-windows-reactor/src/lib.rs's module doc comment).
 build-windows-reactor = "xwin build --target x86_64-pc-windows-msvc -p browser-windows-reactor"
 
+# Statically link the MSVC C runtime into anything built for this target, so
+# the resulting .exe doesn't depend on VCRUNTIME140.dll/msvcp140.dll being
+# present on the machine that runs it — confirmed the hard way: a
+# cargo-xwin-built binary refused to start on a fresh Windows VM with no
+# Visual C++ Redistributable installed ("VCRUNTIME140.dll was not found").
+# Scoped to the target triple, not `[env]`, so — unlike the CC/AR note below
+# — this is safe to keep tracked in the repo: it only ever applies when
+# actually building *for* x86_64-pc-windows-msvc, cross-compiled from here or
+# natively on real Windows, and static-CRT is a reasonable default for a
+# standalone app either way (see scripts/windows-vm/README.md).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
 # browser-macos-appkit cross-compiles from Linux via `cargo zigbuild` plus a
 # macOS SDK for the Apple framework stubs the link step needs — neither of
 # those can be reached through a plain [alias] the way
