@@ -4,6 +4,10 @@ fn main() -> anyhow::Result<()> {
     use browser_macos_appkit::{build_window_and_app, resolve_args, run_chooser};
 
     let args: Vec<String> = std::env::args().collect();
+    // Must run before anything touches a `Profile` path — resolves
+    // `--app-id`/`CLAUDE_BROWSER_APP_ID` if given, and migrates an existing
+    // user's data forward from a previous `APP_ID` otherwise.
+    browser_core::init_app_id(args.clone());
     let (url, profile_name) = resolve_args(args.clone());
     let setup_passphrase = browser_core::resolve_passphrase_setup_requested(args);
 

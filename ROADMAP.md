@@ -487,6 +487,41 @@ build/run instructions.
   `claude-browser-ephemeral-*`) as plain literals, not part of "the title and the application name" this was
   scoped to. See `NAMING.md` for the actual rename this was prep for.
 
+  **Follow-up**: the "still needs a real data migration" caveat above is now handled.
+  `browser_core::app_info` gained `LEGACY_APP_IDS: &[&str]` (empty until the first rename — prepend the
+  outgoing `APP_ID` here, most recently used first) and `init_app_id`, which every front end's `main` now
+  calls exactly once, at the very start, before any `Profile` path is touched. `Profile`'s path methods
+  resolve against a new `effective_app_id()` (a `OnceLock<String>`, defaulting to the compiled-in `APP_ID`
+  when `init_app_id` was never called — every test constructs `Profile`s directly this way, unaffected)
+  instead of the bare constant. `init_app_id` resolves an override — `--app-id NAME`/`--app-id=NAME` (CLI,
+  checked first) or the `CLAUDE_BROWSER_APP_ID` environment variable — and, *only* when neither was given,
+  walks `LEGACY_APP_IDS` and renames the first legacy id's config/data directories (a real `std::fs::rename`,
+  not a copy) to the current `APP_ID`'s location, unless that location already exists. A manual override
+  skips migration entirely — picking an identity on purpose isn't asking to inherit a renamed-from
+  identity's history. `resolve_url_argument` also learned to skip `--app-id`'s value in space-separated
+  form (same special-casing it already had for `--profile`), so `--app-id foo https://example.com` still
+  finds the URL.
+
+  The core rename logic (`migrate_legacy_app_id_data_at`) and the override-parsing logic
+  (`resolve_app_id_override_with_env`) are both split out from their real, `directories`-crate/env-var-
+  touching callers specifically for testability — the latter takes the environment value as a plain
+  parameter rather than reading `std::env::var` itself, since mutating real process environment variables
+  in a test would be flaky under `cargo test`'s default parallel execution. 10 new `browser-core` tests (135
+  total) cover both directly, including a real rename against throwaway temp directories confirming content
+  survives the move and an older, second legacy id is left untouched once a more recent one is found. Also
+  verified live end-to-end against the real `browser-linux-gtk3` binary: `--app-id
+  app-id-smoke-test --profile work` created a real, fully isolated profile directory (`history.db`, and the
+  full webview persistence directory from the earlier cookie-persistence fix — cookies, localStorage,
+  WebKitCache) under the custom id, while the real `claude-browser` directory stayed untouched. The
+  automatic-migration path itself (`LEGACY_APP_IDS` actually containing an entry, exercised through the real
+  compiled `APP_ID`) couldn't be verified live the same way without either risking this machine's own real
+  `~/.config/claude-browser` data or temporarily editing the compiled constant — left to the unit tests
+  above, plus whenever a real rename actually happens and this genuinely gets exercised for the first time.
+  Full regression (`browser-core`'s 135 tests, the gtk3 headless suite — still 39 tests, `init_app_id` is a
+  process-wide one-shot `OnceLock` so it's deliberately never called from within the shared-process test
+  suite — workspace-wide `cargo check`) stayed green; both macOS architectures and both Windows front ends
+  compiled/linked clean.
+
 **`crates/browser-windows-reactor`** — a new, sixth front end, replacing `browser-windows-winui`'s
 `winio-winui3` dependency with Microsoft's own in-tree `windows-reactor`/`windows-webview` (see
 `summaries/windows-github-actions-ci.md`'s comparison-test section for why). Being built incrementally,

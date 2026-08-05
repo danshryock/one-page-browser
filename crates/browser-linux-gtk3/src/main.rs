@@ -8,6 +8,10 @@ fn main() -> anyhow::Result<()> {
     gtk::init()?;
 
     let args: Vec<String> = std::env::args().collect();
+    // Must run before anything touches a `Profile` path — resolves
+    // `--app-id`/`CLAUDE_BROWSER_APP_ID` if given, and migrates an
+    // existing user's data forward from a previous `APP_ID` otherwise.
+    browser_core::init_app_id(args.clone());
     if let Some(url) = resolve_url_argument(args.clone()) {
         show_external_link_chooser(url, resolve_profile_name(args))?;
     } else {

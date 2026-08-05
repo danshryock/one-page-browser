@@ -46,6 +46,10 @@ fn run() -> anyhow::Result<()> {
     browser_windows_winui::trace("run: after Application::new");
 
     let args: Vec<String> = std::env::args().collect();
+    // Must run before anything touches a `Profile` path — resolves
+    // `--app-id`/`CLAUDE_BROWSER_APP_ID` if given, and migrates an
+    // existing user's data forward from a previous `APP_ID` otherwise.
+    browser_core::init_app_id(args.clone());
     if let Some(url) = resolve_url_argument(args.clone()) {
         // Never constructs a `WebView2` control (confirmed: no
         // "webview"/"WebView2" reference anywhere in

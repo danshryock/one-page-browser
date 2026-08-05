@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::app_info::APP_ID;
+use crate::app_info::effective_app_id;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
@@ -41,24 +41,24 @@ impl Profile {
     }
 
     pub fn settings_path(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", APP_ID)?;
+        let dirs = directories::ProjectDirs::from("", "", effective_app_id())?;
         Some(dirs.config_dir().join(&self.name).join("settings.json"))
     }
 
     pub fn keybindings_path(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", APP_ID)?;
+        let dirs = directories::ProjectDirs::from("", "", effective_app_id())?;
         Some(dirs.config_dir().join(&self.name).join("keybindings.json"))
     }
 
     pub fn bookmarks_path(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", APP_ID)?;
+        let dirs = directories::ProjectDirs::from("", "", effective_app_id())?;
         Some(dirs.config_dir().join(&self.name).join("bookmarks.json"))
     }
 
     /// The currently-open pages (URLs + which one was active), saved on
     /// quit and reopened on next launch — see `Session`'s doc comment.
     pub fn session_path(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", APP_ID)?;
+        let dirs = directories::ProjectDirs::from("", "", effective_app_id())?;
         Some(dirs.config_dir().join(&self.name).join("session.json"))
     }
 
@@ -67,14 +67,14 @@ impl Profile {
     /// path yet (a separate step: `libsql`'s core API is async, and this
     /// project is entirely synchronous today).
     pub fn history_db_path(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", APP_ID)?;
+        let dirs = directories::ProjectDirs::from("", "", effective_app_id())?;
         Some(dirs.data_dir().join(&self.name).join("history.db"))
     }
 
     /// Reserved for the per-profile password vault database — same
     /// resolve-the-path-without-opening-anything split as `history_db_path`.
     pub fn passwords_db_path(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", APP_ID)?;
+        let dirs = directories::ProjectDirs::from("", "", effective_app_id())?;
         Some(dirs.data_dir().join(&self.name).join("passwords.db"))
     }
 
@@ -85,7 +85,7 @@ impl Profile {
     /// save dialog, not a forced location — the directory isn't created
     /// until a screenshot is actually about to be saved there.
     pub fn screenshots_dir(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", APP_ID)?;
+        let dirs = directories::ProjectDirs::from("", "", effective_app_id())?;
         Some(dirs.data_dir().join(&self.name).join("screenshots"))
     }
 
@@ -96,7 +96,7 @@ impl Profile {
     /// web context/environment at this directory (or skips doing so for an
     /// `ephemeral` profile, same convention as every other path here).
     pub fn webview_data_dir(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", APP_ID)?;
+        let dirs = directories::ProjectDirs::from("", "", effective_app_id())?;
         Some(dirs.data_dir().join(&self.name).join("webview"))
     }
 
@@ -109,7 +109,7 @@ impl Profile {
     /// without a key first — SQLite (and the cipher extension `libsql`
     /// layers on top of it) only discovers that on the first real read.
     pub fn passphrase_marker_path(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", APP_ID)?;
+        let dirs = directories::ProjectDirs::from("", "", effective_app_id())?;
         Some(dirs.data_dir().join(&self.name).join("passphrase-enabled"))
     }
 
@@ -147,7 +147,7 @@ impl Profile {
     /// implements that sharing — nothing at the storage layer links the two
     /// databases together).
     pub fn vault_passphrase_marker_path(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", APP_ID)?;
+        let dirs = directories::ProjectDirs::from("", "", effective_app_id())?;
         Some(dirs.data_dir().join(&self.name).join("vault-passphrase-enabled"))
     }
 
@@ -226,18 +226,23 @@ pub fn resolve_passphrase_setup_requested<I: IntoIterator<Item = String>>(args: 
 /// Pulls the first positional (non-flag) argument out — used for launching
 /// with a URL (e.g. from the OS's "open with"/default-browser handoff):
 /// `browser-linux-gtk3 https://example.com`. Skips `argv[0]` and
-/// `--profile`'s consumed value so a launch like `program --profile work
-/// https://example.com` still finds the URL, not `"work"`. Any other `--foo`
-/// flag is skipped generically (not enumerated by name) so this doesn't need
-/// updating every time a new flag is added elsewhere. Returns the raw token
-/// unchanged — unlike `resolve_address_input`, this isn't run through
-/// bare-domain/search-query resolution: a real external-link launch always
-/// hands over a fully-qualified URL, and resolving one would need a
-/// profile's `Settings` before a profile has even been picked.
+/// `--profile`'s/`--app-id`'s consumed value so a launch like `program
+/// --profile work https://example.com` still finds the URL, not `"work"`.
+/// Any other `--foo` flag is skipped generically (not enumerated by name)
+/// so this doesn't need updating every time a new flag is added elsewhere
+/// — `--profile`/`--app-id` need the extra handling specifically because
+/// they're the only two-token (space-separated) flags this crate parses;
+/// everything else is a bare presence check (`--incognito`) or already
+/// single-token via `=` (`--profile=work`, which `arg.starts_with("--")`
+/// already skips whole). Returns the raw token unchanged — unlike
+/// `resolve_address_input`, this isn't run through bare-domain/search-query
+/// resolution: a real external-link launch always hands over a
+/// fully-qualified URL, and resolving one would need a profile's
+/// `Settings` before a profile has even been picked.
 pub fn resolve_url_argument<I: IntoIterator<Item = String>>(args: I) -> Option<String> {
     let mut args = args.into_iter().skip(1); // skip argv[0]
     while let Some(arg) = args.next() {
-        if arg == "--profile" {
+        if arg == "--profile" || arg == "--app-id" {
             args.next(); // consume its value too, not the URL
             continue;
         }
@@ -254,7 +259,7 @@ pub fn resolve_url_argument<I: IntoIterator<Item = String>>(args: I) -> Option<S
 /// under), plus `"default"` even on a fresh install where it doesn't exist
 /// on disk yet. Used to populate the external-link chooser's profile picker.
 pub fn list_profile_names() -> Vec<String> {
-    match directories::ProjectDirs::from("", "", APP_ID) {
+    match directories::ProjectDirs::from("", "", effective_app_id()) {
         Some(dirs) => list_profile_names_in(dirs.config_dir()),
         None => vec!["default".to_string()],
     }
@@ -519,6 +524,19 @@ mod tests {
     fn resolve_url_argument_skips_other_flags_generically() {
         assert_eq!(
             resolve_url_argument(args(&["program", "--verbose", "https://example.com"])),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_url_argument_skips_the_app_id_flags_value() {
+        assert_eq!(
+            resolve_url_argument(args(&["program", "--app-id", "renamed", "https://example.com"])),
+            Some("https://example.com".to_string()),
+            "the URL, not the --app-id flag's value, should be returned"
+        );
+        assert_eq!(
+            resolve_url_argument(args(&["program", "--app-id=renamed", "https://example.com"])),
             Some("https://example.com".to_string())
         );
     }

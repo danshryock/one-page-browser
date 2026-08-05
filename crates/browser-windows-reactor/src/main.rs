@@ -18,6 +18,10 @@ fn main() -> anyhow::Result<()> {
     windows_reactor::bootstrap()?;
     browser_windows_reactor::trace("main: after bootstrap");
     let args: Vec<String> = std::env::args().collect();
+    // Must run before anything touches a `Profile` path — resolves
+    // `--app-id`/`CLAUDE_BROWSER_APP_ID` if given, and migrates an existing
+    // user's data forward from a previous `APP_ID` otherwise.
+    browser_core::init_app_id(args.clone());
     let result = if let Some(url) = browser_core::resolve_url_argument(args.clone()) {
         // Never constructs a `WebView2` control at all (confirmed: neither
         // `run_chooser` nor its window tree touches WebView2/`CoreWebView2`
