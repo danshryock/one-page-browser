@@ -14,24 +14,25 @@ browser-core         pure domain logic: Page/PageManager, Settings, Keybindings,
                       no toolkit — exposed via `testing`, see §4). 86 unit tests, toolkit-free.
                            |
 render-engine         RenderEngine trait (navigate/go_back/go_forward/reload/current_url/
-                      screenshot) + one impl per platform family (linux via WebKitGTK, the
-                      msvc winui.rs backend wrapping WinUI 3's native WebView2 control
-                      directly, macos via WKWebView). The one dimension that's genuinely
-                      swappable today. (windows-gnu's WryEngine was removed along with
-                      browser-windows-win32/nwg — see the scope note below; nothing left
-                      targets that triple.)
+                      screenshot) + one impl per platform family (linux via WebKitGTK,
+                      macos via WKWebView). `browser-windows-reactor` doesn't use this
+                      crate for its engine at all — it keeps `ReactorWebViewEngine` local
+                      (see §2's placement-policy note) — so render-engine today only
+                      covers Linux/macOS. (windows-gnu's WryEngine was removed along with
+                      browser-windows-win32/nwg, and the msvc winio-winui3-based
+                      WebView2Engine was removed along with browser-windows-winui itself
+                      — see the scope note below; nothing left targets either.)
                            |
 browser-chrome-core   NEW (§4/§7): toolkit-agnostic decision logic sitting between
                       browser-core's raw data and each frontend's native UI — currently
                       just `switcher` (SwitcherRow/build_switcher_rows/activate_row), unit-
                       tested with browser_core::testing::MockEngine + MemoryHistoryStore.
                            |
-4 frontend crates     browser-linux-gtk3, browser-windows-{winui,reactor},
-                      browser-macos-appkit. Each owns: window/toolbar construction,
-                      PageManager wiring, switcher/settings/profile-picker overlays,
-                      keybindings editor, and native event → core-call glue — though the
-                      switcher piece is now `browser-chrome-core`'s job for the two
-                      frontends already migrated (§4).
+3 frontend crates     browser-linux-gtk3, browser-windows-reactor, browser-macos-appkit.
+                      Each owns: window/toolbar construction, PageManager wiring,
+                      switcher/settings/profile-picker overlays, keybindings editor, and
+                      native event → core-call glue — though the switcher piece is now
+                      `browser-chrome-core`'s job for the frontends already migrated (§4).
 ```
 
 `browser-core` (2,522 lines), `render-engine` (520 lines), and the new `browser-chrome-core` are the
@@ -43,9 +44,14 @@ See §3 for the evidence.
 **Note on scope**: this document was originally written against 7 frontend crates; `browser-windows-win32`,
 `browser-windows-nwg`, and `browser-wx` were deleted afterward to reduce the number of near-duplicate
 implementations (unmaintained, behind the other frontends in feature scope, and Wine-cross-compile-only —
-see `ROADMAP.md`). Several findings below cite their code specifically, since the patterns found there (both
-good and bad) are still instructive even with the crates themselves gone — recoverable from git history if
-needed. Sections marked accordingly.
+see `ROADMAP.md`). `browser-windows-winui` was later deleted too — real WinUI 3 apps crash on GitHub Actions'
+GPU-less Windows runners just before first paint (`STATUS_STOWED_EXCEPTION`, confirmed via crash-dump
+analysis to be inside WinUI 3's own Composition/WinRT internals, not this codebase's own code), with no
+workaround found after an extensive bisection pass, while `browser-windows-reactor` — the other WinUI 3
+front end, built on a different underlying crate — worked fine; too problematic to keep maintaining
+alongside a working alternative (see `ROADMAP.md`). Several findings below cite deleted crates' code
+specifically, since the patterns found there (both good and bad) are still instructive even with the crates
+themselves gone — recoverable from git history if needed. Sections marked accordingly.
 
 ## 2. What's already well-modularized (keep doing this)
 
@@ -61,11 +67,13 @@ needed. Sections marked accordingly.
 - **The `render-engine` placement policy, once made explicit** (it isn't currently written down anywhere,
   which is itself a gap — see §4.6): an engine impl lives in `render-engine` *unless* its native dependency
   would burden other frontends' builds. `browser-windows-reactor` keeps its `ReactorWebViewEngine` local
-  specifically to avoid pulling `windows-reactor`'s git dependency into `browser-windows-winui`'s build
-  (documented in `engine.rs`'s own module comment) — a good, deliberate call, but nothing currently tells
-  the *next* person adding a frontend when to make the same call versus defaulting to `render-engine`. (The
-  now-deleted `browser-wx` was the other example of this — it kept its engine local because it wrapped a
-  wholly different webview control, `wxWebView` rather than `wry`, that the trait didn't otherwise need.)
+  specifically to avoid pulling `windows-reactor`'s git dependency into other frontends' builds — originally
+  written to avoid burdening the now-deleted `browser-windows-winui` specifically, but the same reasoning
+  still holds for any future frontend that might depend on `render-engine` (documented in `engine.rs`'s own
+  module comment) — a good, deliberate call, but nothing currently tells the *next* person adding a frontend
+  when to make the same call versus defaulting to `render-engine`. (The now-deleted `browser-wx` was the
+  other example of this — it kept its engine local because it wrapped a wholly different webview control,
+  `wxWebView` rather than `wry`, that the trait didn't otherwise need.)
 
 ## 3. Duplication found, with evidence
 
@@ -160,30 +168,31 @@ has ever had.
 ### 3.4 Settings save/cancel draft state
 
 Copy `Settings` into local draft fields on open, validate/parse the loaded-pages-limit field, apply on Save,
-discard on Cancel — same shape in `browser-linux-gtk3`, `browser-windows-winui`, `browser-windows-reactor`,
-`browser-macos-appkit`. None of this touches a native widget except the two lines that read/write the
-draft fields from/to actual controls.
+discard on Cancel — same shape in `browser-linux-gtk3`, `browser-windows-reactor`, `browser-macos-appkit`
+(and the now-deleted `browser-windows-winui` had it too). None of this touches a native widget except the
+two lines that read/write the draft fields from/to actual controls.
 
 ### 3.5 Keybindings editor state machine
 
 `listening_for: Option<Action>` (waiting for a new binding), add/remove/commit against `Keybindings`,
-persist, refresh — identical in `browser-linux-gtk3`, `browser-windows-winui`, `browser-windows-reactor`,
-`browser-macos-appkit`. The one genuine platform difference is *how* a chord is captured: `browser-linux-gtk3`
-(and, per its own docs, the now-deleted `browser-windows-win32`/`browser-windows-nwg` had they built this
-feature) can do live "press keys…" capture via a raw keydown event; `windows-reactor` and
-`browser-macos-appkit` fell back to typed-text parsing (`"Ctrl+Shift+P"`) because neither toolkit's
-declarative/high-level shortcut API exposes a generic "capture the next keypress" hook. So `parse_chord`
-itself genuinely isn't shareable across every capture style — but everything *after* obtaining a `KeyChord`
-(add/remove/persist/refresh) is 100% identical logic, currently copy-pasted across all four remaining
-frontends regardless of capture method.
+persist, refresh — identical in `browser-linux-gtk3`, `browser-windows-reactor`, `browser-macos-appkit` (the
+now-deleted `browser-windows-winui` had it too). The one genuine platform difference is *how* a chord is
+captured: `browser-linux-gtk3` (and, per its own docs, the now-deleted `browser-windows-win32`/
+`browser-windows-nwg` had they built this feature, and `browser-windows-winui` actually did) can do live
+"press keys…" capture via a raw keydown event; `windows-reactor` and `browser-macos-appkit` fell back to
+typed-text parsing (`"Ctrl+Shift+P"`) because neither toolkit's declarative/high-level shortcut API exposes
+a generic "capture the next keypress" hook. So `parse_chord` itself genuinely isn't shareable across every
+capture style — but everything *after* obtaining a `KeyChord` (add/remove/persist/refresh) is 100% identical
+logic, currently copy-pasted across all three remaining frontends regardless of capture method.
 
 ### 3.6 Profile picker
 
 `list_profile_names()` → mark the current one → click launches a new process or closes the picker (if
-already current). Same in `browser-linux-gtk3`, `browser-windows-winui`, `browser-windows-reactor`,
-`browser-macos-appkit` — i.e. universal across every remaining frontend. It was absent in the now-deleted
-`browser-windows-win32`/`browser-windows-nwg`/`browser-wx` (they only supported one profile via `--profile`,
-no in-app switcher UI) — a real scope gap at the time, not a bug, and moot now that those crates are gone.
+already current). Same in `browser-linux-gtk3`, `browser-windows-reactor`, `browser-macos-appkit` — i.e.
+universal across every remaining frontend (the now-deleted `browser-windows-winui` had it too). It was
+absent in the now-deleted `browser-windows-win32`/`browser-windows-nwg`/`browser-wx` (they only supported
+one profile via `--profile`, no in-app switcher UI) — a real scope gap at the time, not a bug, and moot now
+that those crates are gone.
 
 ### 3.7 Page-container strategy — a genuine platform difference, not just duplication
 
@@ -264,15 +273,16 @@ no new test infrastructure needed.
   `Similar` row variants, `bookmarks: Option<&Bookmarks>` parameter) before migrating `browser-linux-gtk3` —
   its real switcher also searches bookmarks and lexically-similar history matches, which the original
   3-variant shape (modeled on the simpler reactor/macos-appkit switchers) would have silently dropped.
-  All four frontends now migrated: `browser-windows-reactor` and `browser-macos-appkit` (their local `Tile`/
-  `SwitcherRow` enums and hand-copied row-building removed entirely), `browser-linux-gtk3` (its tile-building
-  split into `build_open_tile`/`build_add_tile`/`build_search_result_tile` helpers keyed by `SwitcherRow`
-  variant, with every tile's `widget_name` now its index into a stored `switcher_rows` snapshot — a bonus
-  fix along the way: history/bookmark/similar tiles previously had no `widget_name` at all, so keyboard
-  Enter/Space only ever worked on open-page/add tiles; routing every tile through the same index-based
-  `activate_switcher_row` fixed that gap for free), and `browser-windows-winui` (`None` passed for
-  `bookmarks` — no bookmarks integration in that crate — and each tile's `Click` closure now just captures
-  the `SwitcherActivation` computed once at build time, rather than a separate closure shape per row kind).
+  Every frontend that existed at the time was migrated: `browser-windows-reactor` and `browser-macos-appkit`
+  (their local `Tile`/`SwitcherRow` enums and hand-copied row-building removed entirely), `browser-linux-gtk3`
+  (its tile-building split into `build_open_tile`/`build_add_tile`/`build_search_result_tile` helpers keyed
+  by `SwitcherRow` variant, with every tile's `widget_name` now its index into a stored `switcher_rows`
+  snapshot — a bonus fix along the way: history/bookmark/similar tiles previously had no `widget_name` at
+  all, so keyboard Enter/Space only ever worked on open-page/add tiles; routing every tile through the same
+  index-based `activate_switcher_row` fixed that gap for free), and the now-deleted `browser-windows-winui`
+  (`None` passed for `bookmarks` — no bookmarks integration in that crate — and each tile's `Click` closure
+  just captured the `SwitcherActivation` computed once at build time, rather than a separate closure shape
+  per row kind).
 - **`SettingsController`**: draft-state handling (start page, search engine index, unlimited/limit), Save/
   Cancel, `String`/`bool`/`Option<usize>` fields only — no native widgets anywhere in this type.
 - **`KeybindingsController`**: add/remove/commit against `Keybindings`, decoupled from *how* the `KeyChord`
@@ -312,8 +322,8 @@ both architectures) after the changes.
 `browser-core`'s `MockEngine`-based test pattern (86 tests, zero native toolkit, `crates/browser-core/src/
 lib.rs`'s `#[cfg(test)] mod tests`) is the thing to extend, not replace. Once the controllers/models in §4
 exist, they're testable the exact same way — meaning the switcher/settings/keybindings/profile-picker
-decision logic across all four frontends, which currently has **zero automated test coverage** (only
-exercised by manual clicking), gets real unit tests essentially for free.
+decision logic across all three remaining frontends, which currently has **zero automated test coverage**
+(only exercised by manual clicking), gets real unit tests essentially for free.
 
 This is complementary to, not a replacement for, `browser-linux-gtk3`'s existing `tests/gtk_tests.rs`
 (using `gtk-test`, replacing what used to be manually-run `examples/nav_test.rs`/`switcher_test.rs`
@@ -327,9 +337,10 @@ having; neither substitutes for the other.
 Staged so each step is independently buildable/testable before the next starts — not a big-bang rewrite:
 
 1. ✅ **Quick wins** (§5) — done.
-2. ✅ **`SwitcherModel`** — done as a crate, migrated to all four frontends (`browser-windows-reactor`,
-   `browser-macos-appkit`, `browser-linux-gtk3`, `browser-windows-winui`). One deliberately-deferred item
-   remains: `browser-windows-reactor`'s `tile_element` still doesn't render `SwitcherRow::Open`'s `color` —
+2. ✅ **`SwitcherModel`** — done as a crate, migrated to every frontend that existed at the time
+   (`browser-windows-reactor`, `browser-macos-appkit`, `browser-linux-gtk3`, and the now-deleted
+   `browser-windows-winui`). One deliberately-deferred item remains: `browser-windows-reactor`'s
+   `tile_element` still doesn't render `SwitcherRow::Open`'s `color` —
    no background-color builder exists in that crate's bound subset of the WinUI 3 API (see the comment at
    `tile_element`'s definition) — a real, narrow toolkit gap, not a modeling gap.
 3. **`SettingsController` + `KeybindingsController`** — same treatment.

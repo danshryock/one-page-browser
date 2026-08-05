@@ -7,18 +7,14 @@ license.workspace = true
 [dependencies]
 anyhow = "1"
 
-# Only linux.rs and macos.rs use wry — the msvc-target WinUI 3 backend
-# (winui.rs) wraps the native Microsoft.UI.Xaml.Controls.WebView2 control
-# directly, no wry involved. Excluding wry there keeps that target's
-# dependency tree free of wry/webview2-com, which it never needs.
+# Only linux.rs and macos.rs use wry.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 wry = "0.55"
 # For `fill_login`'s JSON-escaping of untrusted username/password strings
 # before interpolating them into injected JS — JSON string syntax is a
 # subset of JS string syntax, so this is the correct way to do it, not
 # hand-rolled escaping. Scoped alongside wry since only the wry-based
-# engines (linux.rs/macos.rs) use it — winui.rs has no JS-injection
-# capability at all yet (see its module doc comment).
+# engines (linux.rs/macos.rs) use it.
 serde_json = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -34,11 +30,6 @@ webkit2gtk = "2.0"
 # on unifies with that same dependency and enables `ImageSurface::write_to_png`
 # everywhere, including through the `gtk::cairo` re-export.
 cairo-rs = { version = "0.18", features = ["png"] }
-
-[target.'cfg(all(target_os = "windows", target_env = "msvc"))'.dependencies]
-windows = { version = "0.62", features = ["Win32_Foundation"] }
-windows-core = "0.62"
-winio-winui3 = { version = "0.4", features = ["UI_Composition", "UI_Xaml_Controls_Primitives", "Web_WebView2_Core"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"

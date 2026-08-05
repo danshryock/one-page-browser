@@ -38,7 +38,7 @@ tiny_http = "0.12"
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 # `encryption` builds libsql-ffi's bundled SQLite3 Multiple Ciphers via
 # CMake, which needs `llvm-lib` when cross-compiling for the MSVC target
-# (`cargo build-windows-winui`, via xwin/clang-cl) — not available in this
+# (`cargo build-windows-reactor`, via xwin/clang-cl) — not available in this
 # environment's toolchain, confirmed by actually hitting the build failure,
 # not assumed. Windows stays excluded because of that; macOS was added
 # after directly confirming (via `cargo zigbuild`, this repo's real macOS

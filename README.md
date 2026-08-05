@@ -4,7 +4,7 @@ A cross-platform web browser written in Rust. No tabs, by design.
 
 ## Architecture
 
-- **Content rendering** is handled by the OS-native webview via [`wry`](https://github.com/tauri-apps/wry) (WebView2 on Windows, WKWebView on macOS/iOS, WebKitGTK on Linux, system WebView on Android) — except `browser-windows-winui`, which wraps WinUI 3's own native `WebView2` XAML control directly (see below).
+- **Content rendering** is handled by the OS-native webview via [`wry`](https://github.com/tauri-apps/wry) (WebView2 on Windows, WKWebView on macOS/iOS, WebKitGTK on Linux, system WebView on Android) — except `browser-windows-reactor`, which wraps its WebView2 control via Microsoft's own `windows-webview` crate directly (see below).
 - **Chrome (window, address bar, buttons)** is built with each platform's native UI toolkit rather than a shared cross-platform GUI toolkit — GTK (`gtk-rs`) on Linux, WinUI 3 on Windows, AppKit on macOS. This avoids an event-loop conflict that shared toolkits like `iced` would introduce with `wry`/`tao`.
 - Chrome code never depends on `wry` directly — it talks to a `RenderEngine` trait (`crates/render-engine`), so the underlying engine can be swapped later (e.g. Servo, CEF, a custom engine) without touching the app.
 
@@ -14,20 +14,19 @@ and planned refactoring to close that gap.
 Linux (`crates/browser-linux-gtk3`) is implemented, working, and has real `cargo test`-integrated regression
 tests (see "Testing" below).
 
-Windows has two front ends. `crates/browser-windows-winui` uses WinUI 3 (`Microsoft.UI.Xaml`) — the modern
-Fluent-design Windows toolkit, via the [`winio-winui3`](https://github.com/compio-rs/winio3-rs) bindings
-crate — wrapping WinUI 3's own native `Microsoft.UI.Xaml.Controls.WebView2` XAML control directly
-(`render-engine`'s `WebView2Engine`, gated to the `x86_64-pc-windows-msvc` target) rather than going through
-`wry`, since it's a real XAML `FrameworkElement` that participates in ordinary Grid/StackPanel layout with
-no manual resize plumbing needed. It's cross-compile-only — see "browser-windows-winui: building" below —
-the Windows App SDK runtime it needs isn't available under Wine, so it's never actually been run, only
-cross-compiled, cross-linked, and inspected.
+Windows has one front end. `crates/browser-windows-reactor` uses WinUI 3 (`Microsoft.UI.Xaml`) — the modern
+Fluent-design Windows toolkit — built on Microsoft's own in-tree `windows-reactor`/`windows-webview` crates
+(a declarative, React-like UI model), wrapping its WebView2 control directly rather than going through
+`wry`. It's been run for real, in a Windows VM used for interactive testing — see `ROADMAP.md` for the
+debugging history.
 
-`crates/browser-windows-reactor` is a second WinUI 3 front end, built on Microsoft's own in-tree
-`windows-reactor`/`windows-webview` crates (a declarative, React-like UI model) instead of `winio-winui3`'s
-imperative widget-tree style — see that crate's module doc comment for why both exist side by side. Unlike
-`browser-windows-winui`, this one *has* been run for real, in a Windows VM used for interactive testing —
-see `ROADMAP.md` for the debugging history.
+There used to be a second Windows front end, `crates/browser-windows-winui`, built on the
+[`winio-winui3`](https://github.com/compio-rs/winio3-rs) bindings crate's imperative widget-tree style
+instead of `windows-reactor`'s declarative one. It was deleted: cross-compile-only from day one (the
+Windows App SDK runtime it needs isn't available under Wine), and its one real-hardware CI run crashed with
+`STATUS_STOWED_EXCEPTION` just before first paint — a fault an extensive bisection pass traced to WinUI 3's
+own Composition/WinRT internals on a GPU-less CI runner, not this codebase's code, with no workaround found.
+Too problematic to keep maintaining alongside a working alternative — see `ROADMAP.md`.
 
 `crates/browser-macos-appkit` uses AppKit directly via `objc2`/`objc2-app-kit`, with `wry`'s `WKWebView`
 embedding for content — see "browser-macos-appkit: building" below. Cross-compiles from this Linux dev
@@ -75,9 +74,9 @@ cargo build
 ```
 
 This builds the whole workspace on any host. Each `target_os`-gated crate (`browser-linux-gtk3`,
-`browser-windows-winui`, `browser-windows-reactor`, `browser-macos-appkit`) compiles to an empty stub
-binary on a platform it doesn't apply to (which just prints a one-line explanation if you run it) instead
-of failing, so a bare `cargo build` never needs `--exclude` flags no matter which of these you're on.
+`browser-windows-reactor`, `browser-macos-appkit`) compiles to an empty stub binary on a platform it doesn't
+apply to (which just prints a one-line explanation if you run it) instead of failing, so a bare `cargo build`
+never needs `--exclude` flags no matter which of these you're on.
 
 ## Running
 
@@ -94,7 +93,7 @@ cargo run-gtk3   # same as `cargo run -p browser-linux-gtk3`
 
 ### Launching with a URL
 
-`browser-linux-gtk3`/`browser-windows-winui`/`browser-windows-reactor`/`browser-macos-appkit` all accept a
+`browser-linux-gtk3`/`browser-windows-reactor`/`browser-macos-appkit` all accept a
 bare URL argument (the shape a real OS-level "open with"/default-browser handoff would use, e.g.
 `browser-linux-gtk3 https://example.com`) — instead of opening the normal window straight away, this shows a
 small standalone chooser first: the URL, a profile field pre-filled from `--profile` (or `"default"`), and
@@ -102,11 +101,11 @@ Open/Cancel. Picking a profile and clicking Open opens the real browser window s
 the URL as its first page. Handing the URL off to an already-running instance of the browser, and a
 separate "choose which installed browser to use at all" picker, are both later work, not implemented yet.
 
-### browser-windows-winui / browser-windows-reactor: building
+### browser-windows-reactor: building
 
-Both are cross-compile-only — never run, even under Wine, since WinUI 3 needs the real Windows App SDK
-runtime installed (`browser-windows-reactor` *has* been run for real, but only in an actual Windows VM used
-for interactive testing — see `ROADMAP.md`). Cross-compiling to `x86_64-pc-windows-msvc` needs
+From this Linux dev machine it's cross-compile-only (it *has* been run for real, but only in an actual
+Windows VM used for interactive testing — see `ROADMAP.md`). Cross-compiling to `x86_64-pc-windows-msvc`
+needs
 [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin) (which downloads and caches the Windows SDK + MSVC
 CRT via [`xwin`](https://github.com/Jake-Shadle/xwin) on first use) plus a system `clang`/`lld`/`llvm-lib`
 install (`cargo-xwin` doesn't bundle its own compiler toolchain the way `cargo-zigbuild` does) — on Ubuntu,
@@ -117,7 +116,6 @@ unversioned names by default.
 cargo install cargo-xwin
 rustup target add x86_64-pc-windows-msvc
 
-cargo build-windows-winui    # alias for: cargo xwin build --target x86_64-pc-windows-msvc -p browser-windows-winui
 cargo build-windows-reactor  # alias for: cargo xwin build --target x86_64-pc-windows-msvc -p browser-windows-reactor
 ```
 

@@ -9,9 +9,9 @@ browser-core = { path = "../browser-core" }
 browser-chrome-core = { path = "../browser-chrome-core" }
 # For the RenderEngine trait, so PageManager<ReactorWebViewEngine> (see
 # src/engine.rs) can be reused as-is rather than reinvented. The impl itself
-# stays local to this crate (not in render-engine, alongside WebView2Engine)
-# to avoid pulling windows-reactor/windows-webview's git dependency into
-# browser-windows-winui's build via the shared crate.
+# stays local to this crate rather than living in render-engine, to avoid
+# pulling windows-reactor/windows-webview's git dependency into any other
+# frontend's build via the shared crate.
 render-engine = { path = "../render-engine" }
 anyhow = "1"
 
@@ -20,15 +20,16 @@ anyhow = "1"
 # `windows` crate), not yet published to crates.io as real code (the
 # crates.io listing is a 0.0.0 placeholder — see
 # summaries/windows-github-actions-ci.md's "windows-reactor comparison test"
-# section) — hence the git dependency rather than a version. Being tried as
-# a replacement for `winio-winui3` (the community-maintained wrapper
-# `browser-windows-winui` depends on) since a comparison smoke test against
-# it survived where the real app crashes with STATUS_STOWED_EXCEPTION under
-# winio-winui3 — see that same doc section for the full investigation.
+# section) — hence the git dependency rather than a version. Originally tried
+# as a replacement for `winio-winui3` (the community-maintained wrapper the
+# now-deleted `browser-windows-winui` depended on — see ROADMAP.md) since a
+# comparison smoke test against it survived where that crate's real app
+# crashed with STATUS_STOWED_EXCEPTION under winio-winui3 — see that same
+# doc section for the full investigation.
 #
-# Same MSVC-only gating as browser-windows-winui: WinRT/COM interop needs
-# MSVC specifically, not the x86_64-pc-windows-gnu target the other Windows
-# crates in this workspace use.
+# MSVC-only gating: WinRT/COM interop needs MSVC specifically, not the
+# x86_64-pc-windows-gnu target the other Windows crates in this workspace
+# used to use.
 [target.'cfg(all(target_os = "windows", target_env = "msvc"))'.dependencies]
 windows-reactor = { git = "https://github.com/microsoft/windows-rs" }
 windows-webview = { git = "https://github.com/microsoft/windows-rs", features = ["reactor"] }

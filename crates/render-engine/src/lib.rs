@@ -16,15 +16,20 @@ pub trait RenderEngine {
     fn screenshot(&self, callback: Box<dyn Fn(anyhow::Result<Vec<u8>>)>);
 }
 
+/// A generic `Send`-asserting wrapper — for a value that's provably only
+/// ever touched from one thread (a single-threaded UI event loop), but
+/// needs to satisfy a `Send` bound some framework imposes regardless (e.g.
+/// `windows-reactor`'s `App::render`, even though the whole app is one STA
+/// UI thread — see `browser-windows-reactor`'s own use of this). Not tied
+/// to any one platform's engine — kept here, ungated, since more than one
+/// frontend needs the exact same escape hatch.
+pub struct AssertSend<T>(pub T);
+unsafe impl<T> Send for AssertSend<T> {}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::WryEngine;
-
-#[cfg(all(target_os = "windows", target_env = "msvc"))]
-mod winui;
-#[cfg(all(target_os = "windows", target_env = "msvc"))]
-pub use winui::{AssertSend, WebView2Engine};
 
 #[cfg(target_os = "macos")]
 mod macos;

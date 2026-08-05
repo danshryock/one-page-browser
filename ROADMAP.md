@@ -768,13 +768,36 @@ Still an open investigation — see `summaries/windows-github-actions-ci.md` for
 round, every ruled-out theory, the crash dump analysis, the `windows-reactor` comparison result, and what's
 still untested).
 
+- **Deleted**: `browser-windows-winui`, closing the investigation above rather than resolving it. The crash
+  (`STATUS_STOWED_EXCEPTION`, just before first paint, on GitHub Actions' GPU-less `windows-latest` runners)
+  survived an extensive bisection pass — ten separate smoke-test binaries isolating every individually
+  unusual piece of the real window (bare window, custom title bar, `WebView2`, HWND subclassing, every
+  pairwise/triple combination, `HistoryStore`, exact construction order, `MemoryHistoryStore`) — every one of
+  them survived cleanly, and a real crash dump's stack trace lived entirely inside Microsoft's own
+  `combase.dll`/`ucrtbase.dll`/`KERNELBASE.dll`, with `browser-windows-winui.exe` appearing nowhere in any
+  thread. That points at WinUI 3's own Composition/WinRT internals on a GPU-less machine, not a bug in this
+  codebase or even necessarily in the `winio-winui3` binding crate — but with `browser-windows-reactor`
+  (the other WinUI 3 front end, built on Microsoft's own `windows-reactor` instead of `winio-winui3`) already
+  working — real navigation, multi-page, switcher, overlays, chooser, all interactively verified in a local
+  Windows VM — there was no reason to keep maintaining a second, unverifiable, cross-compile-only front end
+  against the same underlying platform. Removed: `crates/browser-windows-winui/`, `render-engine/src/winui.rs`
+  (and the `windows`/`windows-core`/`winio-winui3` dependencies that only it used — `AssertSend`, the one
+  piece of that file `browser-windows-reactor` also genuinely needed, moved to `render-engine/src/lib.rs`
+  itself, ungated), the workspace member entry, the `build-windows-winui` cargo alias, and the entire
+  `build-and-smoke-winui` CI job (the ten-round bisection saga above) from `.github/workflows/windows.yml`.
+  `README.md`/`ARCHITECTURE.md`/`BUILD_AUTOMATION.md`/`FEATURE_MATRIX.md` updated to match — same treatment
+  as `browser-windows-win32`/`browser-windows-nwg`/`browser-wx` before it: recoverable from git history if
+  ever needed again, historical references kept where the patterns found are still instructive. Verified via
+  `cargo check --workspace` and `cargo build-windows-reactor` (real recompile needed after `AssertSend`
+  moved) staying green afterward.
+
 ## Backlog (not yet started, roughly in the order raised)
 
 - `browser-macos-appkit`: a wrapping tile grid (`NSCollectionView`) instead of the current plain-list
   switcher/profile/passwords/bookmarks overlays — the one remaining item from the bookmarks/theme/encrypted-
   history bullet above, deliberately deferred there as "a smaller, separate follow-up."
-- `browser-windows-winui`: unified search/URL bar and bookmarks, matching what `browser-linux-gtk3` now has
-  (both landed there only, per scope — see "Done" above).
+- `browser-windows-reactor`: unified search/URL bar and bookmarks, matching what `browser-linux-gtk3` now
+  has (both landed there only, per scope — see "Done" above).
 - Other external password managers beyond Bitwarden/Vaultwarden (see "Done" above for that one) — KeePassXC/
   secret-service, 1Password, etc. Each would be its own `PasswordBackend` impl; no shared "generic external
   manager" abstraction beyond the trait itself is needed until a second one is actually built.
@@ -802,8 +825,8 @@ still untested).
   MSVC cross-compile target too — `browser-core/Cargo.toml` now scopes it to
   `any(target_os = "linux", target_os = "macos")` (macOS confirmed working this session, both for the vault
   and now history — see "Done" above), so only Windows remains stubbed. The confirmed blocker there (`cargo
-  build-windows-winui`/`-reactor`, via `cargo-xwin`) is that libsql-ffi's CMake build needs `llvm-lib`, not
-  available in this toolchain — worth revisiting once/if that's installable.
+  build-windows-reactor`, via `cargo-xwin`) is that libsql-ffi's CMake build needs `llvm-lib`, not available
+  in this toolchain — worth revisiting once/if that's installable.
 - Changing/removing a profile's passphrase, or migrating an existing unencrypted profile (history or vault)
   to encrypted (`sqlite3_rekey` is available via libsql-sys but not wired up yet) — i.e. key rotation.
 - Investigate key derivation for the two encrypted stores: today `HistoryStore::open_encrypted`/
@@ -813,9 +836,5 @@ still untested).
   key from the shared passphrase (e.g. via HKDF with a per-store context/salt) would be meaningfully safer
   than reusing identical key material across two independent database files, and whether that's compatible
   with `decide_vault_unlock_action`'s "one passphrase, both stores" UX or would need to change it.
-- `browser-windows-winui` debugging — it's been cross-compile/link-verified only all along (see "Done"
-  above), never actually run; once it can be run on real Windows, expect a real debugging pass (custom
-  title bar drag, the `WM_KEYDOWN` HWND-subclass keybinding capture, `WebView2` control behavior, etc. are
-  all unverified at runtime).
 - A real semantic embedding for vector search (swapping in a local ML model or a network embedding API in
   place of the current lexical hashing-trick embedding) — see `summaries/vector-search.md`'s "Scope notes."

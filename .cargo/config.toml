@@ -4,23 +4,19 @@
 [alias]
 run-gtk3 = "run -p browser-linux-gtk3"
 
-# browser-windows-winui only needs to cross-*compile* (see
-# crates/browser-windows-winui/src/lib.rs) — it's never run, and cargo-xwin's
-# own "build" verb *is* reachable directly through [alias] the same way
-# run-gtk3 reaches cargo's built-in "run".
-build-windows-winui = "xwin build --target x86_64-pc-windows-msvc -p browser-windows-winui"
-# Same reasoning as build-windows-winui above, for the windows-reactor-based
-# rebuild (see crates/browser-windows-reactor/src/lib.rs's module doc
-# comment).
+# browser-windows-reactor only needs to cross-*compile* — cargo-xwin's own
+# "build" verb *is* reachable directly through [alias] the same way
+# run-gtk3 reaches cargo's built-in "run" (see
+# crates/browser-windows-reactor/src/lib.rs's module doc comment).
 build-windows-reactor = "xwin build --target x86_64-pc-windows-msvc -p browser-windows-reactor"
 
 # browser-macos-appkit cross-compiles from Linux via `cargo zigbuild` plus a
 # macOS SDK for the Apple framework stubs the link step needs — neither of
 # those can be reached through a plain [alias] the way
-# build-windows-winui/build-windows-reactor are (cargo-xwin bundles its own
-# SDK-fetcher; cargo-zigbuild needs Zig on PATH and SDKROOT set up first,
-# which aliases can't do). Use .cargo/build-macos-appkit.sh instead (see
-# README.md's "browser-macos-appkit: building" section).
+# build-windows-reactor is (cargo-xwin bundles its own SDK-fetcher;
+# cargo-zigbuild needs Zig on PATH and SDKROOT set up first, which aliases
+# can't do). Use .cargo/build-macos-appkit.sh instead (see README.md's
+# "browser-macos-appkit: building" section).
 
 # browser-core pulls in libsql, whose libsql-ffi dependency compiles a
 # bundled sqlite3.c via cc-rs for *every* target it's built for, including
@@ -40,5 +36,5 @@ build-windows-reactor = "xwin build --target x86_64-pc-windows-msvc -p browser-w
 # `$CARGO_HOME/config.toml` (i.e. `~/.cargo/config.toml`), which is NOT
 # checked into the repo — that's where these two lines now live on this
 # machine, which is the correct place for "where a tool happens to be
-# installed on this specific box". If `cargo build-windows-winui` ever fails
+# installed on this specific box". If `cargo build-windows-reactor` ever fails
 # here with a similar ToolNotFound error, check `~/.cargo/config.toml` first.

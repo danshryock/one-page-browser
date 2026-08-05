@@ -16,10 +16,10 @@ Worth being precise about this, since it's not starting from zero:
   `.zig/`/`.macos-sdk/`, falls back to `PATH`/`SDKROOT`) — it just doesn't automate the initial *fetching* of
   those two things. This is the closest existing precedent for the scripts proposed below; §3 follows its
   shape deliberately.
-- **`cargo build-windows-winui`/`cargo build-windows-reactor`** (`.cargo/config.toml` aliases) fully
-  automate the xwin *invocation* — `cargo-xwin` itself downloads and caches the Windows SDK + MSVC CRT on
-  first use, no manual step there. What's still manual is getting `cargo-xwin` and a system `clang`/`lld`/
-  `llvm-lib` installed in the first place (§2.2).
+- **`cargo build-windows-reactor`** (a `.cargo/config.toml` alias) fully automates the xwin *invocation* —
+  `cargo-xwin` itself downloads and caches the Windows SDK + MSVC CRT on first use, no manual step there.
+  What's still manual is getting `cargo-xwin` and a system `clang`/`lld`/`llvm-lib` installed in the first
+  place (§2.2).
 - **`.github/workflows/windows.yml`/`macos.yml`** are themselves fully automated environment setup + build,
   just scoped to GitHub's hosted runners specifically (`windows-latest` already has the real MSVC toolchain;
   `macos-14`/`macos-13` already have real Xcode) — they don't help a fresh Linux dev machine.
@@ -38,7 +38,7 @@ sudo apt install -y build-essential libgtk-3-dev libwebkit2gtk-4.1-dev  # or -4.
 Smallest gap of the four — two package-manager calls. Still worth scripting for consistency and to handle
 the `-4.1-dev`/`-4.0-dev` fallback automatically rather than making a human retry by hand.
 
-### 2.2 Windows cross-compile (`browser-windows-winui`, `browser-windows-reactor`)
+### 2.2 Windows cross-compile (`browser-windows-reactor`)
 
 ```sh
 cargo install cargo-xwin
@@ -113,9 +113,9 @@ Detects which setup scripts are relevant (native Linux frontend always; Windows/
 their setup has already been run, or runs it first if `--setup` is passed), then runs the full matrix:
 
 ```sh
-cargo build                                              # native (whatever this host is)
-cargo build-windows-winui && cargo build-windows-reactor  # if Windows toolchain present
-.cargo/build-macos-appkit.sh aarch64-apple-darwin         # if macOS toolchain present
+cargo build                                       # native (whatever this host is)
+cargo build-windows-reactor                       # if Windows toolchain present
+.cargo/build-macos-appkit.sh aarch64-apple-darwin # if macOS toolchain present
 .cargo/build-macos-appkit.sh x86_64-apple-darwin
 ```
 
