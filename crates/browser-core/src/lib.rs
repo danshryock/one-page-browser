@@ -24,7 +24,7 @@ mod profile;
 mod session;
 mod settings;
 pub mod testing;
-pub use app_info::APP_NAME;
+pub use app_info::{APP_ID, APP_TITLE};
 pub use bitwarden::{BitwardenBackend, BitwardenStatus};
 pub use bookmarks::{Bookmark, Bookmarks};
 pub use history::{HistoryBackend, HistoryEntry, HistoryStore, MemoryHistoryStore};

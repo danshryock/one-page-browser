@@ -469,17 +469,23 @@ build/run instructions.
   `aarch64-apple-darwin`/`x86_64-apple-darwin`; `browser-windows-winui`/`browser-windows-reactor` both
   compiled/linked clean via `cargo build-windows-winui`/`-reactor` — none of the three could be run to
   verify real behavior from this machine.
-- The application's name/identity, consolidated into one `pub const APP_NAME: &str = "claude-browser"` in a
-  new `browser-core::app_info` module — was previously a bare string literal duplicated 13+ times across
-  `Profile`'s `directories::ProjectDirs::from("", "", "claude-browser")` calls (the one place it's actually
-  load-bearing: it determines the real OS-level config/data directory) plus every front end's window title
-  and both Windows front ends' `WEBVIEW2_USER_DATA_FOLDER` path segment. Renaming the app is now a one-line
-  change here (still needs a real data migration for existing users' profile directories, which this alone
-  doesn't handle — noted in the constant's own doc comment). Fixed a small pre-existing inconsistency along
-  the way: `browser-macos-appkit`'s window title was `"Claude Browser"` (space, title case) while every
-  other front end used `"claude-browser"` — now unified. Deliberately left test-only scratch-directory
-  prefixes (`claude-browser-test-*`, `claude-browser-ephemeral-*`) as plain literals, not part of "the title
-  and the application name" this was scoped to. See `NAMING.md` for the actual rename this was prep for.
+- The application's name/identity, consolidated into `browser-core::app_info` — was previously a bare
+  string literal duplicated 13+ times across `Profile`'s `directories::ProjectDirs::from("", "",
+  "claude-browser")` calls (the one place it's actually load-bearing: it determines the real OS-level
+  config/data directory) plus every front end's window title and both Windows front ends'
+  `WEBVIEW2_USER_DATA_FOLDER` path segment. First pass collapsed everything into one `APP_NAME` constant,
+  which turned out wrong — a path-safe identifier and a human-readable window title are genuinely different
+  strings with different constraints, not one value wearing two hats. Corrected to two constants: `APP_ID`
+  (`"claude-browser"`, path-safe/lowercase-hyphenated — `Profile`'s directory resolution, both Windows front
+  ends' WebView2 path) and `APP_TITLE` (`"Claude Browser"`, human-readable — every front end's window
+  title). Renaming the app is now a one- or two-line change here (still needs a real data migration for
+  existing users' profile directories if `APP_ID` changes, which this alone doesn't handle — noted in the
+  constants' own doc comment). Along the way, unified `browser-macos-appkit`'s window title (previously
+  drifted to `"Claude Browser"` while every other front end used `"claude-browser"`) with the other three
+  front ends onto the same shared `APP_TITLE` — all four now show the identical human-readable title.
+  Deliberately left test-only scratch-directory prefixes (`claude-browser-test-*`,
+  `claude-browser-ephemeral-*`) as plain literals, not part of "the title and the application name" this was
+  scoped to. See `NAMING.md` for the actual rename this was prep for.
 
 **`crates/browser-windows-reactor`** — a new, sixth front end, replacing `browser-windows-winui`'s
 `winio-winui3` dependency with Microsoft's own in-tree `windows-reactor`/`windows-webview` (see

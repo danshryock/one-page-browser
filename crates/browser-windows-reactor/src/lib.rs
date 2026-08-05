@@ -84,7 +84,7 @@ use std::rc::Rc;
 
 use browser_core::{
     launch_new_profile_process, list_profile_names, resolve_address_input, Action, HistoryStore, KeyChord, Keybindings,
-    PageManager, Profile, Session, SessionPage, Settings, APP_NAME, HOME_URL,
+    PageManager, Profile, Session, SessionPage, Settings, APP_TITLE, HOME_URL,
 };
 use engine::ReactorWebViewEngine;
 use windows_reactor::*;
@@ -571,7 +571,7 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     // but rendering the toolbar as an ordinary row right below it sidesteps
     // the problem entirely instead of fighting non-client hit testing from
     // a crate that doesn't expose it.
-    let title_bar = Element::from(TitleBar::new(APP_NAME));
+    let title_bar = Element::from(TitleBar::new(APP_TITLE));
 
     // Every *loaded* page's webview stays mounted (see this module's doc
     // comment on why); the active one is pushed last so it paints on top.
@@ -1109,7 +1109,7 @@ pub fn run(profile: Profile) -> anyhow::Result<()> {
     // (used throughout `browser-windows-winui` for winio-winui3's WinRT
     // delegate constructors), so reused here rather than duplicated.
     let shared = render_engine::AssertSend(shared);
-    App::new().title(APP_NAME).render(move |cx| {
+    App::new().title(APP_TITLE).render(move |cx| {
         let shared = &shared;
         app(cx, &shared.0)
     })?;
