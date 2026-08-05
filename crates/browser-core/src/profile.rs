@@ -6,6 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::app_info::APP_NAME;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
     pub name: String,
@@ -39,24 +41,24 @@ impl Profile {
     }
 
     pub fn settings_path(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        let dirs = directories::ProjectDirs::from("", "", APP_NAME)?;
         Some(dirs.config_dir().join(&self.name).join("settings.json"))
     }
 
     pub fn keybindings_path(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        let dirs = directories::ProjectDirs::from("", "", APP_NAME)?;
         Some(dirs.config_dir().join(&self.name).join("keybindings.json"))
     }
 
     pub fn bookmarks_path(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        let dirs = directories::ProjectDirs::from("", "", APP_NAME)?;
         Some(dirs.config_dir().join(&self.name).join("bookmarks.json"))
     }
 
     /// The currently-open pages (URLs + which one was active), saved on
     /// quit and reopened on next launch — see `Session`'s doc comment.
     pub fn session_path(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        let dirs = directories::ProjectDirs::from("", "", APP_NAME)?;
         Some(dirs.config_dir().join(&self.name).join("session.json"))
     }
 
@@ -65,14 +67,14 @@ impl Profile {
     /// path yet (a separate step: `libsql`'s core API is async, and this
     /// project is entirely synchronous today).
     pub fn history_db_path(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        let dirs = directories::ProjectDirs::from("", "", APP_NAME)?;
         Some(dirs.data_dir().join(&self.name).join("history.db"))
     }
 
     /// Reserved for the per-profile password vault database — same
     /// resolve-the-path-without-opening-anything split as `history_db_path`.
     pub fn passwords_db_path(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        let dirs = directories::ProjectDirs::from("", "", APP_NAME)?;
         Some(dirs.data_dir().join(&self.name).join("passwords.db"))
     }
 
@@ -83,7 +85,7 @@ impl Profile {
     /// save dialog, not a forced location — the directory isn't created
     /// until a screenshot is actually about to be saved there.
     pub fn screenshots_dir(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        let dirs = directories::ProjectDirs::from("", "", APP_NAME)?;
         Some(dirs.data_dir().join(&self.name).join("screenshots"))
     }
 
@@ -94,7 +96,7 @@ impl Profile {
     /// web context/environment at this directory (or skips doing so for an
     /// `ephemeral` profile, same convention as every other path here).
     pub fn webview_data_dir(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        let dirs = directories::ProjectDirs::from("", "", APP_NAME)?;
         Some(dirs.data_dir().join(&self.name).join("webview"))
     }
 
@@ -107,7 +109,7 @@ impl Profile {
     /// without a key first — SQLite (and the cipher extension `libsql`
     /// layers on top of it) only discovers that on the first real read.
     pub fn passphrase_marker_path(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        let dirs = directories::ProjectDirs::from("", "", APP_NAME)?;
         Some(dirs.data_dir().join(&self.name).join("passphrase-enabled"))
     }
 
@@ -145,7 +147,7 @@ impl Profile {
     /// implements that sharing — nothing at the storage layer links the two
     /// databases together).
     pub fn vault_passphrase_marker_path(&self) -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("", "", "claude-browser")?;
+        let dirs = directories::ProjectDirs::from("", "", APP_NAME)?;
         Some(dirs.data_dir().join(&self.name).join("vault-passphrase-enabled"))
     }
 
@@ -252,7 +254,7 @@ pub fn resolve_url_argument<I: IntoIterator<Item = String>>(args: I) -> Option<S
 /// under), plus `"default"` even on a fresh install where it doesn't exist
 /// on disk yet. Used to populate the external-link chooser's profile picker.
 pub fn list_profile_names() -> Vec<String> {
-    match directories::ProjectDirs::from("", "", "claude-browser") {
+    match directories::ProjectDirs::from("", "", APP_NAME) {
         Some(dirs) => list_profile_names_in(dirs.config_dir()),
         None => vec!["default".to_string()],
     }

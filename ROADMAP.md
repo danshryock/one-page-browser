@@ -469,8 +469,17 @@ build/run instructions.
   `aarch64-apple-darwin`/`x86_64-apple-darwin`; `browser-windows-winui`/`browser-windows-reactor` both
   compiled/linked clean via `cargo build-windows-winui`/`-reactor` — none of the three could be run to
   verify real behavior from this machine.
-
-## Next
+- The application's name/identity, consolidated into one `pub const APP_NAME: &str = "claude-browser"` in a
+  new `browser-core::app_info` module — was previously a bare string literal duplicated 13+ times across
+  `Profile`'s `directories::ProjectDirs::from("", "", "claude-browser")` calls (the one place it's actually
+  load-bearing: it determines the real OS-level config/data directory) plus every front end's window title
+  and both Windows front ends' `WEBVIEW2_USER_DATA_FOLDER` path segment. Renaming the app is now a one-line
+  change here (still needs a real data migration for existing users' profile directories, which this alone
+  doesn't handle — noted in the constant's own doc comment). Fixed a small pre-existing inconsistency along
+  the way: `browser-macos-appkit`'s window title was `"Claude Browser"` (space, title case) while every
+  other front end used `"claude-browser"` — now unified. Deliberately left test-only scratch-directory
+  prefixes (`claude-browser-test-*`, `claude-browser-ephemeral-*`) as plain literals, not part of "the title
+  and the application name" this was scoped to. See `NAMING.md` for the actual rename this was prep for.
 
 **`crates/browser-windows-reactor`** — a new, sixth front end, replacing `browser-windows-winui`'s
 `winio-winui3` dependency with Microsoft's own in-tree `windows-reactor`/`windows-webview` (see

@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use browser_core::{
     decide_vault_unlock_action, domain_of, list_profile_names, resolve_address_input, Action, BitwardenBackend, BitwardenStatus,
     Bookmarks, HistoryStore, KeyChord, Keybindings, Login, LoginFields, PageManager, PasswordBackend, PasswordStore, Profile, Session,
-    SessionPage, Settings, Theme, VaultUnlockAction,
+    SessionPage, Settings, Theme, VaultUnlockAction, APP_NAME,
 };
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WebContext, WryEngine};
@@ -2513,7 +2513,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     }
 
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
-    window.set_title(if profile.ephemeral { "claude-browser (Private)" } else { "claude-browser" });
+    window.set_title(&if profile.ephemeral { format!("{APP_NAME} (Private)") } else { APP_NAME.to_string() });
     window.set_default_size(1024, 768);
     // `connect_delete_event` is wired further down, once `app` exists —
     // see the comment there (search "the window's own close button") for

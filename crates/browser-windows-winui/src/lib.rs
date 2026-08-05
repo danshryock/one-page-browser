@@ -38,7 +38,7 @@ use std::rc::Rc;
 
 use browser_core::{
     list_profile_names, resolve_address_input, Action, HistoryStore, KeyChord, Keybindings, PageManager, Profile, Session,
-    SessionPage, Settings,
+    SessionPage, Settings, APP_NAME,
 };
 use render_engine::{AssertSend, RenderEngine, WebView2Engine};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -798,7 +798,7 @@ fn icon_button(label: &str) -> anyhow::Result<Button> {
 /// call `app.add_page(&app.settings().start_page.clone())` afterward.
 pub fn build_window_and_app(profile: Profile) -> anyhow::Result<Rc<AppState>> {
     let window = Window::new()?;
-    window.SetTitle(&HSTRING::from("claude-browser"))?;
+    window.SetTitle(&HSTRING::from(APP_NAME))?;
     if let Ok(app_window) = window.AppWindow() {
         let _ = app_window.Resize(windows::Graphics::SizeInt32 { Width: 1024, Height: 768 });
     }

@@ -71,7 +71,7 @@ fn set_webview2_user_data_folder(profile: &browser_core::Profile) {
         return;
     }
     if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-        let path = std::path::Path::new(&local_app_data).join("claude-browser").join("webview2").join(&profile.name);
+        let path = std::path::Path::new(&local_app_data).join(browser_core::APP_NAME).join("webview2").join(&profile.name);
         // SAFETY: called once, before any other thread exists (nothing has
         // spawned one yet) and before anything reads this variable, and
         // before `run(profile)` constructs the first `WebView2` control.

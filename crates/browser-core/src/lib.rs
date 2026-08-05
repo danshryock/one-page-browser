@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use render_engine::RenderEngine;
 
+mod app_info;
 mod bitwarden;
 mod bookmarks;
 mod embedding;
@@ -23,6 +24,7 @@ mod profile;
 mod session;
 mod settings;
 pub mod testing;
+pub use app_info::APP_NAME;
 pub use bitwarden::{BitwardenBackend, BitwardenStatus};
 pub use bookmarks::{Bookmark, Bookmarks};
 pub use history::{HistoryBackend, HistoryEntry, HistoryStore, MemoryHistoryStore};

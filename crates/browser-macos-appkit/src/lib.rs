@@ -99,7 +99,7 @@ use browser_core::{
     decide_vault_unlock_action, domain_of, launch_new_encrypted_profile_process, launch_new_profile_process,
     list_profile_names, resolve_address_input, resolve_profile_name, resolve_url_argument, Action, BitwardenBackend,
     BitwardenStatus, Bookmark, Bookmarks, HistoryStore, Keybindings, Login, LoginFields, PageManager, PasswordBackend,
-    PasswordStore, Profile, Session, SessionPage, Settings, Theme, VaultUnlockAction, HOME_URL,
+    PasswordStore, Profile, Session, SessionPage, Settings, Theme, VaultUnlockAction, APP_NAME, HOME_URL,
 };
 use render_engine::{RenderEngine, WebContext, WryEngine};
 
@@ -2011,7 +2011,7 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
     let window_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1000.0, 700.0));
     let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable | NSWindowStyleMask::Resizable;
     let window = unsafe { NSWindow::initWithContentRect_styleMask_backing_defer(NSWindow::alloc(mtm), window_rect, style, NSBackingStoreType::Buffered, false) };
-    window.setTitle(&NSString::from_str("Claude Browser"));
+    window.setTitle(&NSString::from_str(APP_NAME));
     window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
     let content_root = window.contentView().ok_or_else(|| anyhow::anyhow!("NSWindow has no content view"))?;
