@@ -924,6 +924,43 @@ link here — its `enigo` backend needs `libxdo`, not installed in this environm
 synthetic-input-based tests as unreliable. macos-appkit: cross-compile-verified only for both targets (both
 `.cargo/build-macos-appkit.sh` targets pass), same standing caveat as every other macOS behavioral claim here.
 
+**windows-reactor opener preservation: real attempt made, real empirical dead end found — on branch
+`windows-reactor-opener-defer-attempt`, not merged.** The entry above deliberately scoped windows-reactor out
+based on a first research pass concluding it needed brand-new WinRT bindings for environment sharing. A second,
+deeper pass (reading the real vendored WinMD metadata directly with `strings`, not guessing) found that
+assessment was based on incomplete information: `page_element`'s existing `on_ready: impl Fn(WebView)` callback
+already hands over a real `windows_webview::WebView` for every page — the exact type
+`NewWindowRequestedArgs::set_new_window(&self, webview: &WebView)` needs — and `NewWindowRequestedArgs::defer()`
++ `Deferral::complete()` (both real, already in the vendored crate, unused anywhere in this codebase until this
+attempt) solve the timing mismatch (the popup's own `WebView` isn't ready until some renders after the request
+comes in). Implemented: `args.defer()` on a user-initiated request, construct an ordinary new background page via
+a new `do_add_page_pending_new_window` (mirrors the old `do_add_page_background` minus URL-seeding), track it in
+a new `pending_new_windows: HookRef<HashMap<String, PendingNewWindow>>`, and once *that* page's own `on_ready`
+fires, call `set_new_window` + `deferral.complete()` instead of `navigate` — letting WebView2 perform the
+originally-requested navigation into it. **This works mechanically** (verified in the real VM: a real synthetic
+click on a `target="_blank"` link opens a background tab, "Example Domain" loads correctly with no `navigate()`
+call from this code at all) **but does not establish a real `window.opener` link** — also verified in the real
+VM, not assumed: `set_new_window` returns `Ok(())` (no environment-mismatch error, no failure of any kind), yet
+`window.opener !== null` evaluates to `false` in the resulting page, every time, confirmed via a temporary
+`execute_script` diagnostic. Best-supported explanation, not yet independently confirmed: this page's
+`ICoreWebView2` was already fully constructed via the normal declarative `webview()` flow *before* being handed
+to `set_new_window`, and WebView2's opener bookkeeping most likely only applies to a webview purpose-built as a
+popup target from the start (via `Environment::create_controller_for_hwnd`, entirely outside `windows_reactor`'s
+XAML flow) — which the first research pass's "needs a raw HWND, and there's no way to embed that back into our
+XAML tab UI" finding remains the real, unresolved blocker for. Kept on its own branch (not merged) because the
+deferred `set_new_window` plumbing isn't worse than the old deny-and-disconnect behavior — same visible UX,
+verified — but genuinely doesn't deliver the thing it's named for, so it isn't presented as done. Two real
+alternatives are being investigated as of this entry, both aimed at closing the same root gap this whole
+investigation kept running into (`windows_reactor`'s declarative XAML `WebView2` control offers no path to a
+purpose-built, pre-`set_new_window` webview, and no adoption path for one built outside it): (1) move *every*
+page's hosting off `windows_reactor`'s declarative widget onto raw `windows_webview::Environment`/`Controller`
+hosting (self-managed HWND positioning, closer to how `browser-macos-appkit` already manages `NSView` frames
+directly rather than through a declarative layout framework), so the same construction path used for ordinary
+pages is available for popups too; (2) get `wry` itself (the same abstraction already relied on for gtk3/macOS,
+which already has real, working `NewWindowResponse::Create`-based opener preservation on its own Windows/WebView2
+backend) hosted inside a `windows_reactor` window, parenting its native child HWND directly rather than through
+XAML. Neither is scoped or attempted yet.
+
 ## Backlog (not yet started, roughly in the order raised)
 
 - `browser-macos-appkit`: a wrapping tile grid (`NSCollectionView`) instead of the current plain-list
