@@ -48,20 +48,45 @@
 //! `windows-reactor` has no `Visibility`/display modifier at all (checked by
 //! reading `crates/libs/reactor/src/element.rs`/`widget.rs` — a real gap,
 //! same category as `winio-winui3`'s missing `KeyDown`, just in a different
-//! place). Instead, every *loaded* page's `webview(..)` element is always
-//! present in the tree, each `.with_key(id)` so the reconciler keeps that
-//! specific page's underlying `WebView2` control (and its navigation
-//! session) alive across renders — the same identity mechanism
-//! `crates/samples/reactor/samples/examples/tab_view_add_button.rs` uses for
-//! a dynamic list of tabs. All of them share one grid cell; the active
-//! page's element is placed *last* in that cell's children, so it paints
-//! (and receives hit-testing) on top, fully occluding the others — a real
-//! technique, not a hack: WinUI 3's `Grid` has always supported multiple
-//! children stacked in one cell in z-order. An *unloaded* page (evicted by
-//! `max_loaded_pages`) simply isn't rendered at all — reactor's own
-//! reconciler tears down its `WebView2` control when its keyed element
-//! stops appearing, no manual `.close()` call needed the way
-//! `WebView2Engine` requires.
+//! place).
+//!
+//! An earlier version of this module kept every *loaded* page's `webview(..)`
+//! element mounted simultaneously, each `.with_key(id)`, stacked in one grid
+//! cell with the active one placed last so it paints on top — modeled on the
+//! technique this module's overlay stacking still legitimately uses for
+//! ordinary XAML content. For `Microsoft.UI.Xaml.Controls.WebView2` this
+//! doesn't work, and not for a z-order/compositing reason: `ElementExt::
+//! with_key`'s match (`crates/libs/reactor/src/element.rs`, checked directly
+//! in the vendored source) has no arm for `WebView2` (or `SwapChainPanel`),
+//! so `.with_key(id)` on one is silently a no-op — every page's element
+//! reports `key() == None`, `has_keys` is always false for `page_elements`,
+//! and the reconciler falls back to *positional* reconciliation. Since
+//! `WebView2` also carries no reactive props (`bindings()` returns an empty
+//! `Vec`), a positionally-matched same-kind webview is just left alone by
+//! `update_widget` — confirmed by direct VM testing with temporary tracing
+//! added to the vendored `windows-webview` crate: clicking a different
+//! switcher tile updated `active_id` (and the title chip) correctly, but the
+//! *previous* page's `WebView2` never got an `on_unmounted`/`on_mounted`
+//! cycle, so its already-loaded content just stayed on screen.
+//!
+//! `page_elements` (see `app`'s render function) now holds at most the
+//! *active* page's element, and the parity trick right where it's built
+//! forces a genuine kind mismatch — nesting the element in a plain `Grid`
+//! on every render where the active id actually changed — so the
+//! reconciler unmounts the old `WebView2` and mounts a fresh one instead of
+//! silently reusing it (confirmed via the same tracing: `on_unmounted` then
+//! a full `on_mounted`/`CoreWebView2Initialized`/`on_ready` cycle on every
+//! switch). The real cost: switching back to a previously-open tab
+//! re-creates its `WebView2` and re-navigates rather than resuming an
+//! already-live session, losing in-page state (scroll position, form
+//! input, JS state) that the old always-mounted approach preserved.
+//! `page_element`'s `reflect` closure keeps `last_url` live-updated on every
+//! navigation completion (not just frozen at real eviction time, as before)
+//! so at least switching back lands on the right URL rather than wherever
+//! the page was originally created with. An *unloaded* page (evicted by
+//! `max_loaded_pages`) was already unmounted this same way before this
+//! change — no manual `.close()` call needed the way `WebView2Engine`
+//! requires.
 //!
 //! `browser_core::PageManager<ReactorWebViewEngine>` owns each page's
 //! `Rc<RefCell<Option<WebView>>>`/`Rc<RefCell<Option<EventRegistration>>>`
@@ -143,6 +168,11 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     let (active_id, set_active_id) = cx.use_state(String::new());
     let active_id_ref = cx.use_ref(active_id.clone());
     *active_id_ref.borrow_mut() = active_id.clone();
+    // Tracks which page id `page_elements` was built for last render, and a
+    // parity bit that flips every time that id changes — see the mount-kind
+    // trick where these are used, below.
+    let last_mounted_page_id = cx.use_ref(String::new());
+    let mount_parity = cx.use_ref(false);
     let (overlay, set_overlay) = cx.use_state(Overlay::None);
     let (search_query, set_search_query) = cx.use_state(String::new());
     // WinUI/XAML has no CSS `:hover` — this is the reactor-idiomatic
@@ -623,17 +653,41 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     // a crate that doesn't expose it.
     let title_bar = Element::from(TitleBar::new(APP_TITLE));
 
-    // Every *loaded* page's webview stays mounted (see this module's doc
-    // comment on why); the active one is pushed last so it paints on top.
-    let page_ids = core.borrow().page_ids();
-    let mut page_elements: Vec<Element> = Vec::with_capacity(page_ids.len());
-    for id in page_ids.iter().filter(|id| **id != active_id) {
-        if core.borrow().is_page_loaded(id) {
-            page_elements.push(page_element(id.clone(), &core, &shared, &active_id_ref, &bump));
-        }
+    // Only the *active* page's webview is ever mounted (see this module's
+    // doc comment on why) — `page_elements` always has zero or one entries.
+    if *last_mounted_page_id.borrow() != active_id {
+        let flipped = !*mount_parity.borrow();
+        *mount_parity.borrow_mut() = flipped;
+        *last_mounted_page_id.borrow_mut() = active_id.clone();
     }
+    let mut page_elements: Vec<Element> = Vec::new();
     if core.borrow().is_page_loaded(&active_id) {
-        page_elements.push(page_element(active_id.clone(), &core, &shared, &active_id_ref, &bump));
+        let el = page_element(active_id.clone(), &core, &shared, &active_id_ref, &bump);
+        // `windows-reactor`'s reconciler only tears down and remounts a
+        // widget when the old/new elements' *kind* mismatch (or the
+        // children list changes length) — matching keys alone don't do it
+        // for a `WebView2` element specifically: `ElementExt::with_key`'s
+        // match (checked directly in the vendored source) has no arm for
+        // `WebView2`, so `.with_key(id)` on one is silently a no-op, and
+        // `WebView2` carries no reactive props for a diff to catch either.
+        // Confirmed by direct testing: without this, switching the active
+        // page updated `active_id` (and the title chip) but the *previous*
+        // page's `WebView2` control was reused in place — reactor treated
+        // it as an unchanged sibling, never re-navigated, and its
+        // `on_mounted`/`CoreWebView2Initialized` never fired again. Wrapping
+        // the element in a nested `Grid` on alternating page switches (never
+        // on an incidental re-render of the *same* page) forces a genuine
+        // kind mismatch exactly when the active page actually changes, which
+        // reliably drives a real unmount-then-mount. `Grid` specifically
+        // (not `StackPanel`, tried first): a `Grid` with no explicit
+        // `.rows()/.columns()` fills whatever space its own parent gives it,
+        // same as `content`'s outer grid already relies on — `StackPanel`
+        // auto-sizes to its children's *desired* size instead, and a
+        // `WebView2` reports zero desired size, so the wrapped page mounted
+        // correctly (confirmed via `on_ready` still firing) but rendered at
+        // zero size, i.e. blank.
+        let el = if *mount_parity.borrow() { Element::from(grid([el])) } else { el };
+        page_elements.push(el);
     }
     let content = grid(page_elements);
 
@@ -802,6 +856,7 @@ fn page_element(
     };
     let start_url = if start_url.is_empty() { HOME_URL.to_string() } else { start_url };
 
+    let core = core.clone();
     let shared = Rc::clone(shared);
     let active_id_ref = active_id_ref.clone();
     let bump = bump.clone();
@@ -814,6 +869,7 @@ fn page_element(
             let bump = bump.clone();
             let active_id_ref = active_id_ref.clone();
             let id = id_for_ready.clone();
+            let core = core.clone();
             let shared = Rc::clone(&shared);
             let title_cell = Rc::clone(&title_cell);
             move |_args| {
@@ -822,6 +878,18 @@ fn page_element(
                 if !source.is_empty() {
                     if let Err(err) = shared.history.record_visit(&source, &ready.document_title()) {
                         eprintln!("failed to record history visit: {err}");
+                    }
+                    // Kept live (not just frozen at unload/eviction time, the
+                    // only other place this is written — see `do_add_page`'s
+                    // comment) because `page_element` now only mounts the
+                    // *active* page's `WebView2` (see `app`'s render
+                    // function): switching away tears this control down, so
+                    // switching back rebuilds a fresh one from `last_url` —
+                    // without updating it here, that would reload whatever
+                    // URL the page was created with, not the one the user
+                    // actually last navigated to.
+                    if let Some(page) = core.borrow_mut().page_mut(&id) {
+                        page.last_url = source.clone();
                     }
                 }
                 // Forces a re-render so the toolbar's title chip (read
@@ -899,13 +967,13 @@ fn page_element(
 /// outer `grid`, the same z-by-array-position trick `app`'s own render
 /// function already uses for `overlay_element.grid_row(2)` layering over
 /// `content`). Matches `browser-linux-gtk3`'s `build_overlay_chrome`'s
-/// rgba(20,20,18,0.55) backdrop color — a free visual-consistency touch,
+/// rgba(20,20,18,0.88) backdrop color — a free visual-consistency touch,
 /// not shared code (different UI frameworks). Caller still builds its own
 /// content and passes the same `Callback<()>` it already threads through as
 /// `on_cancel`/`on_close` (see `settings_overlay`/`profile_overlay`) — this
 /// doesn't invent a second close path.
 fn overlay_chrome(content: impl Into<Element>, on_close: Callback<()>) -> Element {
-    let backdrop = Element::from(Shape::rectangle().fill(Color { a: 140, r: 20, g: 20, b: 18 }))
+    let backdrop = Element::from(Shape::rectangle().fill(Color { a: 224, r: 20, g: 20, b: 18 }))
         .horizontal_alignment(HorizontalAlignment::Stretch)
         .vertical_alignment(VerticalAlignment::Stretch);
 

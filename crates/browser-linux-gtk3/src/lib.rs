@@ -2595,8 +2595,26 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         // search-result tiles (which *do* still have their own background)
         // remain theme-dependent.
         let base_provider = gtk::CssProvider::new();
+        // Each switcher tile is a `gtk::FlowBoxChild` wrapping a `gtk::Overlay`
+        // of stacked buttons (the tile itself, `.tile-close-btn`, the audio
+        // icon) — Adwaita's default `flowboxchild:hover` draws its own
+        // rectangular prelight box around that whole wrapper, so hovering
+        // *any* part of a tile (including the close icon) lit up the entire
+        // card as one unit, and crossing-event delivery between the stacked
+        // sibling buttons made that outer highlight flicker or stick after
+        // the pointer left. Zeroing `flowboxchild:hover` here removes that
+        // container-level visual entirely; each interactive piece then only
+        // shows its own native, single-widget `:hover` (a `filter` brightness
+        // bump, since the tiles' base colors are per-domain and per-theme —
+        // see `build_open_tile`/`theme_css` — so a single flat hover color
+        // can't work for all of them).
         let _ = base_provider.load_from_data(
-            b".tile-title { color: #ffffff; font-weight: 600; } \
+            b"flowboxchild:hover { background-image: none; background-color: transparent; \
+                box-shadow: none; border-color: transparent; outline: none; } \
+              .page-tile:hover, .add-tile:hover, .history-tile:hover, .bookmark-tile:hover, \
+                .similar-tile:hover, .tile-close-btn:hover, .overlay-close-btn:hover { \
+                filter: brightness(1.18); } \
+              .tile-title { color: #ffffff; font-weight: 600; } \
               .tile-subtitle { color: rgba(255, 255, 255, 0.75); } \
               .add-tile-label { color: #ffffff; font-size: 20px; } \
               .add-tile { background-image: none; background-color: rgba(255, 255, 255, 0.15); \
@@ -2782,7 +2800,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     stack.set_hexpand(true);
 
     let scrim_css = gtk::CssProvider::new();
-    let _ = scrim_css.load_from_data(b".switcher-scrim { background-color: rgba(20,20,18,0.55); }");
+    let _ = scrim_css.load_from_data(b".switcher-scrim { background-color: rgba(20,20,18,0.88); }");
 
     // The real, editable text entry — lives entirely inside the switcher now
     // (see the toolbar's `title_button` above). Doubles as the switcher's

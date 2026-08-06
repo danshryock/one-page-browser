@@ -2105,7 +2105,7 @@ struct OverlayChrome {
 /// bookmarks/passwords): a dim backdrop filling `frame`, a close (×) button
 /// pinned to the top-right corner, and a "Press Esc to close" hint next to
 /// it — the same three pieces `browser-linux-gtk3`'s `build_overlay_chrome`
-/// builds (matching its rgba(20,20,18,0.55) backdrop color, a free
+/// builds (matching its rgba(20,20,18,0.88) backdrop color, a free
 /// visual-consistency touch, not shared code — different toolkits). Every
 /// overlay here closes through the one shared `closeAnyOverlay:` selector
 /// already used by every Cancel/Close button (see
@@ -2120,7 +2120,7 @@ fn make_overlay_chrome(mtm: MainThreadMarker, frame: NSRect, delegate: &AnyObjec
     let backdrop = NSBox::initWithFrame(NSBox::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
     backdrop.setBoxType(NSBoxType::Custom);
     backdrop.setTitlePosition(NSTitlePosition::NoTitle);
-    backdrop.setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(20.0 / 255.0, 20.0 / 255.0, 18.0 / 255.0, 0.55));
+    backdrop.setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(20.0 / 255.0, 20.0 / 255.0, 18.0 / 255.0, 0.88));
 
     let close_button = make_button("\u{2715}", delegate, sel!(closeAnyOverlay:), mtm);
     close_button.setFrame(NSRect::new(
