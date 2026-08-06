@@ -1,8 +1,10 @@
 use std::ptr::NonNull;
 
+use objc2::rc::Retained;
 use objc2_app_kit::NSView;
+use objc2_web_kit::{WKWebView, WKWebViewConfiguration};
 use wry::raw_window_handle::{AppKitWindowHandle, HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
-use wry::{Rect, WebContext, WebView, WebViewBuilder};
+use wry::{NewWindowResponse, Rect, WebContext, WebView, WebViewBuilder, WebViewBuilderExtMacos, WebViewExtMacOS};
 
 use crate::RenderEngine;
 
@@ -35,18 +37,88 @@ impl WryEngine {
     /// between tabs) instead of each page silently getting its own
     /// throwaway context (`WebViewBuilder::new()`'s default when no context
     /// is supplied at all).
+    /// `on_new_window_requested` fires for a `target="_blank"` link click, a
+    /// `window.open()` call, or the engine's own default right-click "Open
+    /// Link in New Window" context-menu item — all three route through
+    /// `WKUIDelegate::createWebViewWithConfiguration`, so one handler covers
+    /// all of them. Stays inside `wry`'s own `with_new_window_req_handler`
+    /// hook here (unlike `render_engine::linux`, which bypasses the
+    /// equivalent `wry` hook entirely): `WKUIDelegate` is a single-dispatch
+    /// Objective-C delegate, not a multi-subscriber signal like GTK's, and
+    /// `wry`'s own generated delegate class already implements this exact
+    /// method (also handling file-upload panels and permission prompts in
+    /// the same object) — replacing it would be a real regression for no
+    /// benefit. **Real, honest gap, unlike `render_engine::linux`'s**: this
+    /// means there's no way to tell a real click apart from an unprompted
+    /// `window.open()` script call here at all (`wry`'s hook only ever
+    /// exposes `(uri, NewWindowFeatures)`, and the real underlying
+    /// `WKNavigationAction` has no `isUserInitiated`-equivalent property
+    /// either, confirmed by reading `objc2-web-kit`'s bindings directly) —
+    /// every request that reaches this handler is accepted.
+    ///
+    /// On accept, returns `Some(configuration)` — the exact
+    /// `WKWebViewConfiguration` this app's own new-window closure should
+    /// build the popup's `WryEngine` from via `new_related`, handing its
+    /// raw `webview()` back to `wry` as `NewWindowResponse::Create`. This is
+    /// the mechanism Apple's own docs specify for preserving the popup's
+    /// real `window.opener`/`postMessage` relationship ("The web view
+    /// returned must be created with the specified configuration... WebKit
+    /// will load the request in the returned web view" — so `new_related`
+    /// takes no `initial_url` either, same reasoning). Returning `None`
+    /// denies the popup outright.
     pub fn new(
         parent: &NSView,
         initial_url: &str,
         web_context: &mut WebContext,
         on_title_changed: impl Fn(String) + 'static,
+        on_new_window_requested: impl Fn(String, Retained<WKWebViewConfiguration>) -> Option<Retained<WKWebView>> + 'static,
     ) -> anyhow::Result<Self> {
         let handle = NsViewHandle(NonNull::from(parent));
         let webview = WebViewBuilder::new_with_web_context(web_context)
             .with_url(initial_url)
             .with_document_title_changed_handler(move |title| on_title_changed(title))
+            .with_new_window_req_handler(move |uri, features| {
+                match on_new_window_requested(uri, features.opener.target_configuration) {
+                    Some(webview) => NewWindowResponse::Create { webview },
+                    None => NewWindowResponse::Deny,
+                }
+            })
             .build_as_child(&handle)?;
         Ok(Self { webview })
+    }
+
+    /// Same as `new`, but for a page opened via `window.open()`/
+    /// `target="_blank"`/"open in new tab" that should preserve a real
+    /// opener relationship — see `new`'s `on_new_window_requested` doc
+    /// comment for where `target_configuration` comes from and why there's
+    /// no `initial_url` parameter here (WebKit performs the navigation
+    /// itself once this page's raw webview is handed back to it).
+    pub fn new_related(
+        parent: &NSView,
+        target_configuration: Retained<WKWebViewConfiguration>,
+        on_title_changed: impl Fn(String) + 'static,
+        on_new_window_requested: impl Fn(String, Retained<WKWebViewConfiguration>) -> Option<Retained<WKWebView>> + 'static,
+    ) -> anyhow::Result<Self> {
+        let handle = NsViewHandle(NonNull::from(parent));
+        let webview = WebViewBuilder::new()
+            .with_webview_configuration(target_configuration)
+            .with_document_title_changed_handler(move |title| on_title_changed(title))
+            .with_new_window_req_handler(move |uri, features| {
+                match on_new_window_requested(uri, features.opener.target_configuration) {
+                    Some(webview) => NewWindowResponse::Create { webview },
+                    None => NewWindowResponse::Deny,
+                }
+            })
+            .build_as_child(&handle)?;
+        Ok(Self { webview })
+    }
+
+    /// The webview's own raw `WKWebView` — lets a caller return the result
+    /// of `new_related` from `on_new_window_requested` (via
+    /// `NewWindowResponse::Create`) without needing to know about `wry`'s
+    /// own `WryWebView` subclass type.
+    pub fn raw_webview(&self) -> Retained<WKWebView> {
+        (&self.webview.webview()).into()
     }
 
     /// AppKit has no layout manager to resize the embedded webview the way

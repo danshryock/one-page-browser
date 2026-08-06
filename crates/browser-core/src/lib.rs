@@ -191,6 +191,28 @@ impl<E> PageManager<E> {
         self.enforce_loaded_limit()
     }
 
+    /// Same as `insert`, but doesn't make the new page active — used for a
+    /// page opened via `window.open()`/`target="_blank"`/"open in new tab",
+    /// which should load in the background without stealing focus from
+    /// whatever the user's currently looking at (ordinary browser UX). The
+    /// new page's fresh `last_accessed` still protects it from
+    /// `enforce_loaded_limit` evicting it immediately, the same as any other
+    /// just-created page.
+    pub fn insert_background(&mut self, id: String, engine: E, title: Rc<RefCell<String>>) -> Vec<String> {
+        let color = PALETTE[self.pages.len() % PALETTE.len()];
+        self.pages.push(Page {
+            id,
+            engine: Some(engine),
+            title,
+            color,
+            loaded: true,
+            is_playing_audio: false,
+            last_accessed: Instant::now(),
+            last_url: String::new(),
+        });
+        self.enforce_loaded_limit()
+    }
+
     /// Removes a page and returns it so the caller can clean up its native
     /// container. Does not reassign `active_id` — the caller decides what
     /// becomes active next (a neighboring page, or a freshly created one).
@@ -374,6 +396,21 @@ mod tests {
         let page = mgr.page(&id).expect("the page should still be tracked");
         assert!(page.engine.is_none());
         assert_eq!(page.title.borrow().as_str(), "Saved Title");
+        assert_eq!(page.current_url(), "https://b.example");
+    }
+
+    #[test]
+    fn insert_background_registers_a_loaded_page_without_touching_active_id() {
+        let mut mgr: PageManager<MockEngine> = PageManager::new(None);
+        let existing_active = insert_page(&mut mgr, "https://a.example");
+
+        let id = mgr.allocate_id();
+        mgr.insert_background(id.clone(), MockEngine::new("https://b.example"), Rc::new(RefCell::new(String::new())));
+
+        assert_eq!(mgr.active_id(), existing_active, "insert_background shouldn't steal active-page status");
+        assert!(mgr.is_page_loaded(&id), "a background tab should still be loaded (it has a real engine)");
+        assert_eq!(mgr.loaded_page_count(), 2);
+        let page = mgr.page(&id).expect("the page should be tracked");
         assert_eq!(page.current_url(), "https://b.example");
     }
 

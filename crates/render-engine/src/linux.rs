@@ -1,8 +1,22 @@
+use gtk::glib::object::Cast as _;
 use gtk::Container;
-use webkit2gtk::WebViewExt as _;
+use webkit2gtk::{URIRequestExt as _, WebViewExt as _};
 use wry::{WebContext, WebView, WebViewBuilder, WebViewBuilderExtUnix, WebViewExtUnix};
 
 use crate::RenderEngine;
+
+/// A new-window request's real details, extracted from WebKitGTK's own
+/// `NavigationAction` — see `WryEngine::new`'s `on_new_window_requested` doc
+/// comment for why this needs to bypass `wry`'s `with_new_window_req_handler`
+/// entirely (it only ever exposes the bare URL).
+pub struct NewWindowInfo {
+    pub uri: String,
+    /// Whether a real user gesture (a click, not a script calling
+    /// `window.open()` unprompted) triggered this request — WebKitGTK's own
+    /// `webkit_navigation_action_is_user_gesture`, a real signal `wry`'s
+    /// abstraction discards.
+    pub is_user_gesture: bool,
+}
 
 pub struct WryEngine {
     webview: WebView,
@@ -17,23 +31,82 @@ impl WryEngine {
     /// (and are shared between tabs) instead of each page silently getting
     /// its own throwaway context (`WebViewBuilder::new()`'s default when no
     /// context is supplied at all).
+    /// `on_new_window_requested` fires for a `target="_blank"` link click, a
+    /// `window.open()` call, or the engine's own default right-click "Open
+    /// Link in New Window" context-menu item — all three route through the
+    /// same WebKitGTK `create` signal. Deliberately bypasses `wry`'s own
+    /// `with_new_window_req_handler` (it only ever exposes the bare URL) and
+    /// connects straight to the underlying signal instead, via the same
+    /// Unix escape hatch `is-playing-audio`/`screenshot` already use — this
+    /// is what makes the real `NewWindowInfo::is_user_gesture` signal
+    /// available at all (see its doc comment). The handler gets a clone of
+    /// this page's own raw `webkit2gtk::WebView` (needed to build a
+    /// *related* popup via `new_related`, preserving `window.opener`/
+    /// `postMessage`) and returns the constructed popup's `gtk::Widget` to
+    /// satisfy the signal's contract, or `None` to suppress the request
+    /// outright (no popup, no relationship — used for non-user-gesture
+    /// requests, which get no other treatment: unlike the old
+    /// deny-and-open-unrelated behavior, there's no orphan tab anymore).
     pub fn new<W: gtk::glib::IsA<Container>>(
         container: &W,
         initial_url: &str,
         web_context: &mut WebContext,
         on_title_changed: impl Fn(String) + 'static,
         on_audio_playing_changed: impl Fn(bool) + 'static,
+        on_new_window_requested: impl Fn(NewWindowInfo, webkit2gtk::WebView) -> Option<gtk::Widget> + 'static,
     ) -> anyhow::Result<Self> {
-        let webview = WebViewBuilder::new_with_web_context(web_context)
-            .with_url(initial_url)
-            .with_document_title_changed_handler(move |title| on_title_changed(title))
-            .build_gtk(container)?;
+        let builder = WebViewBuilder::new_with_web_context(web_context).with_url(initial_url);
+        Self::build(builder, container, on_title_changed, on_audio_playing_changed, on_new_window_requested)
+    }
+
+    /// Same as `new`, but for a page opened via `window.open()`/
+    /// `target="_blank"`/"open in new tab" that should preserve a real
+    /// opener relationship (`window.opener`, `postMessage`, the opener's own
+    /// `window.open()` return value) instead of being a disconnected page —
+    /// see `new`'s `on_new_window_requested` doc comment for where this gets
+    /// called from. `related_to` should be the opener page's own raw
+    /// `webkit2gtk::WebView` (the second parameter `on_new_window_requested`
+    /// receives) — `WebViewBuilderExtUnix::with_related_view` shares the
+    /// same web process with it, which is what makes WebKitGTK itself
+    /// establish and honor the real browsing-context relationship. No
+    /// `initial_url`/`.with_url(...)` call here: once the `create` signal
+    /// handler returns this page's widget, WebKitGTK performs the actual
+    /// requested navigation into it itself — setting a URL here would race
+    /// or conflict with that.
+    pub fn new_related<W: gtk::glib::IsA<Container>>(
+        container: &W,
+        related_to: &webkit2gtk::WebView,
+        web_context: &mut WebContext,
+        on_title_changed: impl Fn(String) + 'static,
+        on_audio_playing_changed: impl Fn(bool) + 'static,
+        on_new_window_requested: impl Fn(NewWindowInfo, webkit2gtk::WebView) -> Option<gtk::Widget> + 'static,
+    ) -> anyhow::Result<Self> {
+        let builder = WebViewBuilder::new_with_web_context(web_context).with_related_view(related_to.clone());
+        Self::build(builder, container, on_title_changed, on_audio_playing_changed, on_new_window_requested)
+    }
+
+    /// Shared tail of `new`/`new_related` — everything after the builder's
+    /// initial `.with_url(...)`/`.with_related_view(...)` divergence.
+    fn build<W: gtk::glib::IsA<Container>>(
+        builder: WebViewBuilder<'_>,
+        container: &W,
+        on_title_changed: impl Fn(String) + 'static,
+        on_audio_playing_changed: impl Fn(bool) + 'static,
+        on_new_window_requested: impl Fn(NewWindowInfo, webkit2gtk::WebView) -> Option<gtk::Widget> + 'static,
+    ) -> anyhow::Result<Self> {
+        let webview = builder.with_document_title_changed_handler(move |title| on_title_changed(title)).build_gtk(container)?;
 
         // `is-playing-audio` isn't a wry builder hook — connect straight to
         // the underlying webkit2gtk object via the same Unix escape hatch
         // `screenshot()` below already uses.
         webview.webview().connect_is_playing_audio_notify(move |wv| {
             on_audio_playing_changed(wv.is_playing_audio());
+        });
+
+        webview.webview().connect_create(move |opener, action| {
+            let uri = action.request().and_then(|request| request.uri()).map(|uri| uri.to_string()).unwrap_or_default();
+            let info = NewWindowInfo { uri, is_user_gesture: action.is_user_gesture() };
+            on_new_window_requested(info, opener.clone())
         });
 
         // WebKitGTK's fire-and-forget `evaluate_script` (no callback, used by
@@ -51,6 +124,15 @@ impl WryEngine {
         webview.evaluate_script_with_callback("true", |_| {})?;
 
         Ok(Self { webview })
+    }
+
+    /// The webview's own raw GTK widget — lets a caller return the result of
+    /// `new_related` from WebKitGTK's `create` signal (see `new`'s
+    /// `on_new_window_requested` doc comment) without needing to know
+    /// anything about `webkit2gtk` beyond the `NewWindowInfo`/opener-handle
+    /// types this module already re-exports.
+    pub fn widget(&self) -> gtk::Widget {
+        self.webview.webview().clone().upcast()
     }
 
     /// Toggles reader mode: strips chrome/nav/ads and re-renders the page's

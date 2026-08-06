@@ -847,6 +847,83 @@ settings/profile) is clickable at its title-bar position, and minimize, maximize
 — checked individually, including after the window had been dragged to a new position (the region is
 window-relative, so it isn't invalidated by a move, only a resize).
 
+**`window.open()`/`target="_blank"`/"open in new tab" now does something, on all three front ends.** Previously
+this silently did nothing anywhere — confirmed directly: no front end registered any new-window/popup handler,
+and no context menu was customized anywhere in the repo. Fixed via real, previously-unused platform APIs: `wry`
+0.55.1 (gtk3 + macos-appkit)'s `WebViewBuilder::with_new_window_req_handler`, and windows-reactor's
+`windows-webview` crate's `WebView::on_new_window_requested` (wrapping WebView2's real `NewWindowRequested`
+event). Both fire for a real click (a `target="_blank"` link, or choosing the engine's own default right-click
+"Open link in new tab/window" context-menu item) *and* an unprompted script-only `window.open()` call, so one
+handler per platform covers everything — no separate context-menu code needed anywhere. A new-window request
+opens as a **background tab in this app's own page model**, not a real second OS window (there's no concept of
+multiple top-level windows anywhere in this codebase, and it matches ordinary browser UX — doesn't steal focus).
+Achieved by denying/suppressing the engine's own popup and inserting the page via a new
+`PageManager::insert_background` (mirrors `insert`, just skips `self.active_id = id`) through a new
+`add_page_background`/`do_add_page_background` per front end.
+Real, honest platform gap: only *user-initiated* requests are meant to open a tab (an unprompted script popup
+should be suppressed) — windows-reactor's `NewWindowRequestedArgs::is_user_initiated()` makes this possible and
+is used, but `wry` 0.55.1 has no equivalent anywhere in its public API (checked `NewWindowFeatures`/
+`NewWindowOpener` directly), so gtk3/macos-appkit currently open *every* new-window request they receive, real
+click or not — documented in `WryEngine::new`'s doc comment rather than silently pretending parity. Verified
+end-to-end in the real VM (windows-reactor): navigated to a page with a real `target="_blank"` link, clicked it
+(a real synthetic OS-level click, not a scripted one) — a new background tab appeared in the switcher
+("Example Domain") without switching away from the current page; separately, navigated to a page whose script
+called `window.open()` on load with no click behind it — confirmed via the switcher that no tile was added for
+it, correctly suppressed. gtk3 covered by a new real test
+(`add_page_background_opens_without_switching_away`, run against the real `:0` display); macos-appkit
+cross-compile-verified only (`.cargo/build-macos-appkit.sh`, same standing caveat as every other macOS
+behavioral claim in this file — no way to verify real click-through without a physical run).
+
+**A window.open()/target="_blank" popup now preserves a real `window.opener`/`postMessage` relationship, on
+gtk3 and macos-appkit** — the entry above always denied the engine's own popup and rebuilt a completely
+disconnected page, which broke `window.opener` in the new tab and made the opener's own `window.open()` call
+return `null`. Real, user-requested follow-up: three parallel deep-research passes (reading real vendored
+source, not docs) found a hard platform asymmetry. **windows-reactor stays as today's deny-and-disconnect
+behavior, confirmed out of scope** — the vendored WinRT bindings are missing the members needed (no way to
+share an environment with the XAML `WebView2` control, no public getter to discover one to match), and a real
+fix means hand-authoring new WinRT COM bindings plus raw HWND/composition-visual hosting outside the normal
+XAML flow, a materially bigger undertaking than the other two platforms. **gtk3 and macos-appkit are both
+genuinely fixable**, and now fixed, via each engine's own real "hand back a related webview instead of
+denying" mechanism:
+- **gtk3**: bypasses `wry`'s `with_new_window_req_handler` entirely (it only ever exposed the bare URL) and
+  attaches a raw `create` signal handler directly to the underlying `webkit2gtk::WebView` instead, via the
+  same escape hatch `is-playing-audio`/`screenshot` already use. This is also what makes real
+  `NavigationAction::is_user_gesture()` gating possible for the first time — a real signal `wry` discards,
+  closing the "every request opens, real click or not" gap the entry above documented for this platform. New
+  `WryEngine::new_related` builds the popup via `WebViewBuilderExtUnix::with_related_view` (needs
+  `webkit2gtk`'s `v2_40` feature, not compiled in by default — added to `render-engine/Cargo.toml`), no
+  `.with_url(...)` call (WebKit performs the navigation into the returned view itself once `create` hands it
+  back). `render_engine::WebKitWebView`/`NewWindowInfo` re-exported the same way `WebContext` already is, so
+  `browser-linux-gtk3` never needs its own direct `webkit2gtk` dependency. New `AppState::add_page_related`
+  replaces `add_page_background`.
+- **macos-appkit**: stays inside `wry`'s existing hook — `WKUIDelegate` is a single-dispatch Objective-C
+  delegate, not a multi-subscriber signal like GTK's, and `wry`'s own generated delegate class already
+  implements the one method that matters (also handling file-upload panels and permission prompts in the same
+  object), so replacing it would be a real regression for no benefit. New `WryEngine::new_related` builds the
+  popup via `WebViewBuilderExtMacos::with_webview_configuration`, using the *exact* `WKWebViewConfiguration`
+  `wry`'s existing closure already receives via `NewWindowOpener::target_configuration` — confirmed by Apple's
+  own doc comment on this delegate method ("The web view returned must be created with the specified
+  configuration... WebKit will load the request in the returned web view"), so no `.with_url(...)` call here
+  either. Returns `NewWindowResponse::Create { webview }` instead of always `Deny`. **Gating does not improve
+  here**: `wry`'s hook still only ever exposes `(uri, NewWindowFeatures)`, and the real `WKNavigationAction`
+  itself has no `isUserInitiated`-equivalent property either (confirmed by reading `objc2-web-kit`'s
+  bindings directly) — every request that reaches this handler still opens, same as before, just properly
+  related now instead of disconnected.
+
+One real, empirically-confirmed finding worth remembering: calling the new `add_page_related`/`with_related_view`
+machinery directly against a disconnected, never-actually-triggered webview does **not** retroactively produce a
+`window.opener` link — `window.opener` is only ever set by the engine's own internal handling of a genuine,
+navigation-triggered `create`/`createWebViewWithConfiguration` call (a real click, or a script's `window.open()`
+actually running inside a loaded page), not by `with_related_view` alone. Confirmed by writing a test that
+asserted `window.opener !== null` after a direct `add_page_related` call and watching it fail reliably — this is
+why gtk3's real test (`add_page_related_opens_without_switching_away`) only verifies the page-management mechanics
+(count/active-id/stack/switcher tile), not the opener link itself: doing that end-to-end would need a genuine,
+non-synthetic click, and this repo's own `gtk-test` dev-dependency (which exists for exactly that) can't even
+link here — its `enigo` backend needs `libxdo`, not installed in this environment (`unable to find library
+-lxdo`), consistent with this test file's own long-standing doc comment already steering away from
+synthetic-input-based tests as unreliable. macos-appkit: cross-compile-verified only for both targets (both
+`.cargo/build-macos-appkit.sh` targets pass), same standing caveat as every other macOS behavioral claim here.
+
 ## Backlog (not yet started, roughly in the order raised)
 
 - `browser-macos-appkit`: a wrapping tile grid (`NSCollectionView`) instead of the current plain-list

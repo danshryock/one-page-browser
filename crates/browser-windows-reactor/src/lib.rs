@@ -142,7 +142,7 @@ use browser_core::{
 };
 use engine::ReactorWebViewEngine;
 use windows_reactor::*;
-use windows_webview::{webview, WebView};
+use windows_webview::{webview, NewWindowRequestedArgs, WebView};
 
 /// Same checkpoint-tracing pattern as `browser_windows_winui::trace` — cheap
 /// and has already paid for itself once diagnosing a real crash on Windows.
@@ -343,6 +343,14 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
             do_add_page(&core, &url, &set_active_id, &active_id_ref);
             set_overlay.call(Overlay::None);
             bump.invoke(());
+        }
+    });
+
+    let add_page_background: Callback<String> = Callback::new({
+        let core = core.clone();
+        let bump = bump.clone();
+        move |url: String| {
+            do_add_page_background(&core, &url, &bump);
         }
     });
 
@@ -755,7 +763,7 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     for id in &page_ids {
         if core.borrow().is_page_loaded(id) {
             let is_active = *id == active_id;
-            page_elements.push(page_element(id.clone(), &core, &shared, &active_id_ref, &bump, is_active));
+            page_elements.push(page_element(id.clone(), &core, &shared, &active_id_ref, &bump, &add_page_background, is_active));
         }
     }
     let content = grid(page_elements);
@@ -892,6 +900,26 @@ fn do_add_page(
     set_active_id.call(id);
 }
 
+/// Same as `do_add_page`, but doesn't make the new page active — used for a
+/// page opened via `window.open()`/`target="_blank"`/"open in new tab" (see
+/// `page_element`'s `on_new_window_requested` registration), which shouldn't
+/// steal focus from whatever the user's currently looking at. Still seeds
+/// `last_url` for the same reason `do_add_page` does, and still calls `bump`
+/// so the switcher grid picks up the new tile on next render.
+fn do_add_page_background(core: &HookRef<PageManager<ReactorWebViewEngine>>, url: &str, bump: &Callback<()>) {
+    let id = core.borrow_mut().allocate_id();
+    let engine = ReactorWebViewEngine::new();
+    let title = Rc::new(RefCell::new(String::new()));
+    let evicted = core.borrow_mut().insert_background(id.clone(), engine, title);
+    for evicted_id in evicted {
+        core.borrow_mut().take_engine(&evicted_id);
+    }
+    if let Some(page) = core.borrow_mut().page_mut(&id) {
+        page.last_url = url.to_string();
+    }
+    bump.invoke(());
+}
+
 /// Reconstructs a page's engine if it was unloaded (see this module's doc
 /// comment: an unloaded page's `webview(..)` element simply isn't rendered,
 /// so reactor already tore down its old `WebView2` control) — mirrors
@@ -913,9 +941,10 @@ fn page_element(
     shared: &Rc<Shared>,
     active_id_ref: &HookRef<String>,
     bump: &Callback<()>,
+    add_page_background: &Callback<String>,
     is_active: bool,
 ) -> Element {
-    let Some((web_cell, registration_cell, title_registration_cell, title_cell, xaml_handle_cell, start_url)) =
+    let Some((web_cell, registration_cell, title_registration_cell, title_cell, xaml_handle_cell, new_window_registration_cell, start_url)) =
         core.borrow().page(&id).map(|p| {
             let engine = p.engine.as_ref().expect("page_element only called for loaded pages");
             (
@@ -924,6 +953,7 @@ fn page_element(
                 engine.title_registration.clone(),
                 Rc::clone(&p.title),
                 engine.xaml_handle.clone(),
+                engine.new_window_registration.clone(),
                 p.last_url.clone(),
             )
         })
@@ -945,6 +975,7 @@ fn page_element(
     let shared = Rc::clone(shared);
     let active_id_ref = active_id_ref.clone();
     let bump = bump.clone();
+    let add_page_background = add_page_background.clone();
     let id_for_ready = id.clone();
 
     let on_ready = move |ready: WebView| {
@@ -1037,6 +1068,30 @@ fn page_element(
         };
         if let Ok(registration) = ready.on_document_title_changed(title_changed) {
             *title_registration_cell.borrow_mut() = Some(registration);
+        }
+        // Fires for a `target="_blank"` link click, a `window.open()` call,
+        // or WebView2's own default right-click "Open link in new tab"
+        // context-menu item — all three route through the same
+        // `NewWindowRequested` event, so this one handler covers all of
+        // them (see `ROADMAP.md`/this function's own history for why no
+        // separate context-menu code exists anywhere in this codebase).
+        // Always marks the request handled (never lets WebView2 create a
+        // real second top-level window — there's no concept of one
+        // anywhere in this app), and only actually opens a background tab
+        // for `is_user_initiated()` requests: a script calling
+        // `window.open()` with no real click behind it is silently
+        // suppressed, matching what most real browsers do out of the box.
+        let new_window_requested = {
+            let add_page_background = add_page_background.clone();
+            move |args: NewWindowRequestedArgs| {
+                let _ = args.set_handled(true);
+                if args.is_user_initiated() {
+                    add_page_background.invoke(args.uri());
+                }
+            }
+        };
+        if let Ok(registration) = ready.on_new_window_requested(new_window_requested) {
+            *new_window_registration_cell.borrow_mut() = Some(registration);
         }
         let _ = ready.navigate(&start_url);
         *web_cell.borrow_mut() = Some(ready);

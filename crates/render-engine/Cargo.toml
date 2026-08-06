@@ -23,7 +23,14 @@ gtk = "0.18"
 # webkit2gtk `WebView`, whose `.snapshot()` is what actually captures a
 # page. Already resolved in the workspace's dependency tree via wry/gtk
 # themselves, so adding it directly here doesn't pull in anything new.
-webkit2gtk = "2.0"
+# `v2_40` (which pulls in v2_4/v2_6/... via that feature chain in
+# webkit2gtk's own Cargo.toml) is needed for `WebView::with_related_view`
+# (v2_4), `connect_create` (v2_6), and `NavigationAction::frame_name`
+# (v2_40) — none of which are compiled in by default, and `wry` itself
+# doesn't turn them on unless its own non-default `linux-body` feature is
+# enabled (confirmed via `cargo tree -e features`, which shows zero `v2_x`
+# features resolved workspace-wide without this).
+webkit2gtk = { version = "2.0", features = ["v2_40"] }
 # `gtk` re-exports this same cairo-rs as `gtk::cairo`, but without its
 # `png` feature enabled (nothing else in this workspace needed PNG
 # encoding before now) — depending on it directly here with `png` turned
@@ -34,3 +41,11 @@ cairo-rs = { version = "0.18", features = ["png"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-app-kit = "0.3.2"
+# For `WryEngine::new_related`/its `on_new_window_requested` callback:
+# `WKWebViewConfiguration`/`WKWebView` are the real types WKUIDelegate's
+# `createWebViewWithConfiguration:forNavigationAction:...` needs to preserve
+# a real `window.opener` relationship (see that function's doc comment) —
+# same version wry itself pins internally, so the `Retained<...>` values
+# exchanged with `wry`'s own API are the exact same crate/version, not a
+# separately-resolved incompatible copy.
+objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKWebViewConfiguration"] }

@@ -29,12 +29,29 @@ unsafe impl<T> Send for AssertSend<T> {}
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::WryEngine;
+pub use linux::{NewWindowInfo, WryEngine};
+
+/// Re-exported the same way `WebContext` is below — a page's own raw
+/// `webkit2gtk::WebView`, needed as the `related_to` argument for
+/// `WryEngine::new_related` (see `linux::WryEngine::new`'s
+/// `on_new_window_requested` doc comment: the callback receives one of
+/// these for exactly this purpose), without the caller needing its own
+/// direct `webkit2gtk` dependency.
+#[cfg(target_os = "linux")]
+pub use webkit2gtk::WebView as WebKitWebView;
 
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::WryEngine;
+
+/// Re-exported the same way `WebContext`/`WebKitWebView` are — the real
+/// `WKWebView`/`WKWebViewConfiguration` types needed for
+/// `WryEngine::new_related` (see `macos::WryEngine::new`'s
+/// `on_new_window_requested` doc comment), without the caller needing its
+/// own direct `objc2-web-kit` dependency.
+#[cfg(target_os = "macos")]
+pub use objc2_web_kit::{WKWebView, WKWebViewConfiguration};
 
 /// Re-exported rather than left implicit so callers can hold one
 /// `WebContext` per profile (shared across every page it opens — see

@@ -102,7 +102,7 @@ use browser_core::{
     BitwardenStatus, Bookmark, Bookmarks, HistoryStore, Keybindings, Login, LoginFields, PageManager, PasswordBackend,
     PasswordStore, Profile, Session, SessionPage, Settings, Theme, VaultUnlockAction, APP_TITLE, HOME_URL,
 };
-use render_engine::{RenderEngine, WebContext, WryEngine};
+use render_engine::{RenderEngine, WKWebView, WKWebViewConfiguration, WebContext, WryEngine};
 
 const TOOLBAR_HEIGHT: f64 = 36.0;
 const BUTTON_WIDTH: f64 = 32.0;
@@ -1153,16 +1153,26 @@ impl AppState {
         // `Rc::downgrade(self)` in the same spot.
         let self_for_title = Rc::downgrade(self);
         let id_for_title = id.clone();
-        let engine = WryEngine::new(&container, url, &mut *self.web_context.borrow_mut(), move |title| {
-            let Some(app) = self_for_title.upgrade() else { return };
-            if let Some(page) = app.core.borrow_mut().page_mut(&id_for_title) {
-                *page.title.borrow_mut() = title;
-            }
-            app.record_visit(&id_for_title);
-            if app.core.borrow().active_id() == id_for_title {
-                app.refresh_title_label();
-            }
-        })?;
+        let self_for_new_window = Rc::downgrade(self);
+        let engine = WryEngine::new(
+            &container,
+            url,
+            &mut *self.web_context.borrow_mut(),
+            move |title| {
+                let Some(app) = self_for_title.upgrade() else { return };
+                if let Some(page) = app.core.borrow_mut().page_mut(&id_for_title) {
+                    *page.title.borrow_mut() = title;
+                }
+                app.record_visit(&id_for_title);
+                if app.core.borrow().active_id() == id_for_title {
+                    app.refresh_title_label();
+                }
+            },
+            move |_new_window_url, target_configuration| {
+                let app = self_for_new_window.upgrade()?;
+                app.add_page_related(target_configuration).ok()
+            },
+        )?;
 
         let title = Rc::new(RefCell::new(String::new()));
         let evicted = self.core.borrow_mut().insert(id.clone(), engine, title);
@@ -1170,6 +1180,59 @@ impl AppState {
         self.containers.borrow_mut().insert(id.clone(), container);
         self.set_active(&id);
         Ok(id)
+    }
+
+    /// Opens a page related to `target_configuration` — used for a page
+    /// opened via `window.open()`/`target="_blank"`/"open in new tab" (see
+    /// `render_engine::macos::WryEngine::new`'s `on_new_window_requested`
+    /// doc comment), preserving `window.opener`/`postMessage`/the opener's
+    /// own `window.open()` return value via `WryEngine::new_related` —
+    /// since macOS has no way to gate on a real user gesture (see that same
+    /// doc comment), every request that reaches this function is accepted.
+    /// Returns the new page's raw `WKWebView` so the caller (`wry`'s own
+    /// new-window handler) can hand it straight back as
+    /// `NewWindowResponse::Create`'s payload, rather than tracking it
+    /// internally only. Otherwise mirrors `add_page`: calls
+    /// `insert_background` instead of `insert`, never calls `set_active` so
+    /// the new tab doesn't steal focus, and — matching this function's
+    /// callers' own convention (see `force_new_page_from_search`) — leaves
+    /// refreshing the switcher grid to its caller.
+    fn add_page_related(self: &Rc<Self>, target_configuration: Retained<WKWebViewConfiguration>) -> anyhow::Result<Retained<WKWebView>> {
+        let mtm = self.mtm();
+        let mut core = self.core.borrow_mut();
+        let id = core.allocate_id();
+        drop(core);
+
+        let container = NSView::initWithFrame(NSView::alloc(mtm), self.content_view.frame());
+        self.content_view.addSubview(&container);
+        let self_for_title = Rc::downgrade(self);
+        let id_for_title = id.clone();
+        let self_for_new_window = Rc::downgrade(self);
+        let engine = WryEngine::new_related(
+            &container,
+            target_configuration,
+            move |title| {
+                let Some(app) = self_for_title.upgrade() else { return };
+                if let Some(page) = app.core.borrow_mut().page_mut(&id_for_title) {
+                    *page.title.borrow_mut() = title;
+                }
+                app.record_visit(&id_for_title);
+                if app.core.borrow().active_id() == id_for_title {
+                    app.refresh_title_label();
+                }
+            },
+            move |_new_window_url, target_configuration| {
+                let app = self_for_new_window.upgrade()?;
+                app.add_page_related(target_configuration).ok()
+            },
+        )?;
+
+        let raw_webview = engine.raw_webview();
+        let title = Rc::new(RefCell::new(String::new()));
+        let evicted = self.core.borrow_mut().insert_background(id.clone(), engine, title);
+        self.unload_engines(&evicted);
+        self.containers.borrow_mut().insert(id.clone(), container);
+        Ok(raw_webview)
     }
 
     /// Records a history visit for `id`'s current URL/title — called from
@@ -1217,16 +1280,26 @@ impl AppState {
         // Weak — see the identical comment in `add_page`.
         let self_for_title = Rc::downgrade(self);
         let id_for_title = id.to_string();
-        match WryEngine::new(&container, &url, &mut *self.web_context.borrow_mut(), move |title| {
-            let Some(app) = self_for_title.upgrade() else { return };
-            if let Some(page) = app.core.borrow_mut().page_mut(&id_for_title) {
-                *page.title.borrow_mut() = title;
-            }
-            app.record_visit(&id_for_title);
-            if app.core.borrow().active_id() == id_for_title {
-                app.refresh_title_label();
-            }
-        }) {
+        let self_for_new_window = Rc::downgrade(self);
+        match WryEngine::new(
+            &container,
+            &url,
+            &mut *self.web_context.borrow_mut(),
+            move |title| {
+                let Some(app) = self_for_title.upgrade() else { return };
+                if let Some(page) = app.core.borrow_mut().page_mut(&id_for_title) {
+                    *page.title.borrow_mut() = title;
+                }
+                app.record_visit(&id_for_title);
+                if app.core.borrow().active_id() == id_for_title {
+                    app.refresh_title_label();
+                }
+            },
+            move |_new_window_url, target_configuration| {
+                let app = self_for_new_window.upgrade()?;
+                app.add_page_related(target_configuration).ok()
+            },
+        ) {
             Ok(engine) => {
                 self.core.borrow_mut().install_engine(id, engine);
                 self.containers.borrow_mut().insert(id.to_string(), container);

@@ -18,7 +18,7 @@ use browser_core::{
     SessionPage, Settings, Theme, VaultUnlockAction, APP_TITLE,
 };
 use gtk::prelude::*;
-use render_engine::{RenderEngine, WebContext, WryEngine};
+use render_engine::{NewWindowInfo, RenderEngine, WebContext, WebKitWebView, WryEngine};
 
 /// The password vault's session state — UI-level bookkeeping distinct from
 /// `PasswordStore`/`PasswordBackend` (the storage/abstraction layer, in
@@ -289,6 +289,7 @@ impl AppState {
         let id_for_cb = id.clone();
         let app_weak_audio = Rc::downgrade(self);
         let id_for_audio_cb = id.clone();
+        let app_weak_new_window = Rc::downgrade(self);
         let engine = WryEngine::new(
             &container,
             url,
@@ -308,6 +309,12 @@ impl AppState {
                     app.set_page_audio_playing(&id_for_audio_cb, playing);
                 }
             },
+            move |info: NewWindowInfo, opener: WebKitWebView| -> Option<gtk::Widget> {
+                if !info.is_user_gesture {
+                    return None;
+                }
+                app_weak_new_window.upgrade()?.add_page_related(&opener).ok()
+            },
         )?;
 
         let evicted = self.core.borrow_mut().insert(id.clone(), engine, title);
@@ -316,6 +323,66 @@ impl AppState {
         self.set_active(&id);
         self.rebuild_switcher_grid();
         Ok(())
+    }
+
+    /// Opens a page related to `related_to` — used for a page opened via
+    /// `window.open()`/`target="_blank"`/"open in new tab" with a real user
+    /// gesture behind it (see `WryEngine::new`'s `on_new_window_requested`
+    /// doc comment), preserving `window.opener`/`postMessage`/the opener's
+    /// own `window.open()` return value via `WryEngine::new_related` —
+    /// unlike a plain unrelated background page, this needs the constructed
+    /// widget handed straight back to WebKitGTK's `create` signal (the
+    /// caller of this function), not just tracked internally, so it returns
+    /// the raw `gtk::Widget` rather than `()`. Otherwise mirrors `add_page`:
+    /// calls `insert_background` instead of `insert` and never calls
+    /// `set_active`, so the new tab doesn't steal focus.
+    pub fn add_page_related(self: &Rc<Self>, related_to: &WebKitWebView) -> anyhow::Result<gtk::Widget> {
+        let id = self.core.borrow_mut().allocate_id();
+
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        self.stack.add_named(&container, &id);
+        container.show_all();
+        self.containers.borrow_mut().insert(id.clone(), container.clone());
+
+        let title = Rc::new(RefCell::new(String::new()));
+        let title_for_cb = Rc::clone(&title);
+        let app_weak = Rc::downgrade(self);
+        let id_for_cb = id.clone();
+        let app_weak_audio = Rc::downgrade(self);
+        let id_for_audio_cb = id.clone();
+        let app_weak_new_window = Rc::downgrade(self);
+        let engine = WryEngine::new_related(
+            &container,
+            related_to,
+            &mut *self.web_context.borrow_mut(),
+            move |new_title| {
+                *title_for_cb.borrow_mut() = new_title;
+                if let Some(app) = app_weak.upgrade() {
+                    app.record_visit(&id_for_cb);
+                    app.rebuild_switcher_grid();
+                    if app.core.borrow().active_id() == id_for_cb {
+                        app.refresh_title_label();
+                    }
+                }
+            },
+            move |playing| {
+                if let Some(app) = app_weak_audio.upgrade() {
+                    app.set_page_audio_playing(&id_for_audio_cb, playing);
+                }
+            },
+            move |info: NewWindowInfo, opener: WebKitWebView| -> Option<gtk::Widget> {
+                if !info.is_user_gesture {
+                    return None;
+                }
+                app_weak_new_window.upgrade()?.add_page_related(&opener).ok()
+            },
+        )?;
+
+        let widget = engine.widget();
+        let evicted = self.core.borrow_mut().insert_background(id.clone(), engine, title);
+        self.unload_engines(&evicted);
+        self.rebuild_switcher_grid();
+        Ok(widget)
     }
 
     /// Registers a restored page's URL/title without constructing a real
@@ -492,6 +559,7 @@ impl AppState {
         let id_for_cb = id.to_string();
         let app_weak_audio = Rc::downgrade(self);
         let id_for_audio_cb = id.to_string();
+        let app_weak_new_window = Rc::downgrade(self);
         match WryEngine::new(
             &container,
             &url,
@@ -510,6 +578,12 @@ impl AppState {
                 if let Some(app) = app_weak_audio.upgrade() {
                     app.set_page_audio_playing(&id_for_audio_cb, playing);
                 }
+            },
+            move |info: NewWindowInfo, opener: WebKitWebView| -> Option<gtk::Widget> {
+                if !info.is_user_gesture {
+                    return None;
+                }
+                app_weak_new_window.upgrade()?.add_page_related(&opener).ok()
             },
         ) {
             Ok(engine) => self.core.borrow_mut().install_engine(id, engine),
@@ -1519,6 +1593,7 @@ impl AppState {
             }
         }
     }
+
 
     /// Test helper: simulates clicking "Edit" on a Bitwarden row with this
     /// id — same reasoning as `start_editing_local_login`, just looking the

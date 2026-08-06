@@ -31,6 +31,9 @@ pub struct ReactorWebViewEngine {
     /// render can re-apply `xaml_interop::set_visible` based on whether this
     /// page is currently active, not just once at mount time.
     pub xaml_handle: Rc<RefCell<Option<IInspectable>>>,
+    /// Same reasoning as `registration`, for `on_new_window_requested` (see
+    /// `lib.rs`'s `page_element`) — a third, separate subscription.
+    pub new_window_registration: Rc<RefCell<Option<EventRegistration>>>,
 }
 
 impl ReactorWebViewEngine {
@@ -44,6 +47,7 @@ impl ReactorWebViewEngine {
             registration: Rc::new(RefCell::new(None)),
             title_registration: Rc::new(RefCell::new(None)),
             xaml_handle: Rc::new(RefCell::new(None)),
+            new_window_registration: Rc::new(RefCell::new(None)),
         }
     }
 }

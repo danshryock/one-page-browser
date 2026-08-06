@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 use browser_core::{Action, HistoryStore, PasswordBackend, Profile};
 use browser_linux_gtk3::{build_window_and_app, build_window_and_app_with_history, AppState};
 use gtk::prelude::*;
-use render_engine::{RenderEngine, WebContext, WryEngine};
+use render_engine::{RenderEngine, WebContext, WebKitWebView, WryEngine};
 
 type Job = Box<dyn FnOnce() + Send>;
 
@@ -184,8 +184,8 @@ fn navigation_back_forward_reload() {
         window.show_all();
 
         let mut web_context = WebContext::new(None);
-        let engine =
-            WryEngine::new(&content, &url_a, &mut web_context, |_| {}, |_| {}).expect("WryEngine::new should succeed");
+        let engine = WryEngine::new(&content, &url_a, &mut web_context, |_| {}, |_| {}, |_, _| None)
+            .expect("WryEngine::new should succeed");
         assert!(
             wait_until(|| engine.current_url().ok().as_deref() == Some(url_a.as_str())),
             "initial load should reach page A"
@@ -238,6 +238,7 @@ fn reader_mode_toggles_on_and_off() {
                 *title_for_cb.borrow_mut() = new_title;
             },
             |_| {},
+            |_, _| None,
         )
         .expect("WryEngine::new should succeed");
         assert!(wait_until(|| *title.borrow() == "Page A"), "initial load should reach page A");
@@ -295,6 +296,61 @@ fn page_lifecycle_add_switch_close() {
         assert!(
             app.active_id() == id_b || app.active_id() == id_c,
             "the new active page should be one of the remaining ones"
+        );
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+// `window.opener` itself isn't checked here: it's only ever set by WebKit's
+// own internal handling of a *genuine*, navigation-triggered `create` signal
+// (a real click on a `target="_blank"` link, or a script's `window.open()`
+// call actually running inside a loaded page) — confirmed empirically, not
+// assumed: calling `add_page_related` directly against a disconnected,
+// never-navigated `WebKitWebView::new()` (as this test does, for the same
+// reason `add_page_background`'s test used to call the app's own method
+// directly rather than simulate a click) does *not* retroactively produce a
+// `window.opener` link, even though `with_related_view` still visibly works
+// at the process/mounting level (this test's own assertions below). Testing
+// the real opener linkage end-to-end would need a genuine, trusted
+// (non-synthetic) click — this repo's own `gtk-test` dev-dependency exists
+// for exactly that, but its `enigo` backend needs `libxdo`, not installed in
+// this environment (confirmed: fails at link time, `unable to find library
+// -lxdo`) — consistent with this module's own doc comment already steering
+// away from synthetic-input-based tests as unreliable here. Real-VM-style
+// manual click verification, matching how `browser-windows-reactor`'s
+// windows-vm pipeline verifies its own UI interactions, is the honest
+// verification path for the opener relationship itself.
+#[test]
+fn add_page_related_opens_without_switching_away() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("add-page-related");
+        let url_a = fixture_url("page_a.html");
+
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        app.add_page(&url_a).expect("add_page should succeed");
+        let id_a = app.page_ids()[0].clone();
+        assert_eq!(app.active_id(), id_a);
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())));
+
+        let opener = WebKitWebView::new();
+        app.add_page_related(&opener).expect("add_page_related should succeed");
+
+        assert_eq!(app.page_ids().len(), 2, "add_page_related should add a second tracked page");
+        assert_eq!(app.active_id(), id_a, "add_page_related shouldn't steal focus from the active page");
+        assert_eq!(
+            app.stack_visible_child_name().as_deref(),
+            Some(id_a.as_str()),
+            "the visible page shouldn't change"
+        );
+        assert_eq!(app.active_url().as_deref(), Some(url_a.as_str()), "the active page's content shouldn't change");
+
+        app.open_switcher();
+        assert_eq!(
+            app.switcher_grid_tile_count(),
+            3,
+            "the related page should still get a switcher tile (2 open pages + the always-present Add tile)"
         );
 
         cleanup_test_profile(&profile);
