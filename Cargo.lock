@@ -198,6 +198,7 @@ dependencies = [
  "browser-chrome-core",
  "browser-core",
  "render-engine",
+ "windows-core 0.62.2",
  "windows-reactor",
  "windows-reactor-setup",
  "windows-webview",
@@ -2665,8 +2666,8 @@ dependencies = [
  "webview2-com-sys",
  "windows",
  "windows-core 0.61.2",
- "windows-implement",
- "windows-interface",
+ "windows-implement 0.60.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "windows-interface 0.59.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -2781,8 +2782,8 @@ version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0fdd3ddb90610c7638aa2b3a3ab2904fb9e5cdbecc643ddb3647212781c4ae3"
 dependencies = [
- "windows-implement",
- "windows-interface",
+ "windows-implement 0.60.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "windows-interface 0.59.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "windows-link 0.1.3",
  "windows-result 0.3.4",
  "windows-strings 0.4.2",
@@ -2793,6 +2794,8 @@ name = "windows-core"
 version = "0.62.2"
 source = "git+https://github.com/microsoft/windows-rs#b9e0aa360b8b6caa7dfc6038b5bc6603eed3bb8c"
 dependencies = [
+ "windows-implement 0.60.2 (git+https://github.com/microsoft/windows-rs)",
+ "windows-interface 0.59.3 (git+https://github.com/microsoft/windows-rs)",
  "windows-link 0.2.1 (git+https://github.com/microsoft/windows-rs)",
  "windows-result 0.4.1",
  "windows-strings 0.5.1",
@@ -2831,10 +2834,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "windows-implement"
+version = "0.60.2"
+source = "git+https://github.com/microsoft/windows-rs#b9e0aa360b8b6caa7dfc6038b5bc6603eed3bb8c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "windows-interface"
 version = "0.59.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "windows-interface"
+version = "0.59.3"
+source = "git+https://github.com/microsoft/windows-rs#b9e0aa360b8b6caa7dfc6038b5bc6603eed3bb8c"
 dependencies = [
  "proc-macro2",
  "quote",

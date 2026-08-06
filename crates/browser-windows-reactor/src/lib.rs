@@ -45,47 +45,71 @@
 //!
 //! `winio-winui3`'s approach (a per-page `Grid` container, `Visibility`
 //! toggled to show only the active one) doesn't translate directly:
-//! `windows-reactor` has no `Visibility`/display modifier at all (checked by
-//! reading `crates/libs/reactor/src/element.rs`/`widget.rs` — a real gap,
-//! same category as `winio-winui3`'s missing `KeyDown`, just in a different
-//! place).
+//! `windows-reactor`'s own declarative `Element`/`ElementExt` has no
+//! `Visibility` modifier at all (checked by reading `crates/libs/reactor/
+//! src/element.rs`/`widget.rs` — a real gap, same category as
+//! `winio-winui3`'s missing `KeyDown`, just in a different place).
 //!
-//! An earlier version of this module kept every *loaded* page's `webview(..)`
-//! element mounted simultaneously, each `.with_key(id)`, stacked in one grid
-//! cell with the active one placed last so it paints on top — modeled on the
-//! technique this module's overlay stacking still legitimately uses for
-//! ordinary XAML content. For `Microsoft.UI.Xaml.Controls.WebView2` this
-//! doesn't work, and not for a z-order/compositing reason: `ElementExt::
-//! with_key`'s match (`crates/libs/reactor/src/element.rs`, checked directly
-//! in the vendored source) has no arm for `WebView2` (or `SwapChainPanel`),
-//! so `.with_key(id)` on one is silently a no-op — every page's element
-//! reports `key() == None`, `has_keys` is always false for `page_elements`,
-//! and the reconciler falls back to *positional* reconciliation. Since
-//! `WebView2` also carries no reactive props (`bindings()` returns an empty
-//! `Vec`), a positionally-matched same-kind webview is just left alone by
-//! `update_widget` — confirmed by direct VM testing with temporary tracing
-//! added to the vendored `windows-webview` crate: clicking a different
-//! switcher tile updated `active_id` (and the title chip) correctly, but the
-//! *previous* page's `WebView2` never got an `on_unmounted`/`on_mounted`
-//! cycle, so its already-loaded content just stayed on screen.
+//! Two earlier versions of this module got the mounting story wrong before
+//! landing here, both confirmed by direct real-VM testing (temporary
+//! tracing added to the vendored `windows-webview` crate in one case):
 //!
-//! `page_elements` (see `app`'s render function) now holds at most the
-//! *active* page's element, and the parity trick right where it's built
-//! forces a genuine kind mismatch — nesting the element in a plain `Grid`
-//! on every render where the active id actually changed — so the
-//! reconciler unmounts the old `WebView2` and mounts a fresh one instead of
-//! silently reusing it (confirmed via the same tracing: `on_unmounted` then
-//! a full `on_mounted`/`CoreWebView2Initialized`/`on_ready` cycle on every
-//! switch). The real cost: switching back to a previously-open tab
-//! re-creates its `WebView2` and re-navigates rather than resuming an
-//! already-live session, losing in-page state (scroll position, form
-//! input, JS state) that the old always-mounted approach preserved.
-//! `page_element`'s `reflect` closure keeps `last_url` live-updated on every
-//! navigation completion (not just frozen at real eviction time, as before)
-//! so at least switching back lands on the right URL rather than wherever
-//! the page was originally created with. An *unloaded* page (evicted by
-//! `max_loaded_pages`) was already unmounted this same way before this
-//! change — no manual `.close()` call needed the way `WebView2Engine`
+//! 1. Every *loaded* page's `webview(..)` element mounted simultaneously,
+//!    each `.with_key(id)`, stacked in one grid cell with the active one
+//!    placed last so it paints on top. This doesn't work, and not for a
+//!    z-order/compositing reason: `ElementExt::with_key`'s match (checked
+//!    directly in the vendored source) has no arm for `WebView2` (or
+//!    `SwapChainPanel`), so `.with_key(id)` on one is silently a no-op —
+//!    `has_keys` is always false for `page_elements`, so the reconciler
+//!    falls back to *positional* reconciliation, and since `WebView2` also
+//!    carries no reactive props (`bindings()` returns an empty `Vec`), a
+//!    positionally-matched same-kind webview is just left alone by
+//!    `update_widget`. Clicking a different switcher tile updated
+//!    `active_id` (and the title chip) correctly, but the *previous* page's
+//!    `WebView2` never got an `on_unmounted`/`on_mounted` cycle, so its
+//!    already-loaded content just stayed on screen.
+//! 2. Only mounting the *active* page's element, forcing a real
+//!    unmount/mount cycle by wrapping it in a plain `Grid` on every render
+//!    where the active id actually changed (defeating positional matching
+//!    with a genuine kind mismatch instead of a key). This *worked*, but at
+//!    a real cost this module doesn't have to pay: switching away tore the
+//!    previous page's `WebView2` down entirely, so switching back re-created
+//!    it and re-navigated from scratch instead of resuming an already-live
+//!    session — losing scroll position, form input, and JS state on every
+//!    switch.
+//!
+//! What actually gets both right: `Microsoft.UI.Xaml.Controls.WebView2`'s
+//! own implementation (github.com/microsoft/microsoft-ui-xaml,
+//! `controls/dev/WebView2/WebView2.cpp`) already listens for
+//! `UIElement::VisibilityProperty()` changes and forwards them to the
+//! underlying `ICoreWebView2Controller::IsVisible` for us — the same real
+//! hide/show primitive `browser-linux-gtk3`'s `gtk::Stack` and
+//! `browser-macos-appkit`'s hidden `NSView` already give those two front
+//! ends (confirmed by reading that source directly; it explicitly does
+//! *not* listen for `Opacity`, which is why the opacity approach tried
+//! first — see git history — had no visible effect). `windows-reactor` just
+//! doesn't expose `Visibility` through its declarative API. `xaml_interop.rs`
+//! reaches past that with a small, narrowly-scoped hand-written COM shim
+//! (the real `IUIElement` interface, same IID and vtable layout as the one
+//! already correctly generated — but `pub(crate)`-scoped — inside
+//! `windows-reactor`'s own vendored `bindings.rs`) so `page_element` can
+//! call the real `SetVisibility` directly.
+//!
+//! So: every *loaded* page's `webview(..)` element stays mounted
+//! simultaneously (`page_ids()`'s natural creation order, kept stable
+//! across renders — never reordered active-last, since `WebView2` still
+//! can't be meaningfully `.with_key()`d, so the reconciler still matches
+//! `page_elements` by position and a reorder would read as "the page at
+//! this position changed"). Each page's `on_mounted`/`on_unmounted` (from
+//! `windows_webview::webview()`, wrapped rather than replaced — see
+//! `page_element`) captures the raw native handle into
+//! `ReactorWebViewEngine::xaml_handle`, and every render re-applies
+//! `xaml_interop::set_visible` to it based on whether that page is
+//! currently active — real show/hide, not mount/unmount, so in-page state
+//! survives switching away and back. An *unloaded* page (evicted by
+//! `max_loaded_pages`) still isn't rendered at all — reactor's own
+//! reconciler tears down its `WebView2` control when its element stops
+//! appearing, no manual `.close()` call needed the way `WebView2Engine`
 //! requires.
 //!
 //! `browser_core::PageManager<ReactorWebViewEngine>` owns each page's
@@ -103,6 +127,7 @@
 
 mod engine;
 mod shortcuts;
+mod xaml_interop;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -168,11 +193,6 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     let (active_id, set_active_id) = cx.use_state(String::new());
     let active_id_ref = cx.use_ref(active_id.clone());
     *active_id_ref.borrow_mut() = active_id.clone();
-    // Tracks which page id `page_elements` was built for last render, and a
-    // parity bit that flips every time that id changes — see the mount-kind
-    // trick where these are used, below.
-    let last_mounted_page_id = cx.use_ref(String::new());
-    let mount_parity = cx.use_ref(false);
     let (overlay, set_overlay) = cx.use_state(Overlay::None);
     let (search_query, set_search_query) = cx.use_state(String::new());
     // WinUI/XAML has no CSS `:hover` — this is the reactor-idiomatic
@@ -653,41 +673,21 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     // a crate that doesn't expose it.
     let title_bar = Element::from(TitleBar::new(APP_TITLE));
 
-    // Only the *active* page's webview is ever mounted (see this module's
-    // doc comment on why) — `page_elements` always has zero or one entries.
-    if *last_mounted_page_id.borrow() != active_id {
-        let flipped = !*mount_parity.borrow();
-        *mount_parity.borrow_mut() = flipped;
-        *last_mounted_page_id.borrow_mut() = active_id.clone();
-    }
-    let mut page_elements: Vec<Element> = Vec::new();
-    if core.borrow().is_page_loaded(&active_id) {
-        let el = page_element(active_id.clone(), &core, &shared, &active_id_ref, &bump);
-        // `windows-reactor`'s reconciler only tears down and remounts a
-        // widget when the old/new elements' *kind* mismatch (or the
-        // children list changes length) — matching keys alone don't do it
-        // for a `WebView2` element specifically: `ElementExt::with_key`'s
-        // match (checked directly in the vendored source) has no arm for
-        // `WebView2`, so `.with_key(id)` on one is silently a no-op, and
-        // `WebView2` carries no reactive props for a diff to catch either.
-        // Confirmed by direct testing: without this, switching the active
-        // page updated `active_id` (and the title chip) but the *previous*
-        // page's `WebView2` control was reused in place — reactor treated
-        // it as an unchanged sibling, never re-navigated, and its
-        // `on_mounted`/`CoreWebView2Initialized` never fired again. Wrapping
-        // the element in a nested `Grid` on alternating page switches (never
-        // on an incidental re-render of the *same* page) forces a genuine
-        // kind mismatch exactly when the active page actually changes, which
-        // reliably drives a real unmount-then-mount. `Grid` specifically
-        // (not `StackPanel`, tried first): a `Grid` with no explicit
-        // `.rows()/.columns()` fills whatever space its own parent gives it,
-        // same as `content`'s outer grid already relies on — `StackPanel`
-        // auto-sizes to its children's *desired* size instead, and a
-        // `WebView2` reports zero desired size, so the wrapped page mounted
-        // correctly (confirmed via `on_ready` still firing) but rendered at
-        // zero size, i.e. blank.
-        let el = if *mount_parity.borrow() { Element::from(grid([el])) } else { el };
-        page_elements.push(el);
+    // Every *loaded* page's webview stays mounted (see this module's doc
+    // comment on why) — `page_ids()`'s natural (creation) order is kept
+    // stable across renders, never reordered active-last: `WebView2` can't
+    // be `.with_key()`d (see the doc comment), so the reconciler matches
+    // `page_elements` by position, and reordering would make it treat an
+    // ordinary switch as "the page at this position changed" instead.
+    // Visibility (see `page_element`'s use of `xaml_interop::set_visible`),
+    // not mounting/unmounting, is what actually shows the active one.
+    let page_ids = core.borrow().page_ids();
+    let mut page_elements: Vec<Element> = Vec::with_capacity(page_ids.len());
+    for id in &page_ids {
+        if core.borrow().is_page_loaded(id) {
+            let is_active = *id == active_id;
+            page_elements.push(page_element(id.clone(), &core, &shared, &active_id_ref, &bump, is_active));
+        }
     }
     let content = grid(page_elements);
 
@@ -847,14 +847,33 @@ fn page_element(
     shared: &Rc<Shared>,
     active_id_ref: &HookRef<String>,
     bump: &Callback<()>,
+    is_active: bool,
 ) -> Element {
-    let Some((web_cell, registration_cell, title_registration_cell, title_cell, start_url)) = core.borrow().page(&id).map(|p| {
-        let engine = p.engine.as_ref().expect("page_element only called for loaded pages");
-        (engine.web.clone(), engine.registration.clone(), engine.title_registration.clone(), Rc::clone(&p.title), p.last_url.clone())
-    }) else {
+    let Some((web_cell, registration_cell, title_registration_cell, title_cell, xaml_handle_cell, start_url)) =
+        core.borrow().page(&id).map(|p| {
+            let engine = p.engine.as_ref().expect("page_element only called for loaded pages");
+            (
+                engine.web.clone(),
+                engine.registration.clone(),
+                engine.title_registration.clone(),
+                Rc::clone(&p.title),
+                engine.xaml_handle.clone(),
+                p.last_url.clone(),
+            )
+        })
+    else {
         return Element::from(vstack(())).with_key(id);
     };
     let start_url = if start_url.is_empty() { HOME_URL.to_string() } else { start_url };
+
+    // The widget itself has no per-render update hook (`bindings()` is
+    // empty — see this module's doc comment), so a page that's already
+    // mounted from an earlier render needs its visibility re-applied here,
+    // directly, every time `is_active` might have changed — `on_mounted`
+    // below only fires once, at first mount.
+    if let Some(handle) = xaml_handle_cell.borrow().as_ref() {
+        xaml_interop::set_visible(handle, is_active);
+    }
 
     let core = core.clone();
     let shared = Rc::clone(shared);
@@ -957,7 +976,36 @@ fn page_element(
         *web_cell.borrow_mut() = Some(ready);
     };
 
-    Element::from(webview(on_ready)).with_key(id)
+    // `windows_webview::webview()` already wires its own `.on_mounted`/
+    // `.on_unmounted` (the `EnsureCoreWebView2Async`/bridging dance above,
+    // via `on_ready`) — both fields are `pub`, so rather than reimplement
+    // that here, this wraps the callbacks it already set: call through to
+    // the original first, then additionally capture the raw XAML handle and
+    // apply this page's current visibility via `xaml_interop::set_visible`.
+    // See this module's doc comment for why that's the one thing reaching
+    // past `windows-reactor`'s own declarative API for.
+    let mut widget = webview(on_ready);
+    let original_mounted = widget.mounted.take();
+    let xaml_handle_for_mount = xaml_handle_cell.clone();
+    widget.mounted = Some(Callback::new(move |handle: Option<windows_core::IInspectable>| {
+        if let Some(cb) = &original_mounted {
+            cb.invoke(handle.clone());
+        }
+        if let Some(h) = &handle {
+            xaml_interop::set_visible(h, is_active);
+        }
+        *xaml_handle_for_mount.borrow_mut() = handle;
+    }));
+    let original_unmounted = widget.unmounted.take();
+    let xaml_handle_for_unmount = xaml_handle_cell.clone();
+    widget.unmounted = Some(Callback::new(move |handle: Option<windows_core::IInspectable>| {
+        if let Some(cb) = &original_unmounted {
+            cb.invoke(handle);
+        }
+        *xaml_handle_for_unmount.borrow_mut() = None;
+    }));
+
+    Element::from(widget).with_key(id)
 }
 
 /// Shared chrome for every full-screen overlay (switcher/settings/profile):

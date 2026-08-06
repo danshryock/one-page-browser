@@ -33,6 +33,14 @@ anyhow = "1"
 [target.'cfg(all(target_os = "windows", target_env = "msvc"))'.dependencies]
 windows-reactor = { git = "https://github.com/microsoft/windows-rs" }
 windows-webview = { git = "https://github.com/microsoft/windows-rs", features = ["reactor"] }
+# Same git source/commit as the two deps above (not crates.io's windows-core)
+# — needed by src/xaml_interop.rs, which casts the raw `IInspectable` handle
+# `windows-webview`'s `webview()` hands back in `on_mounted`/`on_unmounted`
+# to a locally-defined `IUIElement` shim so `UIElement.Visibility` can be set
+# directly. Pulling in a different windows-core than windows-reactor/
+# windows-webview themselves use would make their `IInspectable` and ours
+# distinct, incompatible types even though structurally identical.
+windows-core = { git = "https://github.com/microsoft/windows-rs" }
 
 # Deliberately NOT target-gated like the two deps above, despite being
 # windows-only at runtime — see build.rs's doc comment for why: a
