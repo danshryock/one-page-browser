@@ -525,6 +525,47 @@ fn settings_overlay_mutual_exclusion_and_save() {
 }
 
 #[test]
+fn every_overlay_toggle_button_closes_on_a_second_click() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("overlay-toggle");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&fixture_url("page_a.html")).expect("add_page should succeed");
+
+        // Every overlay's own trigger button now toggles closed on a second
+        // "click" (here driven directly through the `toggle_*` method the
+        // button's `connect_clicked` handler calls, same as every other test
+        // in this file drives `AppState` methods directly rather than
+        // synthetic GTK input — see this file's own doc comment for why).
+        app.toggle_switcher();
+        assert!(app.is_switcher_open(), "first toggle_switcher should open the switcher");
+        app.toggle_switcher();
+        assert!(!app.is_switcher_open(), "second toggle_switcher should close the switcher");
+
+        app.toggle_settings();
+        assert!(app.is_settings_open(), "first toggle_settings should open settings");
+        app.toggle_settings();
+        assert!(!app.is_settings_open(), "second toggle_settings should close settings");
+
+        app.toggle_profile_picker();
+        assert!(app.is_profile_picker_open(), "first toggle_profile_picker should open the profile picker");
+        app.toggle_profile_picker();
+        assert!(!app.is_profile_picker_open(), "second toggle_profile_picker should close the profile picker");
+
+        app.toggle_bookmarks();
+        assert!(app.is_bookmarks_open(), "first toggle_bookmarks should open bookmarks");
+        app.toggle_bookmarks();
+        assert!(!app.is_bookmarks_open(), "second toggle_bookmarks should close bookmarks");
+
+        app.toggle_passwords();
+        assert!(app.is_passwords_open(), "first toggle_passwords should open the password manager");
+        app.toggle_passwords();
+        assert!(!app.is_passwords_open(), "second toggle_passwords should close the password manager");
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
 fn session_saved_on_quit_is_restored_on_next_launch() {
     run_on_gtk_thread(|| {
         let profile = test_profile("session-restore");
@@ -1117,27 +1158,23 @@ fn edit_url_opens_switcher_with_current_url_selected_not_blanked() {
 }
 
 #[test]
-fn focusing_address_bar_opens_the_switcher_preloaded_with_current_url() {
+fn clicking_title_chip_opens_the_switcher_preloaded_with_current_url() {
     run_on_gtk_thread(|| {
-        let profile = test_profile("focus-opens-switcher");
+        let profile = test_profile("title-chip-opens-switcher");
         let url_a = fixture_url("page_a.html");
         let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
         app.add_page(&url_a).expect("add_page should succeed");
         assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())));
         assert!(!app.is_switcher_open(), "sanity check: the switcher shouldn't already be open");
 
-        // Exercises the same `AppState::address_bar_focused` the address
-        // bar's real `focus-in-event` handler calls — driven directly
-        // rather than via a real focus change, since this headless test
-        // compositor never actually gives the window real window-manager
-        // focus (confirmed by direct experiment — see that method's doc
-        // comment), so the underlying GDK signal never fires here at all.
-        app.address_bar_focused();
-        assert!(app.is_switcher_open(), "focusing the address bar should open the switcher");
+        // Exercises the same `AppState::title_chip_clicked` the toolbar's
+        // title chip's real `clicked` signal calls.
+        app.title_chip_clicked();
+        assert!(app.is_switcher_open(), "clicking the title chip should open the switcher");
         assert_eq!(
             app.address_bar_text(),
             url_a,
-            "focusing should preload the current URL, same as Ctrl+L, not blank the bar"
+            "clicking should preload the current URL, same as Ctrl+L, not blank the bar"
         );
         assert!(app.address_bar_is_fully_selected(), "the preloaded URL should be fully selected, ready to be typed over");
 
@@ -1146,9 +1183,9 @@ fn focusing_address_bar_opens_the_switcher_preloaded_with_current_url() {
 }
 
 #[test]
-fn refocusing_address_bar_while_switcher_already_open_does_not_clobber_a_typed_filter() {
+fn reclicking_title_chip_while_switcher_already_open_does_not_clobber_a_typed_filter() {
     run_on_gtk_thread(|| {
-        let profile = test_profile("refocus-does-not-clobber");
+        let profile = test_profile("reclick-does-not-clobber");
         let url_a = fixture_url("page_a.html");
         let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
         app.add_page(&url_a).expect("add_page should succeed");
@@ -1157,14 +1194,37 @@ fn refocusing_address_bar_while_switcher_already_open_does_not_clobber_a_typed_f
         app.open_switcher();
         app.set_address_bar_text("something the user is mid-typing");
 
-        // Refocusing (e.g. clicking back into the bar) while the switcher is
-        // already open must not reset it back to the current URL — only a
-        // *fresh* focus-in (switcher not yet open) should do that.
-        app.address_bar_focused();
+        // Re-clicking the title chip while the switcher is already open
+        // (it stays visible/clickable throughout — the overlay only covers
+        // the content area below the header bar) must not reset it back to
+        // the current URL — only a *fresh* open should do that.
+        app.title_chip_clicked();
         assert_eq!(
             app.address_bar_text(),
             "something the user is mid-typing",
-            "refocusing an already-open switcher's address bar shouldn't clobber what's typed"
+            "re-clicking while the switcher is already open shouldn't clobber what's typed"
+        );
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn title_chip_reflects_the_active_pages_real_title() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("title-chip-reflects-title");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        assert_eq!(app.title_label_text(), "New Page", "a freshly-built window with only the default start page should show the fallback title");
+
+        let url_a = fixture_url("page_a.html");
+        app.add_page(&url_a).expect("add_page should succeed");
+        assert!(wait_until(|| app.title_label_text() == "Page A"), "the title chip should pick up page_a.html's real <title> once it loads");
+
+        let url_b = fixture_url("page_b.html");
+        app.add_page(&url_b).expect("add_page should succeed");
+        assert!(
+            wait_until(|| app.title_label_text() == "Page B"),
+            "switching the active page to a second, newly-added page should update the title chip to that page's real title"
         );
 
         cleanup_test_profile(&profile);
@@ -1472,8 +1532,7 @@ fn set_page_audio_playing_toggles_the_tracked_state() {
         // `ensure_engine_loaded`) calls — driven directly rather than via a
         // real WebKitGTK audio-state change, since this headless test
         // compositor has no confirmed audio backend to actually play
-        // anything and exercise the real signal end-to-end (same class of
-        // gap as `address_bar_focused`'s real-focus-event limitation).
+        // anything and exercise the real signal end-to-end.
         app.set_page_audio_playing(&id_a, true);
         assert!(app.is_page_playing_audio(&id_a), "should track that the page started playing audio");
 

@@ -143,9 +143,13 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     let (active_id, set_active_id) = cx.use_state(String::new());
     let active_id_ref = cx.use_ref(active_id.clone());
     *active_id_ref.borrow_mut() = active_id.clone();
-    let (address, set_address) = cx.use_state(String::from(HOME_URL));
     let (overlay, set_overlay) = cx.use_state(Overlay::None);
     let (search_query, set_search_query) = cx.use_state(String::new());
+    // WinUI/XAML has no CSS `:hover` — this is the reactor-idiomatic
+    // equivalent for the toolbar's title chip's hover-looks-like-an-input
+    // state (see the `toolbar` grid below), same reactive-state pattern as
+    // every other piece of UI state in this file.
+    let (hovering, set_hovering) = cx.use_state(false);
 
     let (start_page_draft, set_start_page_draft) = cx.use_state(String::new());
     let (engine_index_draft, set_engine_index_draft) = cx.use_state(-1i32);
@@ -172,7 +176,6 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         let core = core.clone();
         let set_active_id = set_active_id.clone();
         let active_id_ref = active_id_ref.clone();
-        let set_address = set_address.clone();
         let set_overlay = set_overlay.clone();
         let bump = bump.clone();
         move |id: String| {
@@ -180,8 +183,6 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
             core.borrow_mut().set_active(&id);
             *active_id_ref.borrow_mut() = id.clone();
             set_active_id.call(id.clone());
-            let url = core.borrow().page(&id).map(|p| p.current_url()).unwrap_or_default();
-            set_address.call(if url.is_empty() { HOME_URL.to_string() } else { url });
             set_overlay.call(Overlay::None);
             bump.invoke(());
         }
@@ -201,7 +202,7 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         let start_page = shared.settings.borrow().start_page.clone();
         let plan = browser_chrome_core::resolve_restore_plan(&session, &start_page);
         for url in &plan.urls {
-            do_add_page(&core, url, &set_active_id, &active_id_ref, &set_address);
+            do_add_page(&core, url, &set_active_id, &active_id_ref);
         }
         // `do_add_page` makes each newly-added page active in turn, so
         // without this the *last* URL in `plan.urls` would end up active
@@ -219,11 +220,10 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         let core = core.clone();
         let set_active_id = set_active_id.clone();
         let active_id_ref = active_id_ref.clone();
-        let set_address = set_address.clone();
         let set_overlay = set_overlay.clone();
         let bump = bump.clone();
         move |url: String| {
-            do_add_page(&core, &url, &set_active_id, &active_id_ref, &set_address);
+            do_add_page(&core, &url, &set_active_id, &active_id_ref);
             set_overlay.call(Overlay::None);
             bump.invoke(());
         }
@@ -262,26 +262,6 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         }
     };
 
-    let navigate_from_address_bar = {
-        let core = core.clone();
-        let active_id = active_id.clone();
-        let address = address.clone();
-        let settings = Rc::clone(shared);
-        move || {
-            trace("navigate_from_address_bar: fired");
-            let core = core.borrow();
-            if let Some(engine) = core.page(&active_id).and_then(|p| p.engine.as_ref()) {
-                let url = resolve_address_input(&address, &settings.settings.borrow());
-                trace(&format!("navigate_from_address_bar: navigating to {url}"));
-                use render_engine::RenderEngine;
-                let result = engine.navigate(&url);
-                trace(&format!("navigate_from_address_bar: navigate() returned {result:?}"));
-            } else {
-                trace("navigate_from_address_bar: no active engine found");
-            }
-        }
-    };
-
     let open_switcher: Callback<()> = Callback::new({
         let set_overlay = set_overlay.clone();
         let set_search_query = set_search_query.clone();
@@ -298,6 +278,40 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
                 set_overlay.call(Overlay::None);
             } else {
                 open_switcher.invoke(());
+            }
+        }
+    };
+
+    // Opens the switcher preloaded with the active page's current URL —
+    // the toolbar title chip's click target, "grid, to edit the URL",
+    // mirroring `browser-linux-gtk3`'s `open_switcher_editing_url`. Real,
+    // honest gap versus gtk3/macOS: it can't also focus+select-all the
+    // text (this crate's existing, already-documented limitation — no
+    // `Focus()`-style API on `TextBox`/`Element`, see `dispatch_action`'s
+    // own doc comment on `EditUrl`) — presetting the content is real and
+    // works, just not the focus/select part.
+    let open_switcher_editing_url: Callback<()> = Callback::new({
+        let core = core.clone();
+        let active_id = active_id.clone();
+        let set_overlay = set_overlay.clone();
+        let set_search_query = set_search_query.clone();
+        move |()| {
+            let url = core.borrow().page(&active_id).map(|p| p.current_url()).unwrap_or_default();
+            set_search_query.call(url);
+            set_overlay.call(Overlay::Switcher);
+        }
+    });
+    // The title chip's click handler — see `browser-linux-gtk3`'s
+    // `title_chip_clicked` for why it's guarded on `overlay != Overlay::
+    // Switcher`: the toolbar stays clickable even while the switcher is
+    // open (it only covers the content area below the toolbar), and
+    // re-clicking while it's already open must not clobber whatever the
+    // user already typed.
+    let title_chip_clicked = {
+        let open_switcher_editing_url = open_switcher_editing_url.clone();
+        move || {
+            if overlay != Overlay::Switcher {
+                open_switcher_editing_url.invoke(());
             }
         }
     };
@@ -343,6 +357,17 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
             set_overlay.call(Overlay::Settings);
         }
     });
+    let toggle_settings = {
+        let set_overlay = set_overlay.clone();
+        let open_settings = open_settings.clone();
+        move || {
+            if overlay == Overlay::Settings {
+                set_overlay.call(Overlay::None);
+            } else {
+                open_settings.invoke(());
+            }
+        }
+    };
 
     let save_settings: Callback<()> = Callback::new({
         let shared = Rc::clone(shared);
@@ -381,6 +406,17 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
             set_overlay.call(Overlay::Profile);
         }
     });
+    let toggle_profile = {
+        let set_overlay = set_overlay.clone();
+        let open_profile = open_profile.clone();
+        move || {
+            if overlay == Overlay::Profile {
+                set_overlay.call(Overlay::None);
+            } else {
+                open_profile.invoke(());
+            }
+        }
+    };
 
     let create_and_open_profile: Callback<()> = Callback::new({
         let set_overlay = set_overlay.clone();
@@ -513,27 +549,41 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
             e.reload()
         })))
         .grid_column(2),
-        Element::from(
-            text_box(address)
-                .on_text_changed(set_address.clone())
-                .keyboard_accelerator(KeyboardAccelerator::new(
-                    VirtualKey::Enter,
-                    VirtualKeyModifiers::None,
-                    navigate_from_address_bar,
-                )),
-        )
+        {
+            // A clickable "title chip", not a text box — shows the active
+            // page's title, not editable; clicking it opens the switcher in
+            // URL-editing mode (`open_switcher_editing_url`). The real
+            // editable text entry now lives entirely inside the switcher
+            // overlay — see `switcher_overlay`'s `search_box`.
+            let active_title = core
+                .borrow()
+                .page(&active_id)
+                .map(|p| p.title.borrow().clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "New Page".to_string());
+            Element::from(
+                border(Element::from(text_block(active_title).semibold()))
+                    .corner_radius(6.0)
+                    .border_thickness(Thickness::uniform(1.0))
+                    .border_brush(ThemeRef::ControlStroke)
+                    .background(if hovering { ThemeRef::ControlFillInputActive } else { ThemeRef::ControlFillTertiary })
+                    .padding(Thickness { left: 12.0, right: 12.0, top: 6.0, bottom: 6.0 }),
+            )
+            .horizontal_alignment(HorizontalAlignment::Stretch)
+            .on_tapped(title_chip_clicked)
+            .on_pointer_entered({
+                let set_hovering = set_hovering.clone();
+                move |_| set_hovering.call(true)
+            })
+            .on_pointer_exited({
+                let set_hovering = set_hovering.clone();
+                move || set_hovering.call(false)
+            })
+        }
         .grid_column(3),
         Element::from(button("\u{229e}").on_click(toggle_switcher)).grid_column(4),
-        Element::from(button("\u{2699}").on_click({
-            let open_settings = open_settings.clone();
-            move || open_settings.invoke(())
-        }))
-        .grid_column(5),
-        Element::from(button("\u{1f464}").on_click({
-            let open_profile = open_profile.clone();
-            move || open_profile.invoke(())
-        }))
-        .grid_column(6),
+        Element::from(button("\u{2699}").on_click(toggle_settings)).grid_column(5),
+        Element::from(button("\u{1f464}").on_click(toggle_profile)).grid_column(6),
     ))
     .columns([
         GridLength::Auto,
@@ -579,49 +629,58 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     let mut page_elements: Vec<Element> = Vec::with_capacity(page_ids.len());
     for id in page_ids.iter().filter(|id| **id != active_id) {
         if core.borrow().is_page_loaded(id) {
-            page_elements.push(page_element(id.clone(), &core, &shared, &active_id_ref, &set_address));
+            page_elements.push(page_element(id.clone(), &core, &shared, &active_id_ref, &bump));
         }
     }
     if core.borrow().is_page_loaded(&active_id) {
-        page_elements.push(page_element(active_id.clone(), &core, &shared, &active_id_ref, &set_address));
+        page_elements.push(page_element(active_id.clone(), &core, &shared, &active_id_ref, &bump));
     }
     let content = grid(page_elements);
 
     let overlay_element: Option<Element> = match overlay {
         Overlay::None => None,
-        Overlay::Switcher => Some(Element::from(switcher_overlay(
-            &core,
-            &shared,
-            &search_query,
-            set_search_query.clone(),
-            switch_to.clone(),
-            add_page_and_switch.clone(),
-            close_page.clone(),
-        ))),
-        Overlay::Settings => Some(settings_overlay(
-            &shared,
-            &start_page_draft,
-            set_start_page_draft.clone(),
-            engine_index_draft,
-            set_engine_index_draft.clone(),
-            unlimited_draft,
-            set_unlimited_draft.clone(),
-            &limit_draft,
-            set_limit_draft.clone(),
-            save_settings.clone(),
+        Overlay::Switcher => Some(overlay_chrome(
+            switcher_overlay(
+                &core,
+                &shared,
+                &search_query,
+                set_search_query.clone(),
+                switch_to.clone(),
+                add_page_and_switch.clone(),
+                close_page.clone(),
+            ),
             close_any_overlay.clone(),
-            &keybindings,
-            listening_for,
-            set_listening_for.clone(),
-            &new_binding_text,
-            set_new_binding_text.clone(),
-            &bump,
         )),
-        Overlay::Profile => Some(profile_overlay(
-            &shared,
-            &new_profile_draft,
-            set_new_profile_draft.clone(),
-            create_and_open_profile.clone(),
+        Overlay::Settings => Some(overlay_chrome(
+            settings_overlay(
+                &shared,
+                &start_page_draft,
+                set_start_page_draft.clone(),
+                engine_index_draft,
+                set_engine_index_draft.clone(),
+                unlimited_draft,
+                set_unlimited_draft.clone(),
+                &limit_draft,
+                set_limit_draft.clone(),
+                save_settings.clone(),
+                close_any_overlay.clone(),
+                &keybindings,
+                listening_for,
+                set_listening_for.clone(),
+                &new_binding_text,
+                set_new_binding_text.clone(),
+                &bump,
+            ),
+            close_any_overlay.clone(),
+        )),
+        Overlay::Profile => Some(overlay_chrome(
+            profile_overlay(
+                &shared,
+                &new_profile_draft,
+                set_new_profile_draft.clone(),
+                create_and_open_profile.clone(),
+                close_any_overlay.clone(),
+            ),
             close_any_overlay.clone(),
         )),
     };
@@ -691,7 +750,6 @@ fn do_add_page(
     url: &str,
     set_active_id: &SetState<String>,
     active_id_ref: &HookRef<String>,
-    set_address: &SetState<String>,
 ) {
     let id = core.borrow_mut().allocate_id();
     let engine = ReactorWebViewEngine::new();
@@ -712,7 +770,6 @@ fn do_add_page(
     }
     *active_id_ref.borrow_mut() = id.clone();
     set_active_id.call(id);
-    set_address.call(url.to_string());
 }
 
 /// Reconstructs a page's engine if it was unloaded (see this module's doc
@@ -735,11 +792,11 @@ fn page_element(
     core: &HookRef<PageManager<ReactorWebViewEngine>>,
     shared: &Rc<Shared>,
     active_id_ref: &HookRef<String>,
-    set_address: &SetState<String>,
+    bump: &Callback<()>,
 ) -> Element {
-    let Some((web_cell, registration_cell, title_cell, start_url)) = core.borrow().page(&id).map(|p| {
+    let Some((web_cell, registration_cell, title_registration_cell, title_cell, start_url)) = core.borrow().page(&id).map(|p| {
         let engine = p.engine.as_ref().expect("page_element only called for loaded pages");
-        (engine.web.clone(), engine.registration.clone(), Rc::clone(&p.title), p.last_url.clone())
+        (engine.web.clone(), engine.registration.clone(), engine.title_registration.clone(), Rc::clone(&p.title), p.last_url.clone())
     }) else {
         return Element::from(vstack(())).with_key(id);
     };
@@ -747,14 +804,14 @@ fn page_element(
 
     let shared = Rc::clone(shared);
     let active_id_ref = active_id_ref.clone();
-    let set_address = set_address.clone();
+    let bump = bump.clone();
     let id_for_ready = id.clone();
 
     let on_ready = move |ready: WebView| {
         trace(&format!("on_ready: page {id_for_ready} WebView2 ready"));
         let reflect = {
             let ready = ready.clone();
-            let set_address = set_address.clone();
+            let bump = bump.clone();
             let active_id_ref = active_id_ref.clone();
             let id = id_for_ready.clone();
             let shared = Rc::clone(&shared);
@@ -767,19 +824,102 @@ fn page_element(
                         eprintln!("failed to record history visit: {err}");
                     }
                 }
+                // Forces a re-render so the toolbar's title chip (read
+                // directly from `core` each render, see `app`'s render
+                // function) picks up this page's real title once it's
+                // known — only when this is the active page, matching what
+                // this used to gate `set_address.call(source)` on before
+                // the toolbar showed the URL instead of the title. This
+                // `bump.invoke(())` likely has the same not-always-a-real-
+                // render gap documented on `title_changed`'s below — kept
+                // anyway since it's still correct/harmless when it *does*
+                // take effect, and this closure's other job (recording the
+                // visit) is unaffected either way.
                 if *active_id_ref.borrow() == id && !source.is_empty() {
-                    set_address.call(source);
+                    bump.invoke(());
                 }
             }
         };
         if let Ok(registration) = ready.on_navigation_completed(reflect) {
             *registration_cell.borrow_mut() = Some(registration);
         }
+        // Separate from `reflect`/`on_navigation_completed` above — this is
+        // the semantically correct event for a title change (the same one
+        // gtk3/macOS's `wry` engines already use), not just a duplicate.
+        //
+        // Real, pre-existing gap surfaced (not introduced) by this code,
+        // confirmed by direct testing in the real VM with `trace()` logging:
+        // `title_cell` gets updated correctly and this handler *does* fire
+        // with the right title, but the `bump.invoke(())` below doesn't
+        // reliably produce a new render on its own — the toolbar's title
+        // chip stayed on "New Page" until some unrelated, genuinely
+        // UI-thread-originated event (a button click, a keyboard
+        // accelerator) forced the next render, which then picked up the
+        // already-correct `title_cell` value. `reflect`'s own `bump.invoke`
+        // above likely has the exact same gap — it was never visible before
+        // because the toolbar used to show the URL, which `do_add_page`
+        // already seeds correctly before the page ever finishes loading, so
+        // there was nothing to visibly go stale. Root cause is very likely
+        // that `WebView2`'s native event callbacks (`on_document_title_changed`/
+        // `on_navigation_completed`) don't run on whatever thread/message-loop
+        // tick `windows-reactor`'s own dispatch relies on to notice a state
+        // update — properly fixing that means marshaling through a
+        // `DispatcherQueue` (real APIs for this exist in `windows-reactor`'s
+        // own `host.rs`, e.g. `DispatcherQueue::GetForCurrentThread()` +
+        // `TryEnqueueWithPriority`), which needs the UI thread's queue
+        // captured at startup and threaded all the way down here — a
+        // bigger, riskier change than this pass had scope for. Not fixed
+        // here; flagging clearly instead of silently shipping it.
+        let title_changed = {
+            let bump = bump.clone();
+            let active_id_ref = active_id_ref.clone();
+            let id = id_for_ready.clone();
+            let title_cell = Rc::clone(&title_cell);
+            move |new_title: String| {
+                *title_cell.borrow_mut() = new_title;
+                if *active_id_ref.borrow() == id {
+                    bump.invoke(());
+                }
+            }
+        };
+        if let Ok(registration) = ready.on_document_title_changed(title_changed) {
+            *title_registration_cell.borrow_mut() = Some(registration);
+        }
         let _ = ready.navigate(&start_url);
         *web_cell.borrow_mut() = Some(ready);
     };
 
     Element::from(webview(on_ready)).with_key(id)
+}
+
+/// Shared chrome for every full-screen overlay (switcher/settings/profile):
+/// a dim backdrop filling the overlay's grid cell, `content` on top, and a
+/// close (×) button + "Press Esc to close" hint pinned to the top-right —
+/// all stacked in one implicit grid cell (no `.rows()/.columns()` on the
+/// outer `grid`, the same z-by-array-position trick `app`'s own render
+/// function already uses for `overlay_element.grid_row(2)` layering over
+/// `content`). Matches `browser-linux-gtk3`'s `build_overlay_chrome`'s
+/// rgba(20,20,18,0.55) backdrop color — a free visual-consistency touch,
+/// not shared code (different UI frameworks). Caller still builds its own
+/// content and passes the same `Callback<()>` it already threads through as
+/// `on_cancel`/`on_close` (see `settings_overlay`/`profile_overlay`) — this
+/// doesn't invent a second close path.
+fn overlay_chrome(content: impl Into<Element>, on_close: Callback<()>) -> Element {
+    let backdrop = Element::from(Shape::rectangle().fill(Color { a: 140, r: 20, g: 20, b: 18 }))
+        .horizontal_alignment(HorizontalAlignment::Stretch)
+        .vertical_alignment(VerticalAlignment::Stretch);
+
+    let close_button = Element::from(button("\u{2715}").on_click(move || on_close.invoke(())))
+        .horizontal_alignment(HorizontalAlignment::Right)
+        .vertical_alignment(VerticalAlignment::Top)
+        .margin(Thickness::uniform(12.0));
+
+    let hint = Element::from(caption("Press Esc to close"))
+        .horizontal_alignment(HorizontalAlignment::Right)
+        .vertical_alignment(VerticalAlignment::Top)
+        .margin(Thickness { top: 12.0, right: 44.0, left: 0.0, bottom: 0.0 });
+
+    grid((backdrop, content.into(), close_button, hint)).into()
 }
 
 /// The search-box-plus-tile-grid overlay, matching `browser-windows-winui`'s
@@ -807,6 +947,7 @@ fn switcher_overlay(
 
     let start_page = shared.settings.borrow().start_page.clone();
     let tiles_for_select = tiles.clone();
+    let switch_to_for_select = switch_to.clone();
     let add_page_and_switch_for_select = add_page_and_switch.clone();
     let grid_of_tiles = grid_view(tiles, |tile, _idx| tile_element(tile))
         .with_key_selector(tile_key)
@@ -814,7 +955,7 @@ fn switcher_overlay(
         .on_selection_changed(move |idx: i32| {
             let Some(activation) = browser_chrome_core::activate_row(&tiles_for_select, idx.max(0) as usize, &start_page) else { return };
             match activation {
-                browser_chrome_core::SwitcherActivation::SwitchTo(id) => switch_to.invoke(id),
+                browser_chrome_core::SwitcherActivation::SwitchTo(id) => switch_to_for_select.invoke(id),
                 browser_chrome_core::SwitcherActivation::OpenNewPage(url) => add_page_and_switch_for_select.invoke(url),
             }
         });
@@ -845,11 +986,65 @@ fn switcher_overlay(
         }
     };
 
+    // Plain Enter — ported one-for-one from `browser-linux-gtk3`'s unified
+    // `connect_activate` handler (see that crate's `lib.rs`): exactly one
+    // open-page match switches to it; otherwise exactly one history match
+    // opens that entry's real URL, and anything else resolves the typed
+    // text as a fresh address/search. Intended to be what makes typing a
+    // URL in this box (preloaded via the toolbar title chip's click, in
+    // URL-editing mode) and pressing Enter actually navigate, not just
+    // filter tiles — previously this box had no plain-Enter behavior at
+    // all (only Ctrl+Enter, below, and tile selection).
+    //
+    // Real, confirmed-by-testing gap: this `KeyboardAccelerator` doesn't
+    // actually fire while this `TextBox` has keyboard focus — confirmed in
+    // the real VM that the *identical* mechanism with a Ctrl modifier
+    // (`force_new_page_from_search`, below) fires correctly from the same
+    // focused box, isolating this to a plain-`VirtualKeyModifiers::None`
+    // `Enter` specifically, not a registration bug. Very likely a WinUI
+    // `TextBox` consumes a bare Enter as part of its own default input
+    // handling before window/page-level accelerators see it, and
+    // `windows-reactor` exposes no lower-priority key hook (`on_key_down`/
+    // `on_preview_key_down`-style API) to intercept it earlier — checked
+    // directly, no such API exists on `Element`/`TextBox` today. Left in
+    // place (harmless, and correct if it ever does fire) rather than
+    // removed, but typing a URL and pressing plain Enter in this box does
+    // not currently navigate — only Ctrl+Enter (forces a new page) and
+    // clicking/selecting a tile do. Not the parity this was meant to
+    // achieve; flagging clearly instead of silently shipping it as if it
+    // were.
+    let activate_search = {
+        let core = core.clone();
+        let shared = Rc::clone(shared);
+        let query = search_query.to_string();
+        let switch_to = switch_to.clone();
+        let add_page_and_switch = add_page_and_switch.clone();
+        move || {
+            let trimmed = query.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            match core.borrow().matching_ids(trimmed).as_slice() {
+                [only] => switch_to.invoke(only.clone()),
+                _ => {
+                    let history_matches = shared.history.search(trimmed, 2).unwrap_or_default();
+                    if let [only] = history_matches.as_slice() {
+                        add_page_and_switch.invoke(only.url.clone());
+                    } else {
+                        let url = resolve_address_input(trimmed, &shared.settings.borrow());
+                        add_page_and_switch.invoke(url);
+                    }
+                }
+            }
+        }
+    };
+
     let search_box = text_box(search_query.to_string())
         .placeholder_text("Type to filter open pages\u{2026}")
         .on_text_changed(set_search_query)
         .width(400.0)
-        .keyboard_accelerator(KeyboardAccelerator::new(VirtualKey::Enter, VirtualKeyModifiers::Control, force_new_page_from_search));
+        .keyboard_accelerator(KeyboardAccelerator::new(VirtualKey::Enter, VirtualKeyModifiers::Control, force_new_page_from_search))
+        .keyboard_accelerator(KeyboardAccelerator::new(VirtualKey::Enter, VirtualKeyModifiers::None, activate_search));
 
     grid((
         Element::from(search_box).grid_row(0),

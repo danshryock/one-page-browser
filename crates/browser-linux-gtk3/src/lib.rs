@@ -43,14 +43,24 @@ enum LoginSource {
 }
 
 pub struct AppState {
-    /// Doubles as the switcher grid's search box: while the switcher is
-    /// open, typing here filters the tile grid (open pages + history)
-    /// instead of doing anything to the active page, and Enter does the
-    /// switcher's search-activate behavior instead of navigating — see
-    /// `open_switcher`/`close_switcher` and the `connect_changed`/
-    /// `connect_activate` wiring in `build_window_and_app`. One widget for
-    /// both roles, not two, per the "unified search/URL bar" design.
+    /// The switcher grid's search/URL box, living entirely inside the
+    /// switcher overlay's own layout (not the toolbar — see `title_button`).
+    /// While the switcher is open, typing here filters the tile grid (open
+    /// pages + history) or edits the active page's URL depending on how the
+    /// switcher was opened (`open_switcher` vs. `open_switcher_editing_url`)
+    /// — see `close_switcher` and the `connect_changed`/`connect_activate`
+    /// wiring in `build_window_and_app`. One widget for both roles, not two,
+    /// per the "unified search/URL bar" design.
     address_bar: gtk::Entry,
+    /// The toolbar's clickable "title chip" label — shows the active page's
+    /// title (see `refresh_title_label`). Not editable; the chip itself
+    /// (the `gtk::Button` wrapping this label, styled `.title-chip`/
+    /// `.title-chip:hover` in `build_window_and_app_with_history` to look
+    /// like a bordered label at rest and shift toward looking like a text
+    /// input on hover) isn't stored here — same convention every other
+    /// toolbar button already follows, wired up once at construction time
+    /// with no need to be reachable from `AppState` afterward.
+    title_label: gtk::Label,
     stack: gtk::Stack,
     switcher_panel: gtk::Widget,
     flowbox: gtk::FlowBox,
@@ -288,6 +298,9 @@ impl AppState {
                 if let Some(app) = app_weak.upgrade() {
                     app.record_visit(&id_for_cb);
                     app.rebuild_switcher_grid();
+                    if app.core.borrow().active_id() == id_for_cb {
+                        app.refresh_title_label();
+                    }
                 }
             },
             move |playing| {
@@ -488,6 +501,9 @@ impl AppState {
                 if let Some(app) = app_weak.upgrade() {
                     app.record_visit(&id_for_cb);
                     app.rebuild_switcher_grid();
+                    if app.core.borrow().active_id() == id_for_cb {
+                        app.refresh_title_label();
+                    }
                 }
             },
             move |playing| {
@@ -509,9 +525,7 @@ impl AppState {
         self.ensure_engine_loaded(id);
         self.core.borrow_mut().set_active(id);
         self.stack.set_visible_child_name(id);
-        if let Some(page) = self.core.borrow().page(id) {
-            self.address_bar.set_text(&page.current_url());
-        }
+        self.refresh_title_label();
         self.refresh_bookmark_toggle_button();
     }
 
@@ -583,26 +597,14 @@ impl AppState {
     /// The address bar's `focus-in-event` handler's target — opens the
     /// switcher (preloaded with the active page's URL, same as Ctrl+L) the
     /// moment the address bar becomes focused, unless the switcher is
-    /// already open. That guard matters for two reasons:
-    /// `open_switcher_common`'s own `grab_focus()` call would otherwise
-    /// recurse back into this same handler (harmless in practice — GTK
-    /// doesn't re-emit focus-in for a widget that's already focused — but
-    /// the guard is what actually matters), and, more importantly,
-    /// refocusing the address bar while the switcher is *already* open
-    /// (e.g. clicking back into it mid-filter) must not clobber whatever
-    /// the user already typed.
-    ///
-    /// `pub` so tests can call this directly rather than relying on a real
-    /// `focus-in-event` firing — confirmed by direct experiment that this
-    /// headless test compositor never actually gives the window real
-    /// window-manager-level focus (`window.is_active()` stays `false` even
-    /// after `Window::present()` and a multi-second settle), so GDK never
-    /// dispatches the underlying focus signal here at all, though
-    /// `Widget::grab_focus()` still updates the widget's own internal focus
-    /// state correctly (`is_focus()` does flip). Same category of gap this
-    /// crate's tests already document for `gtk-test`'s synthetic input,
-    /// just reached from the real-signal side instead.
-    pub fn address_bar_focused(self: &Rc<Self>) {
+    /// already open. The toolbar (including the title chip) stays visible
+    /// and clickable even while the switcher overlay is showing (the
+    /// overlay only covers the content area below the header bar, not the
+    /// header bar itself) — the guard matters because re-clicking the chip
+    /// while the switcher is *already* open (e.g. mid-filter) must not
+    /// clobber whatever the user already typed; only a *fresh* open should
+    /// preload the current URL.
+    pub fn title_chip_clicked(self: &Rc<Self>) {
         if !self.is_switcher_open() {
             self.open_switcher_editing_url();
         }
@@ -727,6 +729,18 @@ impl AppState {
         self.settings_panel.is_visible()
     }
 
+    /// The settings toolbar button's target — closes the overlay if it's
+    /// already open instead of just re-opening/re-seeding it, same
+    /// open-again-to-close convention every overlay's trigger button now
+    /// follows (see `toggle_switcher`, the original of this pattern).
+    pub fn toggle_settings(self: &Rc<Self>) {
+        if self.is_settings_open() {
+            self.close_settings();
+        } else {
+            self.open_settings();
+        }
+    }
+
     /// Repopulates the default-search-engine dropdown from the live
     /// `Settings::search_engines` (rather than a fixed list) and re-selects
     /// the current default — called whenever settings opens and after every
@@ -846,6 +860,15 @@ impl AppState {
         self.profile_panel.is_visible()
     }
 
+    /// The profile toolbar button's target — see `toggle_settings`.
+    pub fn toggle_profile_picker(self: &Rc<Self>) {
+        if self.is_profile_picker_open() {
+            self.close_profile_picker();
+        } else {
+            self.open_profile_picker();
+        }
+    }
+
     /// Rebuilds the profile picker's list of rows from scratch. The current
     /// profile is marked and, unlike every other row, clicking it just
     /// closes the picker instead of launching a duplicate process of the
@@ -942,6 +965,15 @@ impl AppState {
     /// helper.
     pub fn is_bookmarks_open(&self) -> bool {
         self.bookmarks_panel.is_visible()
+    }
+
+    /// The bookmarks toolbar button's target — see `toggle_settings`.
+    pub fn toggle_bookmarks(self: &Rc<Self>) {
+        if self.is_bookmarks_open() {
+            self.close_bookmarks();
+        } else {
+            self.open_bookmarks();
+        }
     }
 
     /// Rebuilds the bookmarks overlay's list of rows from scratch, most-
@@ -1139,6 +1171,15 @@ impl AppState {
     /// inspection helper.
     pub fn is_passwords_open(&self) -> bool {
         self.passwords_panel.is_visible()
+    }
+
+    /// The passwords toolbar button's target — see `toggle_settings`.
+    pub fn toggle_passwords(self: &Rc<Self>) {
+        if self.is_passwords_open() {
+            self.close_passwords();
+        } else {
+            self.open_passwords();
+        }
     }
 
     /// Builds a fresh `BitwardenBackend` from the current settings, if
@@ -1640,6 +1681,16 @@ impl AppState {
             .set_image(Some(&gtk::Image::from_icon_name(Some(icon_name), gtk::IconSize::Button)));
         self.bookmark_toggle_button
             .set_tooltip_text(Some(if is_bookmarked { "Remove bookmark" } else { "Bookmark this page" }));
+    }
+
+    /// Updates the toolbar's title chip to reflect the active page's current
+    /// title — called whenever the active page changes or its title changes
+    /// (`WryEngine::new`'s title-changed callback). Falls back to "New Page"
+    /// for an empty title, matching `browser_chrome_core::switcher`'s
+    /// existing convention for the same case.
+    fn refresh_title_label(&self) {
+        let title = self.core.borrow().active().map(|p| p.title.borrow().clone()).unwrap_or_default();
+        self.title_label.set_text(if title.is_empty() { "New Page" } else { &title });
     }
 
     /// Whether the active page is currently bookmarked — test/inspection
@@ -2233,6 +2284,19 @@ impl AppState {
         self.switcher_panel.is_visible()
     }
 
+    /// The switcher toolbar button's target — closes the grid if it's
+    /// already open instead of just re-opening it. Every other overlay's
+    /// trigger button now follows this same open-again-to-close convention
+    /// (`toggle_settings`/`toggle_profile_picker`/`toggle_bookmarks`/
+    /// `toggle_passwords`), this was just the original one.
+    pub fn toggle_switcher(self: &Rc<Self>) {
+        if self.is_switcher_open() {
+            self.close_switcher();
+        } else {
+            self.open_switcher();
+        }
+    }
+
     /// Whether this window belongs to an ephemeral (private/incognito/guest)
     /// profile — test/inspection helper. More reliable than checking
     /// `window.title()` directly: with a custom `GtkHeaderBar` set as the
@@ -2284,6 +2348,11 @@ impl AppState {
     /// setting up the "typed a filter, then closed without selecting" case.
     pub fn set_address_bar_text(&self, text: &str) {
         self.address_bar.set_text(text);
+    }
+
+    /// The toolbar's title chip's current text — test/inspection helper.
+    pub fn title_label_text(&self) -> String {
+        self.title_label.text().to_string()
     }
 
     /// Whether the address bar's entire current text is selected — test
@@ -2443,6 +2512,51 @@ fn gtk_key_to_chord(event: &gtk::gdk::EventKey) -> Option<KeyChord> {
     Some(KeyChord::new(ctrl, alt, shift, key))
 }
 
+/// Shared chrome for every full-screen overlay (switcher/settings/profile/
+/// bookmarks/passwords): a dimming scrim behind `content`, a close (×)
+/// button pinned to the upper-right, and a small "Press Esc to close" hint
+/// next to it. Construction and signal-wiring are already two separate
+/// passes in `build_window_and_app_with_history` — this only builds
+/// widgets, so it takes no `Rc<AppState>` and the caller wires the returned
+/// `scrim`/`close_button` to whichever `close_*` method is right for that
+/// overlay, the same way scrim-click wiring already works today.
+fn build_overlay_chrome(
+    content: &impl gtk::glib::IsA<gtk::Widget>,
+    scrim_css: &gtk::CssProvider,
+) -> (gtk::Overlay, gtk::EventBox, gtk::Button) {
+    let scrim = gtk::EventBox::new();
+    scrim.style_context().add_class("switcher-scrim");
+    scrim.style_context().add_provider(scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+    // Same "× glyph in a circular translucent button" idiom already used
+    // for switcher tiles' `tile-close-btn`/`tile-close-label`, just larger
+    // and pinned to the overlay's own corner instead of a tile's.
+    let close_button = gtk::Button::new();
+    close_button.style_context().add_class("overlay-close-btn");
+    let close_label = gtk::Label::new(Some("\u{d7}"));
+    close_label.style_context().add_class("overlay-close-label");
+    close_button.add(&close_label);
+    close_button.set_halign(gtk::Align::End);
+    close_button.set_valign(gtk::Align::Start);
+    close_button.set_margin_top(16);
+    close_button.set_margin_end(16);
+    close_button.set_size_request(28, 28);
+
+    let esc_hint = gtk::Label::new(Some("Press Esc to close"));
+    esc_hint.style_context().add_class("overlay-esc-hint");
+    esc_hint.set_halign(gtk::Align::End);
+    esc_hint.set_valign(gtk::Align::Start);
+    esc_hint.set_margin_top(20);
+    esc_hint.set_margin_end(52); // clears the close button
+
+    let root_overlay = gtk::Overlay::new();
+    root_overlay.add(&scrim);
+    root_overlay.add_overlay(content);
+    root_overlay.add_overlay(&close_button);
+    root_overlay.add_overlay(&esc_hint);
+    (root_overlay, scrim, close_button)
+}
+
 /// Builds the full window + chrome (header bar, page stack, switcher overlay)
 /// and wires up all signal handlers. Does not create any page — call
 /// `app.add_page(&app.settings().start_page.clone())` (or any other URL)
@@ -2491,7 +2605,16 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
                 border: none; box-shadow: none; border-radius: 9999px; padding: 0; \
                 min-width: 0; min-height: 0; } \
               .tile-close-label { color: #ffffff; } \
+              .overlay-close-btn { background-image: none; background-color: rgba(0, 0, 0, 0.45); \
+                border: none; box-shadow: none; border-radius: 9999px; padding: 0; \
+                min-width: 0; min-height: 0; } \
+              .overlay-close-label { color: #ffffff; font-size: 14px; } \
+              .overlay-esc-hint { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
               .tile-audio-icon { color: #ffffff; } \
+              .title-chip { background-image: none; background-color: alpha(@theme_fg_color, 0.06); \
+                border: 1px solid alpha(@theme_fg_color, 0.22); border-radius: 6px; box-shadow: none; \
+                padding: 4px 12px; } \
+              .title-chip:hover { background-color: @theme_base_color; border-color: @theme_selected_bg_color; } \
               .switcher-hint { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
               .switcher-profile-label { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
               .page-tile-unloaded { opacity: 0.5; } \
@@ -2605,16 +2728,31 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     header_bar.pack_start(&back_button);
     header_bar.pack_start(&forward_button);
 
-    let address_bar = gtk::Entry::new();
-    address_bar.set_width_chars(50);
-    address_bar.set_hexpand(true);
+    // A clickable "title chip", not a text field — shows the active page's
+    // title (see `refresh_title_label`), borders itself subtly, and shifts
+    // toward looking like a text input on hover (both via the
+    // `.title-chip`/`.title-chip:hover` CSS below) as a discoverability
+    // hint that clicking it opens the switcher in URL-editing mode
+    // (`open_switcher_editing_url`). The real editable text entry now lives
+    // entirely inside the switcher overlay (see `grid_content` below) — a
+    // `gtk::Button` (not a plain `Label`/`EventBox`) specifically because
+    // buttons get native `:hover`/pseudo-class CSS support for free, and
+    // it's the same click primitive every other toolbar control already
+    // uses.
+    let title_button = gtk::Button::new();
+    title_button.style_context().add_class("title-chip");
+    title_button.style_context().add_class("flat");
+    let title_label = gtk::Label::new(Some("New Page"));
+    title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title_button.add(&title_label);
+    title_button.set_hexpand(true);
 
-    // Group the reload button with the address bar itself (rather than
+    // Group the reload button with the title chip itself (rather than
     // packing it into the header bar's separate end-region) so it's centered
-    // as part of the same unit as the address bar, sitting flush against it.
-    // A spacer before the address bar and one after the reload button (each
-    // about one toolbar button wide) doubles as draggable header-bar space
-    // for moving the window.
+    // as part of the same unit as the title chip, sitting flush against it.
+    // A spacer before the chip and one after the reload button (each about
+    // one toolbar button wide) doubles as draggable header-bar space for
+    // moving the window.
     const TOOLBAR_BUTTON_WIDTH: i32 = 36;
     let spacer_before_address_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     spacer_before_address_bar.set_size_request(TOOLBAR_BUTTON_WIDTH, -1);
@@ -2623,7 +2761,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
 
     let address_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     address_group.pack_start(&spacer_before_address_bar, false, false, 0);
-    address_group.pack_start(&address_bar, true, true, 0);
+    address_group.pack_start(&title_button, true, true, 0);
     address_group.pack_start(&bookmark_toggle_button, false, false, 0);
     address_group.pack_start(&reload_button, false, false, 0);
     address_group.pack_start(&spacer_after_reload, false, false, 0);
@@ -2643,13 +2781,16 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     stack.set_vexpand(true);
     stack.set_hexpand(true);
 
-    let scrim = gtk::EventBox::new();
-    scrim.style_context().add_class("switcher-scrim");
     let scrim_css = gtk::CssProvider::new();
     let _ = scrim_css.load_from_data(b".switcher-scrim { background-color: rgba(20,20,18,0.55); }");
-    scrim
-        .style_context()
-        .add_provider(&scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+    // The real, editable text entry — lives entirely inside the switcher now
+    // (see the toolbar's `title_button` above). Doubles as the switcher's
+    // search box (filter open pages/history) and, when opened via the title
+    // chip's click, the URL editor for the active page — one widget for
+    // both roles, same as before, just relocated out of the toolbar.
+    let address_bar = gtk::Entry::new();
+    address_bar.set_hexpand(true);
 
     let flowbox = gtk::FlowBox::new();
     flowbox.set_valign(gtk::Align::Start);
@@ -2671,19 +2812,20 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     grid_content.set_halign(gtk::Align::Fill);
     grid_content.set_valign(gtk::Align::Start);
     grid_content.set_margin_top(40);
+    grid_content.pack_start(&address_bar, false, false, 0);
     grid_content.pack_start(&flowbox, true, true, 0);
     grid_content.pack_start(&keynav_hint, false, false, 0);
 
+    // Top-left, not top-right — the overlay chrome's close icon/Esc hint
+    // now own that corner for every overlay.
     let profile_label = gtk::Label::new(Some(&profile.name));
     profile_label.style_context().add_class("switcher-profile-label");
-    profile_label.set_halign(gtk::Align::End);
+    profile_label.set_halign(gtk::Align::Start);
     profile_label.set_valign(gtk::Align::Start);
     profile_label.set_margin_top(12);
-    profile_label.set_margin_end(16);
+    profile_label.set_margin_start(16);
 
-    let switcher_overlay = gtk::Overlay::new();
-    switcher_overlay.add(&scrim);
-    switcher_overlay.add_overlay(&grid_content);
+    let (switcher_overlay, scrim, switcher_close_button) = build_overlay_chrome(&grid_content, &scrim_css);
     switcher_overlay.add_overlay(&profile_label);
 
     // --- Settings overlay: an in-window overlay (like the switcher grid
@@ -2691,12 +2833,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     // doc comment for why. Scoped to picking the default search engine from
     // the existing seeded list, not adding/editing entries — that's a
     // fuller list-editor UI, left for later.
-    let settings_scrim = gtk::EventBox::new();
-    settings_scrim.style_context().add_class("switcher-scrim");
-    settings_scrim
-        .style_context()
-        .add_provider(&scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-
     let settings_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
     settings_box.set_halign(gtk::Align::Fill);
     settings_box.set_valign(gtk::Align::Start);
@@ -2851,9 +2987,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     settings_buttons_row.pack_start(&settings_save_button, false, false, 0);
     settings_box.pack_start(&settings_buttons_row, false, false, 0);
 
-    let settings_overlay = gtk::Overlay::new();
-    settings_overlay.add(&settings_scrim);
-    settings_overlay.add_overlay(&settings_box);
+    let (settings_overlay, settings_scrim, settings_close_button) = build_overlay_chrome(&settings_box, &scrim_css);
 
     // --- Profile picker overlay: same in-window-overlay pattern again.
     // Lists existing profiles (from `list_profile_names()`, rebuilt each
@@ -2861,12 +2995,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     // other than the current one launches a new, independent process
     // scoped to it (`launch_new_profile_process`) rather than switching this
     // window in place.
-    let profile_scrim = gtk::EventBox::new();
-    profile_scrim.style_context().add_class("switcher-scrim");
-    profile_scrim
-        .style_context()
-        .add_provider(&scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-
     let profile_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
     profile_box.set_halign(gtk::Align::Fill);
     profile_box.set_valign(gtk::Align::Start);
@@ -2902,18 +3030,10 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     profile_buttons_row.pack_start(&profile_cancel_button, false, false, 0);
     profile_box.pack_start(&profile_buttons_row, false, false, 0);
 
-    let profile_overlay = gtk::Overlay::new();
-    profile_overlay.add(&profile_scrim);
-    profile_overlay.add_overlay(&profile_box);
+    let (profile_overlay, profile_scrim, profile_close_button) = build_overlay_chrome(&profile_box, &scrim_css);
 
     // --- Bookmarks overlay: same shape again. One row per bookmark, rebuilt
     // from `Bookmarks::all()` each time it opens and after every add/remove.
-    let bookmarks_scrim = gtk::EventBox::new();
-    bookmarks_scrim.style_context().add_class("switcher-scrim");
-    bookmarks_scrim
-        .style_context()
-        .add_provider(&scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-
     let bookmarks_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
     bookmarks_box.set_halign(gtk::Align::Fill);
     bookmarks_box.set_valign(gtk::Align::Start);
@@ -2934,21 +3054,13 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     bookmarks_close_row.pack_start(&bookmarks_close_button, false, false, 0);
     bookmarks_box.pack_start(&bookmarks_close_row, false, false, 0);
 
-    let bookmarks_overlay = gtk::Overlay::new();
-    bookmarks_overlay.add(&bookmarks_scrim);
-    bookmarks_overlay.add_overlay(&bookmarks_box);
+    let (bookmarks_overlay, bookmarks_scrim, bookmarks_close_icon) = build_overlay_chrome(&bookmarks_box, &scrim_css);
 
     // --- Password manager overlay: same shape again. One row per
     // credential, rebuilt from `PasswordStore::list()` each time the
     // overlay opens and after every add/update/delete — plus an inline
     // add-new-credential form, since unlike bookmarks a password isn't
     // captured from the active page, it has to be typed in.
-    let passwords_scrim = gtk::EventBox::new();
-    passwords_scrim.style_context().add_class("switcher-scrim");
-    passwords_scrim
-        .style_context()
-        .add_provider(&scrim_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-
     let passwords_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
     passwords_box.set_halign(gtk::Align::Fill);
     passwords_box.set_valign(gtk::Align::Start);
@@ -3053,9 +3165,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     passwords_close_row.pack_start(&passwords_close_button, false, false, 0);
     passwords_box.pack_start(&passwords_close_row, false, false, 0);
 
-    let passwords_overlay = gtk::Overlay::new();
-    passwords_overlay.add(&passwords_scrim);
-    passwords_overlay.add_overlay(&passwords_box);
+    let (passwords_overlay, passwords_scrim, passwords_close_icon) = build_overlay_chrome(&passwords_box, &scrim_css);
 
     let root_overlay = gtk::Overlay::new();
     root_overlay.add(&stack);
@@ -3103,6 +3213,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     };
     let app = Rc::new(AppState {
         address_bar: address_bar.clone(),
+        title_label: title_label.clone(),
         stack,
         switcher_panel: switcher_overlay.clone().upcast::<gtk::Widget>(),
         flowbox: flowbox.clone(),
@@ -3175,14 +3286,11 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         });
     }
     {
-        // Focusing the address bar (a click, Tab, or any other way it
-        // becomes the focus widget) opens the switcher — see
-        // `AppState::address_bar_focused`'s doc comment for the full
-        // reasoning, including why it's guarded on `!is_switcher_open()`.
+        // The toolbar's title chip — see `AppState::title_chip_clicked`'s
+        // doc comment for why it's guarded on `!is_switcher_open()`.
         let app = Rc::clone(&app);
-        address_bar.connect_focus_in_event(move |_, _| {
-            app.address_bar_focused();
-            gtk::glib::Propagation::Proceed
+        title_button.connect_clicked(move |_| {
+            app.title_chip_clicked();
         });
     }
     {
@@ -3275,64 +3383,62 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         reload_button.connect_clicked(move |_| app.with_active(|p| p.reload()));
     }
     {
-        // Contextual: while the switcher is open, the address bar is acting
-        // as its search box (filter open pages/history, Enter opens the sole
-        // match or a fresh page) instead of navigating the active page — see
-        // the field doc on `AppState::address_bar`.
+        // The address bar's Enter handler — filters/edits are its only
+        // roles now that it lives entirely inside the switcher panel (see
+        // the field doc on `AppState::address_bar`), so this no longer
+        // needs to branch on whether the switcher is open: it always is,
+        // by construction, whenever this widget is reachable at all.
         let app = Rc::clone(&app);
         address_bar.connect_activate(move |entry| {
             let text = entry.text().to_string();
-            if app.is_switcher_open() {
-                let trimmed = text.trim();
-                if trimmed.is_empty() {
-                    return;
-                }
-                match app.matching_page_ids(trimmed).as_slice() {
-                    [] => {
-                        // No open page matches — check history before
-                        // treating the typed text as a fresh URL/search:
-                        // exactly one history match opens that entry's real
-                        // URL instead.
-                        match app.history.search(trimmed, 2) {
-                            Ok(matches) if matches.len() == 1 => {
-                                let url = matches[0].url.clone();
-                                if let Err(err) = app.add_page(&url) {
-                                    eprintln!("failed to open history entry: {err}");
-                                }
-                                app.close_switcher();
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            match app.matching_page_ids(trimmed).as_slice() {
+                [] => {
+                    // No open page matches — check history before
+                    // treating the typed text as a fresh URL/search:
+                    // exactly one history match opens that entry's real
+                    // URL instead.
+                    match app.history.search(trimmed, 2) {
+                        Ok(matches) if matches.len() == 1 => {
+                            let url = matches[0].url.clone();
+                            if let Err(err) = app.add_page(&url) {
+                                eprintln!("failed to open history entry: {err}");
                             }
-                            _ => {
-                                let url = resolve_address_input(trimmed, &app.settings());
-                                if let Err(err) = app.add_page(&url) {
-                                    eprintln!("failed to open new page: {err}");
-                                }
-                                app.close_switcher();
+                            app.close_switcher();
+                        }
+                        _ => {
+                            let url = resolve_address_input(trimmed, &app.settings());
+                            if let Err(err) = app.add_page(&url) {
+                                eprintln!("failed to open new page: {err}");
                             }
+                            app.close_switcher();
                         }
                     }
-                    [only] => app.switch_to(only),
-                    _ => {}
                 }
-            } else {
-                let url = resolve_address_input(&text, &app.settings());
-                app.with_active(|p| p.navigate(&url));
+                [only] => app.switch_to(only),
+                _ => {}
             }
         });
     }
     {
         let app = Rc::clone(&app);
         switcher_toggle.connect_clicked(move |_| {
-            if app.is_switcher_open() {
-                app.close_switcher();
-            } else {
-                app.open_switcher();
-            }
+            app.toggle_switcher();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        switcher_close_button.connect_clicked(move |_| {
+            app.close_switcher();
         });
     }
     {
         let app = Rc::clone(&app);
         settings_button.connect_clicked(move |_| {
-            app.open_settings();
+            app.toggle_settings();
         });
     }
     {
@@ -3347,6 +3453,12 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         settings_scrim.connect_button_press_event(move |_, _| {
             app.close_settings();
             gtk::glib::Propagation::Stop
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        settings_close_button.connect_clicked(move |_| {
+            app.close_settings();
         });
     }
     {
@@ -3376,7 +3488,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     {
         let app = Rc::clone(&app);
         profile_button.connect_clicked(move |_| {
-            app.open_profile_picker();
+            app.toggle_profile_picker();
         });
     }
     {
@@ -3384,6 +3496,12 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         profile_scrim.connect_button_press_event(move |_, _| {
             app.close_profile_picker();
             gtk::glib::Propagation::Stop
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        profile_close_button.connect_clicked(move |_| {
+            app.close_profile_picker();
         });
     }
     {
@@ -3419,7 +3537,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     {
         let app = Rc::clone(&app);
         bookmarks_button.connect_clicked(move |_| {
-            app.open_bookmarks();
+            app.toggle_bookmarks();
         });
     }
     {
@@ -3449,8 +3567,14 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     }
     {
         let app = Rc::clone(&app);
+        bookmarks_close_icon.connect_clicked(move |_| {
+            app.close_bookmarks();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
         passwords_button.connect_clicked(move |_| {
-            app.open_passwords();
+            app.toggle_passwords();
         });
     }
     {
@@ -3463,6 +3587,12 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     {
         let app = Rc::clone(&app);
         passwords_close_button.connect_clicked(move |_| {
+            app.close_passwords();
+        });
+    }
+    {
+        let app = Rc::clone(&app);
+        passwords_close_icon.connect_clicked(move |_| {
             app.close_passwords();
         });
     }

@@ -60,6 +60,28 @@ pub fn build_menu(delegate: &Retained<AppDelegate>, keybindings: &Keybindings, m
         unsafe { item.setTarget(Some(delegate)) };
         browser_menu.addItem(&item);
     }
+    // Appended *after* the `Action::ALL` loop, not interspersed — kept out
+    // of the loop so `apply_key_equivalents`'s index-based walk over
+    // `browser_items` (paired against `Action::ALL[idx]`) still lines up.
+    // Escape is otherwise the one hardcoded, non-`Keybindings`-configurable
+    // shortcut in this app (matches gtk3/reactor — see
+    // `browser_core::keybindings`'s doc comment). Reuses the existing
+    // `closeAnyOverlay:` selector (already idempotent with nothing open).
+    // A menu item's key equivalent always fires and swallows the event when
+    // enabled, which would otherwise steal Escape from web page content
+    // (in-page fullscreen, JS modals) even with no overlay open — gated via
+    // `NSMenuItemValidation` (see `lib.rs`) so it only fires while one
+    // actually is.
+    let close_overlay_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Close Overlay"),
+            Some(sel!(closeAnyOverlay:)),
+            &NSString::from_str("\u{1b}"), // literal ESC
+        )
+    };
+    unsafe { close_overlay_item.setTarget(Some(delegate)) };
+    browser_menu.addItem(&close_overlay_item);
     browser_menu_item.setSubmenu(Some(&browser_menu));
     main_menu.addItem(&browser_menu_item);
 

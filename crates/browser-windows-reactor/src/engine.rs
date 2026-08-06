@@ -20,6 +20,11 @@ pub struct ReactorWebViewEngine {
     /// `EventRegistration` unsubscribes it immediately (see
     /// `windows-webview`'s doc comment on the type).
     pub registration: Rc<RefCell<Option<EventRegistration>>>,
+    /// Same reasoning as `registration`, for `on_document_title_changed`
+    /// (see `lib.rs`'s `page_element`) — a second, separate subscription,
+    /// not reused from `registration` (that one's for
+    /// `on_navigation_completed`, a different event with different timing).
+    pub title_registration: Rc<RefCell<Option<EventRegistration>>>,
 }
 
 impl ReactorWebViewEngine {
@@ -28,7 +33,7 @@ impl ReactorWebViewEngine {
     /// `.with_key()`d to this page's id (see `lib.rs`'s `page_element`).
     /// Every `RenderEngine` method below is a no-op/error until then.
     pub fn new() -> Self {
-        Self { web: Rc::new(RefCell::new(None)), registration: Rc::new(RefCell::new(None)) }
+        Self { web: Rc::new(RefCell::new(None)), registration: Rc::new(RefCell::new(None)), title_registration: Rc::new(RefCell::new(None)) }
     }
 }
 

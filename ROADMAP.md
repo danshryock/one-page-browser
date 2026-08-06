@@ -796,8 +796,34 @@ still untested).
 - `browser-macos-appkit`: a wrapping tile grid (`NSCollectionView`) instead of the current plain-list
   switcher/profile/passwords/bookmarks overlays — the one remaining item from the bookmarks/theme/encrypted-
   history bullet above, deliberately deferred there as "a smaller, separate follow-up."
-- `browser-windows-reactor`: unified search/URL bar and bookmarks, matching what `browser-linux-gtk3` now
-  has (both landed there only, per scope — see "Done" above).
+- `browser-windows-reactor`: bookmarks, matching what `browser-linux-gtk3`/`browser-macos-appkit` have (the
+  unified search/URL bar landed on this front end too — see "Done" above).
+- `browser-windows-reactor`: `WebView2` native event callbacks (`on_document_title_changed`,
+  `on_navigation_completed`) don't reliably produce a new render when they call a state setter/`Callback`
+  from inside the callback — confirmed by direct `trace()`-logged testing in the real VM: the state (e.g.
+  `Page::title`) updates correctly and the callback genuinely fires, but the toolbar doesn't visually reflect
+  it until some other, real UI-thread-originated event (a click, a keyboard accelerator) forces the next
+  render, which then picks up the already-correct value. Most visible today on the toolbar's title chip
+  (freshly-loaded pages can sit on the "New Page" fallback until *something else* happens), but likely
+  affects anything relying on a `WebView2` callback's own `bump`/state-setter call to be the trigger. Root
+  cause is very likely that these native callbacks don't run on whatever thread/message-loop tick
+  `windows-reactor`'s own dispatch relies on to notice a state update; a real fix likely means marshaling
+  through a `DispatcherQueue` (real APIs for this exist in `windows-reactor`'s own `host.rs`, e.g.
+  `DispatcherQueue::GetForCurrentThread()` + `TryEnqueueWithPriority`) — captured on the UI thread at startup
+  and threaded down to `page_element`, which is a bigger, riskier change than the pass that found this had
+  scope for.
+- `browser-windows-reactor`: the switcher's search/URL box's plain-Enter `KeyboardAccelerator`
+  (`VirtualKeyModifiers::None` + `Enter`, ported from `browser-linux-gtk3`'s unified `connect_activate` to
+  make typing a URL there and pressing Enter navigate/switch, not just filter) doesn't actually fire while
+  that `TextBox` has keyboard focus — confirmed directly in the real VM: the *same* mechanism with a Ctrl
+  modifier (`force_new_page_from_search`, pre-existing) fires correctly from the same focused box, isolating
+  this to a bare, unmodified Enter specifically. Very likely a WinUI `TextBox` consumes plain Enter as part
+  of its own default input handling before window/page-level accelerators see it; `windows-reactor` exposes
+  no lower-priority key hook (`on_key_down`/`on_preview_key_down`-style API on `Element`/`TextBox`) to
+  intercept it earlier — checked directly, no such API exists today. Net effect: typing a URL in that box
+  (e.g. via the toolbar title chip's click, in URL-editing mode) and pressing plain Enter does not navigate;
+  only Ctrl+Enter (forces a new page) and clicking/selecting a tile do. See `switcher_overlay`'s
+  `activate_search` in `lib.rs` for the fuller writeup.
 - Other external password managers beyond Bitwarden/Vaultwarden (see "Done" above for that one) — KeePassXC/
   secret-service, 1Password, etc. Each would be its own `PasswordBackend` impl; no shared "generic external
   manager" abstraction beyond the trait itself is needed until a second one is actually built.
