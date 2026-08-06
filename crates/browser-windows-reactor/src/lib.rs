@@ -127,6 +127,10 @@
 
 mod engine;
 mod shortcuts;
+// Field/method names below mirror the real WinRT API names (PascalCase) —
+// same convention, same suppression, as `windows-reactor`'s own vendored
+// `bindings.rs` (see its `lib.rs`).
+#[allow(non_snake_case, non_upper_case_globals, dead_code)]
 mod xaml_interop;
 
 use std::cell::RefCell;
@@ -193,6 +197,20 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     let (active_id, set_active_id) = cx.use_state(String::new());
     let active_id_ref = cx.use_ref(active_id.clone());
     *active_id_ref.borrow_mut() = active_id.clone();
+    // Backs the real fix for the switcher search box's plain-Enter gap (see
+    // `switcher_overlay`'s `activate_search` and `xaml_interop`'s module
+    // doc comment): `enter_subscription` holds the one `PreviewKeyDown`
+    // subscription for the app's lifetime (sets itself up lazily below,
+    // since the native root content element isn't available on the very
+    // first render); `enter_action` holds whatever that subscription
+    // should currently do with a plain Enter, refreshed every render —
+    // `Some` only while the switcher overlay's search box actually has
+    // something to act on, `None` the rest of the time so Enter elsewhere
+    // in the app (Settings, Profile) is left alone. The actual subscribe
+    // call is further down, once `bump` exists (see there for why).
+    let enter_action: HookRef<Option<Rc<dyn Fn() -> bool>>> = cx.use_ref(None);
+    let enter_subscription: HookRef<Option<windows_core::EventRevoker>> = cx.use_ref(None);
+    *enter_action.borrow_mut() = None;
     let (overlay, set_overlay) = cx.use_state(Overlay::None);
     let (search_query, set_search_query) = cx.use_state(String::new());
     // WinUI/XAML has no CSS `:hover` — this is the reactor-idiomatic
@@ -221,6 +239,41 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         let set_generation = set_generation.clone();
         move |()| set_generation.call(generation.wrapping_add(1))
     });
+
+    // `PreviewKeyDown` is a real native XAML event, not one of reactor's own
+    // wired-up `Element` events (see `xaml_interop`'s module doc comment) —
+    // it fires on the UI thread same as any other input event (confirmed:
+    // interleaves correctly with reactor's own renders in `trace()` output),
+    // but calling reactor's `SetState`/`Callback` setters from inside it
+    // doesn't on its own get picked up: reactor's normal event handlers all
+    // go through some shared internal wrapper that checks for dirty state
+    // and schedules a render afterward, and this callback — subscribed via
+    // raw interop, entirely outside reactor's own `Element`/event system —
+    // never passes through that wrapper. Confirmed directly: `trace()`
+    // showed `activate_search` correctly running and returning `true` on a
+    // real plain-Enter press, but no render followed until some unrelated,
+    // genuinely reactor-dispatched event came along. `bump.invoke(())`
+    // (already the established fix for "state changed outside reactor's
+    // own dispatch" elsewhere in this file) closes that gap here too.
+    if enter_subscription.borrow().is_none() {
+        match xaml_interop::root_content() {
+            Some(root) => {
+                let enter_action = enter_action.clone();
+                let bump = bump.clone();
+                let on_plain_enter = move || {
+                    let handled = enter_action.borrow().as_ref().is_some_and(|action| action());
+                    if handled {
+                        bump.invoke(());
+                    }
+                    handled
+                };
+                if let Ok(revoker) = xaml_interop::intercept_plain_enter(&root, on_plain_enter) {
+                    *enter_subscription.borrow_mut() = Some(revoker);
+                }
+            }
+            None => {}
+        }
+    }
 
     let switch_to: Callback<String> = Callback::new({
         let core = core.clone();
@@ -702,6 +755,7 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
                 switch_to.clone(),
                 add_page_and_switch.clone(),
                 close_page.clone(),
+                &enter_action,
             ),
             close_any_overlay.clone(),
         )),
@@ -1055,6 +1109,7 @@ fn switcher_overlay(
     switch_to: Callback<String>,
     add_page_and_switch: Callback<String>,
     close_page: Callback<String>,
+    enter_action: &HookRef<Option<Rc<dyn Fn() -> bool>>>,
 ) -> Grid {
     // No bookmarks integration on this platform (see `ARCHITECTURE.md`
     // §5/Backlog) — `None` means `build_switcher_rows` simply skips that
@@ -1106,41 +1161,49 @@ fn switcher_overlay(
     // `connect_activate` handler (see that crate's `lib.rs`): exactly one
     // open-page match switches to it; otherwise exactly one history match
     // opens that entry's real URL, and anything else resolves the typed
-    // text as a fresh address/search. Intended to be what makes typing a
-    // URL in this box (preloaded via the toolbar title chip's click, in
-    // URL-editing mode) and pressing Enter actually navigate, not just
-    // filter tiles — previously this box had no plain-Enter behavior at
-    // all (only Ctrl+Enter, below, and tile selection).
+    // text as a fresh address/search. Makes typing a URL in this box
+    // (preloaded via the toolbar title chip's click, in URL-editing mode)
+    // and pressing Enter actually navigate, not just filter tiles.
     //
-    // Real, confirmed-by-testing gap: this `KeyboardAccelerator` doesn't
-    // actually fire while this `TextBox` has keyboard focus — confirmed in
-    // the real VM that the *identical* mechanism with a Ctrl modifier
-    // (`force_new_page_from_search`, below) fires correctly from the same
-    // focused box, isolating this to a plain-`VirtualKeyModifiers::None`
-    // `Enter` specifically, not a registration bug. Very likely a WinUI
-    // `TextBox` consumes a bare Enter as part of its own default input
-    // handling before window/page-level accelerators see it, and
-    // `windows-reactor` exposes no lower-priority key hook (`on_key_down`/
-    // `on_preview_key_down`-style API) to intercept it earlier — checked
-    // directly, no such API exists on `Element`/`TextBox` today. Left in
-    // place (harmless, and correct if it ever does fire) rather than
-    // removed, but typing a URL and pressing plain Enter in this box does
-    // not currently navigate — only Ctrl+Enter (forces a new page) and
-    // clicking/selecting a tile do. Not the parity this was meant to
-    // achieve; flagging clearly instead of silently shipping it as if it
-    // were.
+    // Not wired through a `KeyboardAccelerator` (unlike
+    // `force_new_page_from_search` above) — confirmed by direct testing
+    // that a plain, unmodified `VirtualKeyModifiers::None` `Enter`
+    // accelerator never fires while this `TextBox` has keyboard focus
+    // (the *identical* mechanism with a Ctrl modifier fires correctly from
+    // the same focused box, isolating this to bare Enter specifically): a
+    // focused `TextBox` consumes it as part of its own default input
+    // handling before accelerators ever see it. Wired into `enter_action`
+    // instead (see `app`'s `xaml_interop::intercept_plain_enter`
+    // subscription, set up once on the window's root content and reading
+    // this cell fresh on every Enter press) — a `PreviewKeyDown` tunnels
+    // down *before* the `TextBox`'s own handling runs, which is the actual
+    // fix, not a workaround. Returns whether it did anything, so that
+    // shared subscription knows whether to mark the key handled.
     let activate_search = {
         let core = core.clone();
         let shared = Rc::clone(shared);
         let query = search_query.to_string();
         let switch_to = switch_to.clone();
         let add_page_and_switch = add_page_and_switch.clone();
-        move || {
+        move || -> bool {
             let trimmed = query.trim();
             if trimmed.is_empty() {
-                return;
+                return false;
             }
-            match core.borrow().matching_ids(trimmed).as_slice() {
+            // `matching_ids(..)` is collected into an owned `Vec` *before*
+            // the `match` on purpose, not just inline in the scrutinee: a
+            // `match`'s scrutinee temporaries live for the whole match
+            // expression (a real, easy-to-miss Rust rule), so
+            // `core.borrow()` done inline here would still be held live
+            // while the `_` arm below calls `add_page_and_switch` →
+            // `do_add_page` → `core.borrow_mut()` — a `BorrowMutError`
+            // panic, confirmed by direct testing (silently caught and
+            // logged by reactor's own fault boundary, `fault::catch`,
+            // rather than crashing, which is exactly why this had to be
+            // chased down with temporary `trace()` calls rather than a
+            // visible failure).
+            let matching = core.borrow().matching_ids(trimmed);
+            match matching.as_slice() {
                 [only] => switch_to.invoke(only.clone()),
                 _ => {
                     let history_matches = shared.history.search(trimmed, 2).unwrap_or_default();
@@ -1152,15 +1215,16 @@ fn switcher_overlay(
                     }
                 }
             }
+            true
         }
     };
+    *enter_action.borrow_mut() = Some(Rc::new(activate_search) as Rc<dyn Fn() -> bool>);
 
     let search_box = text_box(search_query.to_string())
         .placeholder_text("Type to filter open pages\u{2026}")
         .on_text_changed(set_search_query)
         .width(400.0)
-        .keyboard_accelerator(KeyboardAccelerator::new(VirtualKey::Enter, VirtualKeyModifiers::Control, force_new_page_from_search))
-        .keyboard_accelerator(KeyboardAccelerator::new(VirtualKey::Enter, VirtualKeyModifiers::None, activate_search));
+        .keyboard_accelerator(KeyboardAccelerator::new(VirtualKey::Enter, VirtualKeyModifiers::Control, force_new_page_from_search));
 
     grid((
         Element::from(search_box).grid_row(0),
