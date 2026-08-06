@@ -275,6 +275,20 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         }
     }
 
+    // One-time setup for the toolbar-in-the-title-bar passthrough region
+    // (see `title_bar`'s doc comment below and `xaml_interop::
+    // setup_titlebar_passthrough`) — same lazy-retry-until-it-succeeds
+    // shape as `enter_subscription` above, since the native root content
+    // element isn't available on the very first render either. Unlike
+    // `enter_action`, there's nothing to refresh every render here: the
+    // subscription itself reapplies the region on every `SizeChanged`.
+    let titlebar_passthrough_subscription: HookRef<Option<windows_core::EventRevoker>> = cx.use_ref(None);
+    if titlebar_passthrough_subscription.borrow().is_none()
+        && let Some(revoker) = xaml_interop::setup_titlebar_passthrough()
+    {
+        *titlebar_passthrough_subscription.borrow_mut() = Some(revoker);
+    }
+
     let switch_to: Callback<String> = Callback::new({
         let core = core.clone();
         let set_active_id = set_active_id.clone();
@@ -705,26 +719,28 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     // `browser-windows-winui`'s manual `window.SetExtendsContentIntoTitleBar
     // (true)` + `window.SetTitleBar(...)`.
     //
-    // The toolbar is deliberately *not* hosted in `TitleBar`'s `.content()`
-    // slot — an earlier version of this code did exactly that, and real
-    // testing in the dockur/windows VM found every click on that content
-    // (the address bar, the settings gear, all of it) silently did nothing:
-    // no `dispatch_action` ever fired for a button in there, confirmed via
-    // this module's own `trace` log, while the same actions fired
-    // correctly through `KeyboardAccelerator`s in the same session.
-    // `windows-reactor`'s `host.rs` wires whatever's in this slot up via
-    // `Window.SetTitleBar(element)`, which marks that element as the
-    // draggable caption region; real WinUI apps that put interactive
-    // controls inside a custom title bar have to separately register
-    // non-client hit-test passthrough rectangles
-    // (`InputNonClientPointerSource.SetRegionRects`) so clicks still reach
-    // them — `windows-reactor` doesn't do that anywhere in its own source
-    // (checked directly), so anything placed in `.content()` here is
-    // click-dead. Keeping `TitleBar` for the native drag/window-chrome area
-    // but rendering the toolbar as an ordinary row right below it sidesteps
-    // the problem entirely instead of fighting non-client hit testing from
-    // a crate that doesn't expose it.
-    let title_bar = Element::from(TitleBar::new(APP_TITLE));
+    // The toolbar now lives in `TitleBar`'s `.content()` slot, merging it
+    // into the draggable title bar area like a real browser (tabs/controls
+    // sitting in the same strip as the native minimize/maximize/close
+    // buttons) instead of as an ordinary row below a mostly-empty title bar.
+    // An earlier version of this code tried this and reverted it: real
+    // testing found every click on that content silently did nothing,
+    // because `windows-reactor`'s `host.rs` wires whatever's in `.content()`
+    // up via `Window.SetTitleBar(element)`, which marks that whole element
+    // as the draggable caption region — and putting interactive controls
+    // inside a custom title bar needs separately registering non-client
+    // hit-test passthrough rectangles (`InputNonClientPointerSource.
+    // SetRegionRects`) so clicks still reach them, which `windows-reactor`
+    // doesn't do anywhere in its own source (checked directly). That's now
+    // handled directly: `xaml_interop::setup_titlebar_passthrough` (raw
+    // interop, same category of fix as `intercept_plain_enter`) marks the
+    // toolbar's row `Passthrough`, reapplied on every resize — with left
+    // and right margins reserved so the window stays draggable and the
+    // system's own caption buttons keep working (both found broken by real
+    // testing when the passthrough region was too generous — see that
+    // function's doc comment for the details and why it still doesn't need
+    // to track the toolbar's exact bounds).
+    let title_bar = Element::from(TitleBar::new(APP_TITLE).content(toolbar));
 
     // Every *loaded* page's webview stays mounted (see this module's doc
     // comment on why) — `page_ids()`'s natural (creation) order is kept
@@ -817,15 +833,11 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     }
 
     trace("app: render end");
-    let mut rows = vec![
-        title_bar.grid_row(0),
-        Element::from(toolbar).grid_row(1),
-        Element::from(content).grid_row(2),
-    ];
+    let mut rows = vec![title_bar.grid_row(0), Element::from(content).grid_row(1)];
     if let Some(overlay_element) = overlay_element {
-        rows.push(overlay_element.grid_row(2));
+        rows.push(overlay_element.grid_row(1));
     }
-    let mut root: Element = grid(rows).rows([GridLength::Auto, GridLength::Auto, GridLength::STAR]).into();
+    let mut root: Element = grid(rows).rows([GridLength::Auto, GridLength::STAR]).into();
     for accel in accelerators {
         root = root.keyboard_accelerator(accel);
     }
