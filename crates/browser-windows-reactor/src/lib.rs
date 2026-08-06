@@ -134,6 +134,7 @@ mod shortcuts;
 mod xaml_interop;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use browser_core::{
@@ -142,7 +143,7 @@ use browser_core::{
 };
 use engine::ReactorWebViewEngine;
 use windows_reactor::*;
-use windows_webview::{webview, NewWindowRequestedArgs, WebView};
+use windows_webview::{webview, Deferral, NewWindowRequestedArgs, WebView};
 
 /// Same checkpoint-tracing pattern as `browser_windows_winui::trace` — cheap
 /// and has already paid for itself once diagnosing a real crash on Windows.
@@ -197,6 +198,14 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     let (active_id, set_active_id) = cx.use_state(String::new());
     let active_id_ref = cx.use_ref(active_id.clone());
     *active_id_ref.borrow_mut() = active_id.clone();
+    // New-window requests (`window.open()`/`target="_blank"`) waiting on a
+    // specific not-yet-ready page's own `WebView2` to finish constructing —
+    // see `page_element`'s `on_ready` for both halves of this (inserting a
+    // pending entry when a request comes in, and completing it once the
+    // matching page's `WebView` is available). Keyed by the new page's id,
+    // for the app's lifetime — entries are removed as soon as they're
+    // resolved, so this only ever holds genuinely in-flight requests.
+    let pending_new_windows: HookRef<HashMap<String, PendingNewWindow>> = cx.use_ref(HashMap::new());
     // Backs the real fix for the switcher search box's plain-Enter gap (see
     // `switcher_overlay`'s `activate_search` and `xaml_interop`'s module
     // doc comment): `enter_subscription` holds the one `PreviewKeyDown`
@@ -343,14 +352,6 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
             do_add_page(&core, &url, &set_active_id, &active_id_ref);
             set_overlay.call(Overlay::None);
             bump.invoke(());
-        }
-    });
-
-    let add_page_background: Callback<String> = Callback::new({
-        let core = core.clone();
-        let bump = bump.clone();
-        move |url: String| {
-            do_add_page_background(&core, &url, &bump);
         }
     });
 
@@ -763,7 +764,7 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     for id in &page_ids {
         if core.borrow().is_page_loaded(id) {
             let is_active = *id == active_id;
-            page_elements.push(page_element(id.clone(), &core, &shared, &active_id_ref, &bump, &add_page_background, is_active));
+            page_elements.push(page_element(id.clone(), &core, &shared, &active_id_ref, &bump, &pending_new_windows, is_active));
         }
     }
     let content = grid(page_elements);
@@ -900,13 +901,42 @@ fn do_add_page(
     set_active_id.call(id);
 }
 
-/// Same as `do_add_page`, but doesn't make the new page active — used for a
-/// page opened via `window.open()`/`target="_blank"`/"open in new tab" (see
-/// `page_element`'s `on_new_window_requested` registration), which shouldn't
-/// steal focus from whatever the user's currently looking at. Still seeds
-/// `last_url` for the same reason `do_add_page` does, and still calls `bump`
-/// so the switcher grid picks up the new tile on next render.
-fn do_add_page_background(core: &HookRef<PageManager<ReactorWebViewEngine>>, url: &str, bump: &Callback<()>) {
+/// A new-window request that's been deferred (`args.defer()`) while its
+/// popup's own page is still being constructed — see `page_element`'s
+/// `on_ready` for where this is created (when the request first comes in)
+/// and resolved (once the matching page's own `WebView` becomes ready).
+struct PendingNewWindow {
+    args: NewWindowRequestedArgs,
+    deferral: Deferral,
+}
+
+/// Same as `do_add_page`, but doesn't make the new page active and takes no
+/// URL — used for a page opened via `window.open()`/`target="_blank"`/"open
+/// in new tab" (see `page_element`'s `on_new_window_requested` registration
+/// and `PendingNewWindow`'s doc comment). Doesn't steal focus from whatever
+/// the user's currently looking at (`insert_background`, not `insert`), and
+/// there's nothing to navigate to here — once this page's own `WebView`
+/// becomes ready, `page_element`'s `on_ready` hands it to WebView2 via
+/// `NewWindowRequestedArgs::set_new_window` instead of calling `navigate`,
+/// and WebView2 performs the originally-requested navigation into it
+/// itself. **This does establish a real `window.opener` link** — reusing
+/// this page's already-declaratively-constructed `WebView` (rather than a
+/// separately, freshly-constructed one) is not a problem; confirmed
+/// empirically in the real VM, including against a real standalone POC that
+/// ruled out every other theory first (see `ROADMAP.md`'s entry on this
+/// investigation for the full history). What actually determines whether
+/// `window.opener` ends up set is the *page's own* `rel="opener"`/
+/// `rel="noopener"` on the triggering `target="_blank"` link — real,
+/// spec-defined Chromium behavior (shipped Chrome 88+, WebView2 inherits
+/// it): a plain `target="_blank"` anchor with no `rel` behaves as if
+/// `rel="noopener"` were set by default, and correctly gets a null opener
+/// here, same as in real Chrome — that's not a bug in this code, it's this
+/// code correctly matching real browser semantics. `window.open()` JS calls
+/// are unaffected by this default (they still get a real opener unless the
+/// page explicitly passes `"noopener"`). Still calls `bump` so the switcher
+/// grid picks up the new tile on next render. Returns the new page's id so
+/// the caller can key `pending_new_windows` with it.
+fn do_add_page_pending_new_window(core: &HookRef<PageManager<ReactorWebViewEngine>>, bump: &Callback<()>) -> String {
     let id = core.borrow_mut().allocate_id();
     let engine = ReactorWebViewEngine::new();
     let title = Rc::new(RefCell::new(String::new()));
@@ -914,10 +944,8 @@ fn do_add_page_background(core: &HookRef<PageManager<ReactorWebViewEngine>>, url
     for evicted_id in evicted {
         core.borrow_mut().take_engine(&evicted_id);
     }
-    if let Some(page) = core.borrow_mut().page_mut(&id) {
-        page.last_url = url.to_string();
-    }
     bump.invoke(());
+    id
 }
 
 /// Reconstructs a page's engine if it was unloaded (see this module's doc
@@ -941,7 +969,7 @@ fn page_element(
     shared: &Rc<Shared>,
     active_id_ref: &HookRef<String>,
     bump: &Callback<()>,
-    add_page_background: &Callback<String>,
+    pending_new_windows: &HookRef<HashMap<String, PendingNewWindow>>,
     is_active: bool,
 ) -> Element {
     let Some((web_cell, registration_cell, title_registration_cell, title_cell, xaml_handle_cell, new_window_registration_cell, start_url)) =
@@ -975,7 +1003,7 @@ fn page_element(
     let shared = Rc::clone(shared);
     let active_id_ref = active_id_ref.clone();
     let bump = bump.clone();
-    let add_page_background = add_page_background.clone();
+    let pending_new_windows = pending_new_windows.clone();
     let id_for_ready = id.clone();
 
     let on_ready = move |ready: WebView| {
@@ -1075,25 +1103,52 @@ fn page_element(
         // `NewWindowRequested` event, so this one handler covers all of
         // them (see `ROADMAP.md`/this function's own history for why no
         // separate context-menu code exists anywhere in this codebase).
-        // Always marks the request handled (never lets WebView2 create a
-        // real second top-level window — there's no concept of one
-        // anywhere in this app), and only actually opens a background tab
-        // for `is_user_initiated()` requests: a script calling
-        // `window.open()` with no real click behind it is silently
-        // suppressed, matching what most real browsers do out of the box.
+        // Always marks the request handled (never lets WebView2 create its
+        // own default popup — we're always the ones providing the eventual
+        // window, via `set_new_window` below, not just suppressing it), and
+        // only actually opens a page for `is_user_initiated()` requests: a
+        // script calling `window.open()` with no real click behind it is
+        // silently suppressed, matching what most real browsers do out of
+        // the box. `args.defer()` + `do_add_page_pending_new_window` routes
+        // this through `set_new_window` instead of denying and navigating a
+        // disconnected page ourselves — see `PendingNewWindow`'s doc comment
+        // for the other half (resolving it once the new page's own `WebView`
+        // is ready, right before this same `on_ready` closure's `navigate`
+        // call, a few lines below), which really does establish a real
+        // `window.opener` link when the triggering page's own markup allows
+        // it (real Chromium `rel="opener"`/`rel="noopener"` semantics, not
+        // something this code overrides or needs to special-case).
         let new_window_requested = {
-            let add_page_background = add_page_background.clone();
+            let core = core.clone();
+            let bump = bump.clone();
+            let pending_new_windows = pending_new_windows.clone();
             move |args: NewWindowRequestedArgs| {
                 let _ = args.set_handled(true);
                 if args.is_user_initiated() {
-                    add_page_background.invoke(args.uri());
+                    if let Ok(deferral) = args.defer() {
+                        let new_id = do_add_page_pending_new_window(&core, &bump);
+                        pending_new_windows.borrow_mut().insert(new_id, PendingNewWindow { args, deferral });
+                    }
                 }
             }
         };
         if let Ok(registration) = ready.on_new_window_requested(new_window_requested) {
             *new_window_registration_cell.borrow_mut() = Some(registration);
         }
-        let _ = ready.navigate(&start_url);
+        // A pending entry here means this page exists specifically to
+        // become another page's popup (see `PendingNewWindow`'s doc
+        // comment) — hand it to WebView2 via `set_new_window` instead of
+        // navigating it ourselves; WebView2 performs the originally
+        // requested navigation into it once this resolves.
+        match pending_new_windows.borrow_mut().remove(&id_for_ready) {
+            Some(pending) => {
+                let _ = pending.args.set_new_window(&ready);
+                let _ = pending.deferral.complete();
+            }
+            None => {
+                let _ = ready.navigate(&start_url);
+            }
+        }
         *web_cell.borrow_mut() = Some(ready);
     };
 

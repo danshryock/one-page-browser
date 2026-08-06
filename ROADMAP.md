@@ -924,6 +924,64 @@ link here — its `enigo` backend needs `libxdo`, not installed in this environm
 synthetic-input-based tests as unreliable. macos-appkit: cross-compile-verified only for both targets (both
 `.cargo/build-macos-appkit.sh` targets pass), same standing caveat as every other macOS behavioral claim here.
 
+**windows-reactor opener preservation: actually works — the whole investigation below was chasing a false
+negative caused by the test page, not a real platform limitation.** The entry above deliberately scoped
+windows-reactor out based on a research pass concluding it needed brand-new WinRT bindings for environment
+sharing. That, and everything that followed, turned out to be unnecessary — recorded here in full because the
+methodology mistake is the actually-valuable lesson, not the (very real, very extensive) engineering path that
+followed from it.
+
+The real fix needed only what was already available: `page_element`'s existing `on_ready: impl Fn(WebView)`
+callback hands over a real `windows_webview::WebView` for every page — the exact type
+`NewWindowRequestedArgs::set_new_window(&self, webview: &WebView)` needs — and `NewWindowRequestedArgs::defer()`
++ `Deferral::complete()` (both real, in the vendored crate, unused anywhere in this codebase before this) solve
+the only real timing problem (the popup's own `WebView` isn't ready until some renders after the request comes
+in). Implemented: `args.defer()` on a user-initiated request, construct an ordinary new background page via a new
+`do_add_page_pending_new_window` (mirrors the old `do_add_page_background` minus URL-seeding), track it in a new
+`pending_new_windows: HookRef<HashMap<String, PendingNewWindow>>`, and once *that* page's own `on_ready` fires,
+call `set_new_window` + `deferral.complete()` instead of `navigate` — WebView2 performs the originally-requested
+navigation into it itself. This is the *entire* fix. `ReactorWebViewEngine`/`engine.rs` needed no changes at all.
+
+Verifying it, though, produced a real, reproducible, wrong signal: every test page used a plain
+`<a target="_blank">` link with no `rel` attribute, and `window.opener` came back `null` every single time —
+`set_new_window` itself always returned `Ok(())`, no error of any kind. That symptom (succeeds, but doesn't
+connect) was read as "the API doesn't work from a declaratively-constructed webview," which kicked off a very
+long chain of real engineering investigation to work around it: whether `wry` could be embedded inside
+`windows_reactor` instead (real research: it hits an airspace regression from classic HWND-child hosting *and*
+calls the identical `SetNewWindow` API, no better off); whether moving all page hosting to raw
+`windows_webview::Environment`/`Controller` construction with real DirectComposition interop would help (real
+research: architecturally sound but a large, separate undertaking, and composition hosting doesn't touch opener
+bookkeeping at all — it only affects *rendering*); whether an AOT-compiled C# WinUI3 island would fare better
+(real research: no — a genuine first-party Microsoft Q&A report describes the identical "`SetNewWindow` succeeds,
+`window.opener` stays null" symptom in idiomatic C#, with `postMessage` recommended as the real workaround, and
+separately WinUI3 + WebView2 + Native AOT is currently broken via multiple open Microsoft bugs); and finally a
+standalone bare-Win32 POC (no WinUI3, no `windows-reactor` at all) that constructed a genuinely fresh,
+never-navigated `Controller`/`WebView` off the reentrant call stack via a `WM_APP`-posted message — eliminating
+every remaining theory (construction freshness, reentrancy) — and **still got `window.opener === false`** against
+the same plain `target="_blank"` test page.
+
+The user then asked the one question that actually mattered: were the new windows being opened via `target=
+"_blank"`, and could this be Chromium's real default-`noopener` behavior for that specific case? Confirmed
+immediately, from real sources: Chrome shipped "`<a target="_blank">` implies `rel="noopener"` unless the page
+opts back in with `rel="opener"`" in **Chrome 88** (January 2021) — a genuine, spec-level default (WHATWG living
+standard), which WebView2 inherits since it's Chromium-based. Critically, this default applies *only* to anchor-
+driven `target="_blank"` navigation, not to `window.open()` JS calls (which still get a real opener by default
+unless the page explicitly passes `"noopener"`). Re-testing the exact same standalone POC — and separately, the
+exact same already-committed `windows-reactor` implementation, unmodified — against a test page with
+`rel="opener"` added: **`window.opener` came back `true` in both**, immediately, no further changes needed. Every
+single test that session had (correctly, per spec) gotten a null opener because the test page itself, not any
+platform or interop limitation, disqualified it — and that correct result was misread as a platform failure.
+
+**Net result: the original, simplest implementation (declarative `WebView` reuse + `defer`/`set_new_window`,
+already committed on `windows-reactor-opener-defer-attempt`) is correct and complete.** It respects real
+Chromium opener/noopener semantics exactly like gtk3/macos-appkit's `wry`-based equivalents do, and additionally
+gates on `NewWindowRequestedArgs::is_user_initiated()` the way the other two platforms cannot (no equivalent
+signal exists in `wry`'s public API on any platform, confirmed earlier this same investigation). No raw HWND
+hosting, no composition interop, no C# island, no architecture change of any kind was ever necessary. Verified in
+the real VM against both cases directly: a plain `target="_blank"` link correctly gets a null opener (matching
+real Chrome), and the same link with `rel="opener"` correctly gets a real one, `window.opener !== null`,
+confirmed via `execute_script`.
+
 ## Backlog (not yet started, roughly in the order raised)
 
 - `browser-macos-appkit`: a wrapping tile grid (`NSCollectionView`) instead of the current plain-list
