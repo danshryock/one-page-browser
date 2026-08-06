@@ -919,24 +919,23 @@ struct PendingNewWindow {
 /// becomes ready, `page_element`'s `on_ready` hands it to WebView2 via
 /// `NewWindowRequestedArgs::set_new_window` instead of calling `navigate`,
 /// and WebView2 performs the originally-requested navigation into it
-/// itself. **This does NOT establish a real `window.opener` link, despite
-/// being the API that's supposed to** — confirmed empirically in the real
-/// VM: `set_new_window` returns `Ok(())` (no environment-mismatch error or
-/// any other failure), yet `window.opener !== null` evaluates to `false` in
-/// the resulting page every time. Best-supported explanation: this page's
-/// `ICoreWebView2` was already fully constructed via our own normal
-/// declarative `webview()` flow *before* being handed to `set_new_window`,
-/// and WebView2's opener bookkeeping most likely only applies to a webview
-/// purpose-built as a popup target from the start (e.g. via
-/// `Environment::create_controller_for_hwnd`, done outside `windows_reactor`'s
-/// XAML flow entirely — see `ROADMAP.md`'s entry on this whole investigation
-/// for the full history and why that path wasn't pursued here). Kept anyway
-/// over the previous "deny + open a disconnected background tab" behavior
-/// because it's not worse — the resulting tab behaves identically from the
-/// user's perspective — but it should **not** be described as opener-
-/// preserving anywhere; it isn't. Still calls `bump` so the switcher grid
-/// picks up the new tile on next render. Returns the new page's id so the
-/// caller can key `pending_new_windows` with it.
+/// itself. **This does establish a real `window.opener` link** — reusing
+/// this page's already-declaratively-constructed `WebView` (rather than a
+/// separately, freshly-constructed one) is not a problem; confirmed
+/// empirically in the real VM, including against a real standalone POC that
+/// ruled out every other theory first (see `ROADMAP.md`'s entry on this
+/// investigation for the full history). What actually determines whether
+/// `window.opener` ends up set is the *page's own* `rel="opener"`/
+/// `rel="noopener"` on the triggering `target="_blank"` link — real,
+/// spec-defined Chromium behavior (shipped Chrome 88+, WebView2 inherits
+/// it): a plain `target="_blank"` anchor with no `rel` behaves as if
+/// `rel="noopener"` were set by default, and correctly gets a null opener
+/// here, same as in real Chrome — that's not a bug in this code, it's this
+/// code correctly matching real browser semantics. `window.open()` JS calls
+/// are unaffected by this default (they still get a real opener unless the
+/// page explicitly passes `"noopener"`). Still calls `bump` so the switcher
+/// grid picks up the new tile on next render. Returns the new page's id so
+/// the caller can key `pending_new_windows` with it.
 fn do_add_page_pending_new_window(core: &HookRef<PageManager<ReactorWebViewEngine>>, bump: &Callback<()>) -> String {
     let id = core.borrow_mut().allocate_id();
     let engine = ReactorWebViewEngine::new();
@@ -1115,9 +1114,10 @@ fn page_element(
         // disconnected page ourselves — see `PendingNewWindow`'s doc comment
         // for the other half (resolving it once the new page's own `WebView`
         // is ready, right before this same `on_ready` closure's `navigate`
-        // call, a few lines below) **and, importantly, for why this still
-        // doesn't establish a real `window.opener` link** despite using the
-        // API that's supposed to.
+        // call, a few lines below), which really does establish a real
+        // `window.opener` link when the triggering page's own markup allows
+        // it (real Chromium `rel="opener"`/`rel="noopener"` semantics, not
+        // something this code overrides or needs to special-case).
         let new_window_requested = {
             let core = core.clone();
             let bump = bump.clone();
