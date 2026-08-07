@@ -18,6 +18,28 @@ pub struct NewWindowInfo {
     pub is_user_gesture: bool,
 }
 
+/// Overrides `console.log` to relay every call through `wry`'s IPC channel
+/// (`window.ipc.postMessage`) in addition to its normal behavior — see
+/// `WryEngine::new`'s `on_console_message` doc comment for why. Checks for
+/// `window.chrome.webview` too (not just `window.ipc`) so the *exact* same
+/// script content works unmodified on windows-reactor's WebView2 backend as
+/// well — kept as a byte-identical copy over there (two separate
+/// compilation units, same reasoning `FILL_LOGIN_SCRIPT` is already
+/// duplicated between this file and `macos.rs` rather than shared).
+const CONSOLE_CAPTURE_SCRIPT: &str = r#"
+(function () {
+  var send = window.chrome && window.chrome.webview
+    ? function (m) { window.chrome.webview.postMessage(m); }
+    : window.ipc ? function (m) { window.ipc.postMessage(m); } : null;
+  if (!send) return;
+  var original = console.log;
+  console.log = function () {
+    original.apply(console, arguments);
+    try { send(Array.prototype.map.call(arguments, String).join(' ')); } catch (e) {}
+  };
+})();
+"#;
+
 pub struct WryEngine {
     webview: WebView,
 }
@@ -47,6 +69,15 @@ impl WryEngine {
     /// outright (no popup, no relationship — used for non-user-gesture
     /// requests, which get no other treatment: unlike the old
     /// deny-and-open-unrelated behavior, there's no orphan tab anymore).
+    /// `on_console_message` fires for every `console.log(...)` call any page
+    /// in this webview makes (via `CONSOLE_CAPTURE_SCRIPT`, injected into
+    /// every page through `wry`'s `with_initialization_script`/
+    /// `with_ipc_handler`) — a real, generic capability, not specific to any
+    /// one test: production call sites can pass a no-op, or wire it to
+    /// `eprintln!` for incidental debugging value; automated test call sites
+    /// (see `web-standards-tests/`) use it to read a fixture page's own
+    /// plain, standard `console.log` output as that test's result, instead
+    /// of each test needing its own bespoke host-side check-and-report code.
     pub fn new<W: gtk::glib::IsA<Container>>(
         container: &W,
         initial_url: &str,
@@ -54,9 +85,10 @@ impl WryEngine {
         on_title_changed: impl Fn(String) + 'static,
         on_audio_playing_changed: impl Fn(bool) + 'static,
         on_new_window_requested: impl Fn(NewWindowInfo, webkit2gtk::WebView) -> Option<gtk::Widget> + 'static,
+        on_console_message: impl Fn(String) + 'static,
     ) -> anyhow::Result<Self> {
         let builder = WebViewBuilder::new_with_web_context(web_context).with_url(initial_url);
-        Self::build(builder, container, on_title_changed, on_audio_playing_changed, on_new_window_requested)
+        Self::build(builder, container, on_title_changed, on_audio_playing_changed, on_new_window_requested, on_console_message)
     }
 
     /// Same as `new`, but for a page opened via `window.open()`/
@@ -80,9 +112,10 @@ impl WryEngine {
         on_title_changed: impl Fn(String) + 'static,
         on_audio_playing_changed: impl Fn(bool) + 'static,
         on_new_window_requested: impl Fn(NewWindowInfo, webkit2gtk::WebView) -> Option<gtk::Widget> + 'static,
+        on_console_message: impl Fn(String) + 'static,
     ) -> anyhow::Result<Self> {
         let builder = WebViewBuilder::new_with_web_context(web_context).with_related_view(related_to.clone());
-        Self::build(builder, container, on_title_changed, on_audio_playing_changed, on_new_window_requested)
+        Self::build(builder, container, on_title_changed, on_audio_playing_changed, on_new_window_requested, on_console_message)
     }
 
     /// Shared tail of `new`/`new_related` — everything after the builder's
@@ -93,8 +126,13 @@ impl WryEngine {
         on_title_changed: impl Fn(String) + 'static,
         on_audio_playing_changed: impl Fn(bool) + 'static,
         on_new_window_requested: impl Fn(NewWindowInfo, webkit2gtk::WebView) -> Option<gtk::Widget> + 'static,
+        on_console_message: impl Fn(String) + 'static,
     ) -> anyhow::Result<Self> {
-        let webview = builder.with_document_title_changed_handler(move |title| on_title_changed(title)).build_gtk(container)?;
+        let webview = builder
+            .with_initialization_script(CONSOLE_CAPTURE_SCRIPT)
+            .with_ipc_handler(move |request| on_console_message(request.body().clone()))
+            .with_document_title_changed_handler(move |title| on_title_changed(title))
+            .build_gtk(container)?;
 
         // `is-playing-audio` isn't a wry builder hook — connect straight to
         // the underlying webkit2gtk object via the same Unix escape hatch

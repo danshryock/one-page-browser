@@ -34,6 +34,10 @@ pub struct ReactorWebViewEngine {
     /// Same reasoning as `registration`, for `on_new_window_requested` (see
     /// `lib.rs`'s `page_element`) — a third, separate subscription.
     pub new_window_registration: Rc<RefCell<Option<EventRegistration>>>,
+    /// Same reasoning as `registration`, for `on_web_message_received` (see
+    /// `lib.rs`'s `page_element`'s console-capture shim) — a fourth,
+    /// separate subscription.
+    pub console_message_registration: Rc<RefCell<Option<EventRegistration>>>,
 }
 
 impl ReactorWebViewEngine {
@@ -48,6 +52,7 @@ impl ReactorWebViewEngine {
             title_registration: Rc::new(RefCell::new(None)),
             xaml_handle: Rc::new(RefCell::new(None)),
             new_window_registration: Rc::new(RefCell::new(None)),
+            console_message_registration: Rc::new(RefCell::new(None)),
         }
     }
 }

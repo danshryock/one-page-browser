@@ -34,6 +34,49 @@ build/run instructions.
   test harness spawning a fresh thread per `#[test]` even under `--test-threads=1`. Fixed with a single
   persistent worker thread that owns GTK for the whole process; each test sends its body there and blocks for
   the result.
+- Cross-platform web-standards test suite (`web-standards-tests/`), starting with opener verification —
+  the same fixture files (`web-standards-tests/fixtures/opener-default`/`opener-explicit-opener`, plus a
+  shared `popup.html`) run on every front end, each driven with a genuine, OS-trusted synthetic click (never
+  a script-dispatched DOM `click()`), reporting results via the fixture page's own plain `console.log` calls
+  relayed through a shared shim (`CONSOLE_CAPTURE_SCRIPT`, injected via `wry`'s
+  `with_initialization_script`/`with_ipc_handler` on gtk3/macos-appkit, `windows_webview`'s
+  `add_script_to_execute_on_document_created`/`on_web_message_received` on windows-reactor) — no per-test
+  custom Rust verification logic on any platform. `browser-linux-gtk3` extends its existing in-process
+  `tests/gtk_tests.rs` harness (`opener_verification_default_target_blank_has_no_opener`/
+  `..._explicit_rel_opener_has_opener`); windows-reactor gets a small external driver
+  (`web-standards-tests/src/bin/windows_driver.rs`, real `SendInput`, `scripts/windows-vm/build-and-test.sh`
+  runs it in the real VM); macos-appkit's driver (`macos_driver.rs`) exists and cross-compiles but is
+  link-check-only in this environment (same standing caveat as every other macOS deliverable).
+  - **gtk3**: implemented and verified working end-to-end via direct testing — but the two new
+    `#[test]`s can't be *proven passing* in this dev sandbox specifically: isolated down to `enigo`'s
+    XTest-based synthetic mouse click not landing at all here (confirmed with a minimal probe: a plain
+    `gtk::Button`'s `clicked` signal never fires from the same `mouse_move_to`/`mouse_click` call, tried
+    against both the real `:0` desktop and an isolated `xwfb-run -c cage` session) — a sandbox/XTest
+    limitation, not a defect in the test or the app; likely to just work on a normal desktop or a CI runner
+    with confirmed-working `xvfb`/`xdotool`.
+  - **windows-reactor**: verified passing for real in the VM, but along the way surfaced (and fixed) a real,
+    severe, previously-unknown bug this test suite's own console-capture wiring introduced: injecting the
+    shim via `WebView::add_script_to_execute_on_document_created` directly inside `page_element`'s `on_ready`
+    deadlocked the *entire app* — that call internally pumps the calling thread's message loop
+    (`windows_webview`'s own `pump::wait`) until an async completion handler fires, and calling it from
+    *within* `on_ready` (itself invoked from inside `windows-reactor`'s own COM event dispatch, already
+    nested on the call stack) meant every single page navigation, including a plain `https://
+    www.google.com`, silently never rendered again — confirmed directly (removing the call restored
+    navigation; restoring it reproduced the hang every time). Fixed with a new `xaml_interop::
+    defer_to_next_tick` (real `SetTimer`/`WM_TIMER`, not a same-stack-frame call — the `windows` crate,
+    pinned to the same git rev as `windows-reactor`/`windows-webview`/`windows-core`, was added as a new
+    dependency for this), which runs the deferred callback from the *top-level* message dispatch instead,
+    with nothing else on the stack, where the exact same blocking call is safe. Also surfaced a second, still
+    real, still-flaky gap while building the driver: a newly-*activated* (not newly-created) page's XAML
+    visibility toggle doesn't reliably apply on the very first render after switching either — this is the
+    same underlying class of issue as the already-known `title_changed`/`on_navigation_completed` render gap
+    documented below, just affecting page visibility instead of the title chip. Worked around, not fixed, by
+    seeding every fixture case as an already-open page in the profile's session before launch (`scripts/
+    windows-vm/seed-fixture-session.ps1`) — so the driver only ever needs `switch_to` between already-open
+    pages (confirmed reliable) rather than `do_add_page` (confirmed to reproduce the *original*, now-fixed
+    deadlock's sibling bug: a *brand-new* page's first-ever visibility application is exactly as unreliable)
+    — plus a "nudge" (an extra harmless click) and a generous wait; still not 100% deterministic run to run,
+    consistent with the render-gap bug's own already-documented unpredictability below.
 - Unified search/URL bar (`browser-core` + `browser-linux-gtk3`) — the switcher grid's separate search box is
   gone; the toolbar address bar now doubles as the switcher's search box while it's open (cleared/focused on
   open, filters the grid on every keystroke, Enter does the switcher's search-activate behavior), and is
@@ -1002,7 +1045,16 @@ confirmed via `execute_script`.
   through a `DispatcherQueue` (real APIs for this exist in `windows-reactor`'s own `host.rs`, e.g.
   `DispatcherQueue::GetForCurrentThread()` + `TryEnqueueWithPriority`) — captured on the UI thread at startup
   and threaded down to `page_element`, which is a bigger, riskier change than the pass that found this had
-  scope for.
+  scope for. **Confirmed to be a bigger blast radius than title-only**: the web-standards test suite work
+  (see "Done" above) found the exact same class of gap also affects a newly-*activated* page's XAML
+  visibility toggle, not just the title chip — a real, still-open reliability issue for anything driving this
+  front end via synthetic UI interaction, worked around there (not fixed) with a same-page-already-open
+  strategy plus an extra "nudge" click. The `DispatcherQueue`/`TryEnqueueWithPriority` fix sketched above is
+  now a real, non-speculative fix for `add_script_to_execute_on_document_created`'s *separate* deadlock bug
+  too (see that entry) — `xaml_interop::defer_to_next_tick`, added there via raw `SetTimer`/`WM_TIMER` instead
+  since `DispatcherQueue` itself isn't reachable through any of this crate's current public dependencies, is
+  the same fix in spirit; revisiting with the real `DispatcherQueue` API (if a future `windows-reactor`
+  version exports it) could plausibly fix this visibility gap the same way.
 - Other external password managers beyond Bitwarden/Vaultwarden (see "Done" above for that one) — KeePassXC/
   secret-service, 1Password, etc. Each would be its own `PasswordBackend` impl; no shared "generic external
   manager" abstraction beyond the trait itself is needed until a second one is actually built.

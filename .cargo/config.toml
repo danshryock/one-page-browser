@@ -10,6 +10,10 @@ run-gtk3 = "run -p browser-linux-gtk3"
 # crates/browser-windows-reactor/src/lib.rs's module doc comment).
 build-windows-reactor = "xwin build --target x86_64-pc-windows-msvc -p browser-windows-reactor"
 
+# The windows-reactor web-standards driver (see web-standards-tests/src/bin/
+# windows_driver.rs) — cross-compiles the same way as the app itself.
+build-web-standards-driver-windows = "xwin build --target x86_64-pc-windows-msvc -p web-standards-tests --bin web-standards-driver-windows"
+
 # Statically link the MSVC C runtime into anything built for this target, so
 # the resulting .exe doesn't depend on VCRUNTIME140.dll/msvcp140.dll being
 # present on the machine that runs it — confirmed the hard way: a

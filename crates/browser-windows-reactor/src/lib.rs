@@ -143,7 +143,7 @@ use browser_core::{
 };
 use engine::ReactorWebViewEngine;
 use windows_reactor::*;
-use windows_webview::{webview, Deferral, NewWindowRequestedArgs, WebView};
+use windows_webview::{webview, Deferral, NewWindowRequestedArgs, WebMessageReceivedArgs, WebView};
 
 /// Same checkpoint-tracing pattern as `browser_windows_winui::trace` — cheap
 /// and has already paid for itself once diagnosing a real crash on Windows.
@@ -881,6 +881,7 @@ fn do_add_page(
     active_id_ref: &HookRef<String>,
 ) {
     let id = core.borrow_mut().allocate_id();
+    trace(&format!("do_add_page: id={id} url={url:?}"));
     let engine = ReactorWebViewEngine::new();
     let title = Rc::new(RefCell::new(String::new()));
     let evicted = core.borrow_mut().insert(id.clone(), engine, title);
@@ -959,6 +960,30 @@ fn ensure_engine_loaded(core: &HookRef<PageManager<ReactorWebViewEngine>>, id: &
     }
 }
 
+/// Overrides `console.log` to relay every call through
+/// `window.chrome.webview.postMessage`, captured below via
+/// `on_web_message_received` and printed to stdout — the same shim
+/// (byte-identical) as `render_engine::linux`/`macos`'s constant of the same
+/// name, letting `web-standards-tests/`'s external driver read a fixture
+/// page's own plain `console.log` output from this app's piped stdout,
+/// without any test-only Rust logic on this side. Always injected,
+/// production and test alike, same reasoning as `render_engine`'s copies:
+/// cheap, harmless, and a real incidental debugging benefit (page
+/// `console.log` becomes visible in the terminal during normal development).
+const CONSOLE_CAPTURE_SCRIPT: &str = r#"
+(function () {
+  var send = window.chrome && window.chrome.webview
+    ? function (m) { window.chrome.webview.postMessage(m); }
+    : window.ipc ? function (m) { window.ipc.postMessage(m); } : null;
+  if (!send) return;
+  var original = console.log;
+  console.log = function () {
+    original.apply(console, arguments);
+    try { send(Array.prototype.map.call(arguments, String).join(' ')); } catch (e) {}
+  };
+})();
+"#;
+
 /// Builds one page's always-mounted `webview(..)` element, filling in the
 /// same `Rc`s `core`'s `ReactorWebViewEngine` already owns for this page
 /// (see this module's doc comment) — `RenderEngine`'s methods and this
@@ -972,19 +997,28 @@ fn page_element(
     pending_new_windows: &HookRef<HashMap<String, PendingNewWindow>>,
     is_active: bool,
 ) -> Element {
-    let Some((web_cell, registration_cell, title_registration_cell, title_cell, xaml_handle_cell, new_window_registration_cell, start_url)) =
-        core.borrow().page(&id).map(|p| {
-            let engine = p.engine.as_ref().expect("page_element only called for loaded pages");
-            (
-                engine.web.clone(),
-                engine.registration.clone(),
-                engine.title_registration.clone(),
-                Rc::clone(&p.title),
-                engine.xaml_handle.clone(),
-                engine.new_window_registration.clone(),
-                p.last_url.clone(),
-            )
-        })
+    let Some((
+        web_cell,
+        registration_cell,
+        title_registration_cell,
+        title_cell,
+        xaml_handle_cell,
+        new_window_registration_cell,
+        console_message_registration_cell,
+        start_url,
+    )) = core.borrow().page(&id).map(|p| {
+        let engine = p.engine.as_ref().expect("page_element only called for loaded pages");
+        (
+            engine.web.clone(),
+            engine.registration.clone(),
+            engine.title_registration.clone(),
+            Rc::clone(&p.title),
+            engine.xaml_handle.clone(),
+            engine.new_window_registration.clone(),
+            engine.console_message_registration.clone(),
+            p.last_url.clone(),
+        )
+    })
     else {
         return Element::from(vstack(())).with_key(id);
     };
@@ -1008,6 +1042,42 @@ fn page_element(
 
     let on_ready = move |ready: WebView| {
         trace(&format!("on_ready: page {id_for_ready} WebView2 ready"));
+        // Deferred to a later, non-nested message-loop tick — see
+        // `xaml_interop::defer_to_next_tick`'s doc comment for why:
+        // `add_script_to_execute_on_document_created` below blocks on a
+        // nested message pump, and calling it directly from here (already
+        // nested inside `windows-reactor`'s own event dispatch) deadlocks
+        // the whole app.
+        //
+        // `webview()` requires `on_ready: Fn(WebView)`, not `FnOnce` — so it
+        // can't give the deferred closure below ownership of its own
+        // captures directly (a `Fn` closure can't move out of itself on
+        // each call, even though this one only ever actually runs once in
+        // practice); cloning fresh copies here for the deferred closure to
+        // own keeps `on_ready` itself intact and callable again.
+        let web_cell = web_cell.clone();
+        let registration_cell = registration_cell.clone();
+        let title_registration_cell = title_registration_cell.clone();
+        let title_cell = Rc::clone(&title_cell);
+        let new_window_registration_cell = new_window_registration_cell.clone();
+        let console_message_registration_cell = console_message_registration_cell.clone();
+        let core = core.clone();
+        let shared = Rc::clone(&shared);
+        let active_id_ref = active_id_ref.clone();
+        let bump = bump.clone();
+        let pending_new_windows = pending_new_windows.clone();
+        let id_for_ready = id_for_ready.clone();
+        let start_url = start_url.clone();
+        xaml_interop::defer_to_next_tick(move || {
+        let _ = ready.add_script_to_execute_on_document_created(CONSOLE_CAPTURE_SCRIPT);
+        let console_message_received = move |args: WebMessageReceivedArgs| {
+            if let Ok(message) = args.try_web_message_as_string() {
+                println!("{message}");
+            }
+        };
+        if let Ok(registration) = ready.on_web_message_received(console_message_received) {
+            *console_message_registration_cell.borrow_mut() = Some(registration);
+        }
         let reflect = {
             let ready = ready.clone();
             let bump = bump.clone();
@@ -1146,10 +1216,12 @@ fn page_element(
                 let _ = pending.deferral.complete();
             }
             None => {
-                let _ = ready.navigate(&start_url);
+                let result = ready.navigate(&start_url);
+                trace(&format!("on_ready: navigate({start_url:?}) -> {result:?}"));
             }
         }
         *web_cell.borrow_mut() = Some(ready);
+        });
     };
 
     // `windows_webview::webview()` already wires its own `.on_mounted`/
@@ -1309,6 +1381,7 @@ fn switcher_overlay(
         let add_page_and_switch = add_page_and_switch.clone();
         move || -> bool {
             let trimmed = query.trim();
+            trace(&format!("activate_search: trimmed={trimmed:?} len={}", trimmed.len()));
             if trimmed.is_empty() {
                 return false;
             }
@@ -1342,9 +1415,16 @@ fn switcher_overlay(
     };
     *enter_action.borrow_mut() = Some(Rc::new(activate_search) as Rc<dyn Fn() -> bool>);
 
+    let set_search_query_traced = {
+        let set_search_query = set_search_query.clone();
+        move |text: String| {
+            trace(&format!("search_box: on_text_changed({text:?})"));
+            set_search_query.call(text);
+        }
+    };
     let search_box = text_box(search_query.to_string())
         .placeholder_text("Type to filter open pages\u{2026}")
-        .on_text_changed(set_search_query)
+        .on_text_changed(set_search_query_traced)
         .width(400.0)
         .keyboard_accelerator(KeyboardAccelerator::new(VirtualKey::Enter, VirtualKeyModifiers::Control, force_new_page_from_search));
 

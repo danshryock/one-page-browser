@@ -43,9 +43,10 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use browser_core::{Action, HistoryStore, PasswordBackend, Profile};
+use enigo::MouseControllable;
 use browser_linux_gtk3::{build_window_and_app, build_window_and_app_with_history, AppState};
 use gtk::prelude::*;
-use render_engine::{RenderEngine, WebContext, WebKitWebView, WryEngine};
+use render_engine::{NewWindowInfo, RenderEngine, WebContext, WebKitWebView, WryEngine};
 
 type Job = Box<dyn FnOnce() + Send>;
 
@@ -140,6 +141,17 @@ fn fixture_url(name: &str) -> String {
     format!("file://{fixtures}/{name}")
 }
 
+/// The shared, cross-platform `web-standards-tests/fixtures/<name>/` directory
+/// (one level up from this crate's own `examples/fixtures/`, at the repo
+/// root) — see that directory's own fixtures for the opener test case files.
+/// Canonicalized (resolving the `..` segments) since WebKitGTK reports
+/// `current_url()` back in canonical form after loading — comparing against
+/// an un-normalized path here would spuriously never match.
+fn web_standards_fixture_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web-standards-tests/fixtures")).join(name);
+    dir.canonicalize().unwrap_or_else(|err| panic!("failed to canonicalize fixture dir {dir:?}: {err}"))
+}
+
 /// A profile scoped to this test alone (unique per test name + process),
 /// so tests never share or pollute each other's — or the real user's —
 /// `Settings`/`HistoryStore`/`Keybindings` files on disk. Removes its
@@ -184,7 +196,7 @@ fn navigation_back_forward_reload() {
         window.show_all();
 
         let mut web_context = WebContext::new(None);
-        let engine = WryEngine::new(&content, &url_a, &mut web_context, |_| {}, |_| {}, |_, _| None)
+        let engine = WryEngine::new(&content, &url_a, &mut web_context, |_| {}, |_| {}, |_, _| None, |_| {})
             .expect("WryEngine::new should succeed");
         assert!(
             wait_until(|| engine.current_url().ok().as_deref() == Some(url_a.as_str())),
@@ -239,6 +251,7 @@ fn reader_mode_toggles_on_and_off() {
             },
             |_| {},
             |_, _| None,
+            |_| {},
         )
         .expect("WryEngine::new should succeed");
         assert!(wait_until(|| *title.borrow() == "Page A"), "initial load should reach page A");
@@ -355,6 +368,177 @@ fn add_page_related_opens_without_switching_away() {
 
         cleanup_test_profile(&profile);
     });
+}
+
+/// Web-standards test: does a real, genuine (OS-level synthetic, not a
+/// script-dispatched DOM `click()`) click on a `target="_blank"` link
+/// correctly follow real Chromium/WebKit `rel="opener"`/implicit-`noopener`
+/// semantics — see `web-standards-tests/fixtures/`'s `opener-default`/
+/// `opener-explicit-opener` fixtures and this crate's `README.md`/
+/// `ROADMAP.md` for the investigation this exists to guard against
+/// regressing. Unlike `add_page_related_opens_without_switching_away` above
+/// (which calls `add_page_related` directly against a disconnected,
+/// never-navigated `WebKitWebView::new()`, deliberately *not* a real opener
+/// link), this drives the real `WryEngine::new`/`is_user_gesture`/
+/// `new_related` path end-to-end with a genuine click, and reads the
+/// popup's own `console.log('opener_is_set=' + ...)` output — relayed
+/// through the same `on_console_message` IPC hook every front end's
+/// production code already wires up — as the test's result, instead of any
+/// custom Rust-side verification logic.
+fn run_web_standards_opener_case(case: &'static str) {
+    run_on_gtk_thread(move || {
+        let fixture_dir = web_standards_fixture_dir(case);
+        let index_url = format!("file://{}/index.html", fixture_dir.display());
+        let expected = std::fs::read_to_string(fixture_dir.join("expected.txt"))
+            .unwrap_or_else(|err| panic!("failed to read expected.txt for {case}: {err}"));
+
+        // A single `gtk::Stack` in one toplevel window hosts both the
+        // opener's and the popup's containers — matching `AppState`'s own
+        // architecture (every page, visible or background, lives in one
+        // `self.stack`), and critically *not* a second independent toplevel
+        // window: confirmed by testing directly that a second
+        // `gtk::Window::new(Toplevel)` for the popup container caused the
+        // synthetic click below to silently land on nothing (WebKitGTK's
+        // `create` signal never fired) — a plain second toplevel is exactly
+        // what a kiosk-style single-app compositor (`cage`, used by this
+        // crate's isolated-display test setup) stacks/focuses over the
+        // first, and even under an ordinary desktop WM a freshly mapped
+        // window commonly steals focus the same way.
+        let window = gtk::Window::new(gtk::WindowType::Toplevel);
+        let stack = gtk::Stack::new();
+        window.add(&stack);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let popup_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        stack.add_named(&content, "opener");
+        stack.add_named(&popup_container, "popup");
+        stack.set_visible_child_name("opener");
+        window.show_all();
+        // `gtk_test::click`'s own doc comment: the click "fails" if the
+        // window isn't on top of every other window — this is what makes a
+        // real, OS-trusted click actually land on the link. `present()`
+        // only sends the X11 request asynchronously — the window manager
+        // needs a real moment (and pumped events) to actually grant focus.
+        window.present();
+        let focus_deadline = Instant::now() + Duration::from_secs(2);
+        while !window.is_active() && Instant::now() < focus_deadline {
+            while gtk::events_pending() {
+                gtk::main_iteration_do(false);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Kept alive for the popup page's whole lifetime, mirroring
+        // `AppState::add_page_related`/`PageManager` keeping a popup's
+        // engine tracked rather than letting it drop the instant its widget
+        // is handed back to WebKitGTK's `create` signal.
+        let popup_engines: Rc<std::cell::RefCell<Vec<WryEngine>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
+
+        let messages: Rc<std::cell::RefCell<Vec<String>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let messages_for_new_window = Rc::clone(&messages);
+        let messages_for_engine = Rc::clone(&messages);
+        let popup_engines_for_new_window = Rc::clone(&popup_engines);
+
+        let mut web_context = WebContext::new(None);
+        let engine = WryEngine::new(
+            &content,
+            &index_url,
+            &mut web_context,
+            |_title| {},
+            |_playing| {},
+            move |info: NewWindowInfo, opener: WebKitWebView| -> Option<gtk::Widget> {
+                if !info.is_user_gesture {
+                    return None;
+                }
+                let messages_for_popup = Rc::clone(&messages_for_new_window);
+                let mut popup_context = WebContext::new(None);
+                let popup_engine = WryEngine::new_related(
+                    &popup_container,
+                    &opener,
+                    &mut popup_context,
+                    |_title| {},
+                    |_playing| {},
+                    |_info, _opener| None,
+                    move |message| messages_for_popup.borrow_mut().push(message),
+                )
+                .ok()?;
+                let widget = popup_engine.widget();
+                popup_engines_for_new_window.borrow_mut().push(popup_engine);
+                Some(widget)
+            },
+            move |message| messages_for_engine.borrow_mut().push(message),
+        )
+        .expect("WryEngine::new should succeed");
+
+        assert!(wait_until(|| engine.current_url().ok().as_deref() == Some(index_url.as_str())), "fixture index page should load");
+
+        // Neither `gtk_test::click` nor `gtk_test::mouse_move` is used
+        // directly here:
+        // - `click` waits on the clicked widget's own `button-release-event`
+        //   GTK signal, which a WebKitGTK `WebView` never emits (WebKit
+        //   handles pointer input inside its own compositor, not through
+        //   plain GTK widget signals) — confirmed by testing directly:
+        //   `gtk_test::click` against this widget hung indefinitely.
+        // - `mouse_move` internally calls `gtk::test_widget_wait_for_draw`,
+        //   which also hung indefinitely here — this test's own
+        //   `wait_until` above already guarantees the page (and so the
+        //   widget) has drawn at least once, so a second, unconditional
+        //   wait for a fresh draw event that may never come is redundant
+        //   and, empirically, not reliable in every windowing setup.
+        //
+        // What's kept is the actual input delivery both functions perform
+        // underneath: computing the widget's on-screen position and firing
+        // a real, OS-level synthetic `enigo` mouse move + click — genuinely
+        // trusted from WebKit's perspective, unlike a script-dispatched DOM
+        // `click()` — with this test's own `wait_until` below polling for
+        // the popup's `console.log` output to arrive instead of waiting on
+        // any GTK signal.
+        //
+        // Real, environment-specific gap surfaced (not introduced) by this
+        // test, confirmed by direct testing: in this dev sandbox, `enigo`'s
+        // XTest-based fake input doesn't land at all — verified with a
+        // minimal standalone probe (a plain `gtk::Button`, not a webview)
+        // against both this crate's `xwfb-run -c cage` isolated display and
+        // the real `:0` desktop session, neither ever fired the button's
+        // `clicked` signal from an identical `mouse_move_to`/`mouse_click`
+        // call. That rules out anything WebKitGTK- or opener-specific —
+        // XTest fake input is evidently disabled or unavailable at the X
+        // server level in this particular sandbox — so this test may not
+        // pass here, but the mechanism itself (a real click driving
+        // `is_user_gesture`/`new_related`/the console-capture IPC hook, all
+        // exercised identically to production) is correct and should work
+        // wherever XTest fake input actually functions (a normal desktop,
+        // or CI with `xvfb`/`xdotool` support confirmed working).
+        let allocation = engine.widget().allocation();
+        let toplevel = engine.widget().toplevel().expect("webview should have a toplevel window");
+        let toplevel_window = toplevel.window().expect("toplevel should be realized");
+        let (_, window_x, window_y) = toplevel_window.origin();
+        let (cx, cy) = engine
+            .widget()
+            .translate_coordinates(&toplevel, allocation.width() / 2, allocation.height() / 2)
+            .expect("translate_coordinates should succeed for a realized, mapped widget");
+        let mut enigo = enigo::Enigo::new();
+        enigo.mouse_move_to(window_x + cx, window_y + cy);
+        std::thread::sleep(Duration::from_millis(200));
+        enigo.mouse_click(enigo::MouseButton::Left);
+
+        assert!(
+            wait_until(|| !messages.borrow().is_empty()),
+            "{case}: clicking the link should trigger the popup's console.log, relayed via IPC"
+        );
+
+        let actual = messages.borrow().join("\n") + "\n";
+        assert_eq!(actual, expected, "{case}: captured console output should match expected.txt");
+    });
+}
+
+#[test]
+fn opener_verification_default_target_blank_has_no_opener() {
+    run_web_standards_opener_case("opener-default");
+}
+
+#[test]
+fn opener_verification_explicit_rel_opener_has_opener() {
+    run_web_standards_opener_case("opener-explicit-opener");
 }
 
 #[test]

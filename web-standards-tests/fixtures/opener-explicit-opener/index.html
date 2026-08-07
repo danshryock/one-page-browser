@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+<head><title>opener-explicit-opener</title></head>
+<body style="margin:0">
+<!-- A large fixed pixel size (not vw/vh — confirmed by testing directly that
+     100vw/100vh resolved against a viewport smaller than the widget's later,
+     final allocation, leaving the link rendered far smaller than the window)
+     so a click anywhere near the embedding widget's origin (all a
+     synthetic-input test driver can target — it has no way to aim at a
+     specific DOM element) reliably lands on this link regardless of the
+     host window's actual size. -->
+<a href="../shared/popup.html" target="_blank" rel="opener" id="l" style="display:block;width:4000px;height:4000px">Open New Tab</a>
+</body>
+</html>

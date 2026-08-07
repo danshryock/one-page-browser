@@ -41,6 +41,12 @@ windows-webview = { git = "https://github.com/microsoft/windows-rs", features = 
 # windows-webview themselves use would make their `IInspectable` and ours
 # distinct, incompatible types even though structurally identical.
 windows-core = { git = "https://github.com/microsoft/windows-rs" }
+# Same git source as the three deps above, for raw `SetTimer`/`KillTimer` —
+# see `page_element`'s `on_ready` doc comment on why the console-capture
+# script registration needs deferring off this callback's own call stack.
+windows = { git = "https://github.com/microsoft/windows-rs", rev = "b9e0aa360b8b6caa7dfc6038b5bc6603eed3bb8c", features = [
+    "winuser",
+] }
 
 # Deliberately NOT target-gated like the two deps above, despite being
 # windows-only at runtime — see build.rs's doc comment for why: a

@@ -1,0 +1,39 @@
+[package]
+name = "web-standards-tests"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# One binary per platform (mirroring how `render-engine` splits
+# `linux.rs`/`macos.rs`) — each is `#[cfg(target_os = "...")]`-gated
+# internally (see its own `main` for the real vs. stub split, the same
+# pattern `browser-windows-reactor`'s `main.rs` already uses), so this crate
+# builds cleanly on every host even though each binary only *does* anything
+# on its own target platform.
+[[bin]]
+name = "web-standards-driver-windows"
+path = "src/bin/windows_driver.rs"
+
+[[bin]]
+name = "web-standards-driver-macos"
+path = "src/bin/macos_driver.rs"
+
+[dependencies]
+anyhow = "1"
+
+# `windows` (not `windows-core`/`windows-reactor`/`windows-webview`, which
+# `browser-windows-reactor` uses): this is a wholly separate process driving
+# the real app from the *outside* via `SendInput`/window-finding — it shares
+# no types with the app, so there's no reason to match its git-pinned
+# `windows-core` version.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+core-foundation = "0.10"

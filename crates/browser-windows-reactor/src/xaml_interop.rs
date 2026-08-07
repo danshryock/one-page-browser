@@ -664,6 +664,59 @@ pub(crate) fn setup_titlebar_passthrough() -> Option<windows_core::EventRevoker>
     element.SizeChanged(move |_sender, _args| apply_titlebar_passthrough()).ok()
 }
 
+std::thread_local! {
+    static DEFERRED_CALLBACKS: std::cell::RefCell<Vec<Box<dyn FnOnce()>>> = std::cell::RefCell::new(Vec::new());
+}
+
+const DEFER_TIMER_ID: usize = 0xc1a0de;
+
+unsafe extern "system" fn run_deferred_callbacks(
+    hwnd: windows::Win32::HWND,
+    _msg: u32,
+    _timer_id: usize,
+    _time: u32,
+) {
+    let _ = unsafe { windows::Win32::winuser::KillTimer(Some(hwnd), DEFER_TIMER_ID) };
+    let callbacks = DEFERRED_CALLBACKS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    for callback in callbacks {
+        callback();
+    }
+}
+
+/// Schedules `callback` to run on a later, non-nested tick of the window's
+/// own message loop — via a real Win32 `SetTimer`/`WM_TIMER`, not a
+/// same-stack-frame call.
+///
+/// Real, empirically-confirmed gap this exists to close: `windows_webview`'s
+/// `WebView::add_script_to_execute_on_document_created` internally pumps the
+/// calling thread's message loop (`GetMessageW` in a loop) until its async
+/// completion handler fires (see that crate's own `pump::wait`) — calling it
+/// synchronously from inside `page_element`'s `on_ready` (itself invoked
+/// from *within* `windows-reactor`'s own COM event dispatch, already nested
+/// on the call stack) deadlocks the whole app: confirmed directly by
+/// removing the call and watching navigation start working again, then
+/// restoring it and watching every page — even a plain `https://
+/// www.google.com` — go permanently blank. A `SetTimer`-scheduled callback
+/// runs from the *top-level* message dispatch instead, with nothing else on
+/// the stack, so the exact same blocking call inside it is safe.
+pub(crate) fn defer_to_next_tick(callback: impl FnOnce() + 'static) {
+    DEFERRED_CALLBACKS.with(|cell| cell.borrow_mut().push(Box::new(callback)));
+    if let Some(hwnd) = main_hwnd() {
+        unsafe {
+            windows::Win32::winuser::SetTimer(Some(hwnd), DEFER_TIMER_ID, 0, Some(run_deferred_callbacks));
+        }
+    }
+}
+
+fn main_hwnd() -> Option<windows::Win32::HWND> {
+    let raw = windows_reactor::with_active_host(|host| -> Result<isize> {
+        let window = host.window();
+        window.cast::<IWindowNative>()?.GetWindowHandle()
+    })?
+    .ok()?;
+    Some(windows::Win32::HWND(raw as *mut core::ffi::c_void))
+}
+
 fn apply_titlebar_passthrough() {
     let result = windows_reactor::with_active_host(|host| -> Result<()> {
         let window = host.window();

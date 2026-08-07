@@ -315,6 +315,7 @@ impl AppState {
                 }
                 app_weak_new_window.upgrade()?.add_page_related(&opener).ok()
             },
+            |message| eprintln!("console.log: {message}"),
         )?;
 
         let evicted = self.core.borrow_mut().insert(id.clone(), engine, title);
@@ -376,6 +377,7 @@ impl AppState {
                 }
                 app_weak_new_window.upgrade()?.add_page_related(&opener).ok()
             },
+            |message| eprintln!("console.log: {message}"),
         )?;
 
         let widget = engine.widget();
@@ -585,6 +587,7 @@ impl AppState {
                 }
                 app_weak_new_window.upgrade()?.add_page_related(&opener).ok()
             },
+            |message| eprintln!("console.log: {message}"),
         ) {
             Ok(engine) => self.core.borrow_mut().install_engine(id, engine),
             Err(err) => eprintln!("failed to reload unloaded page: {err}"),

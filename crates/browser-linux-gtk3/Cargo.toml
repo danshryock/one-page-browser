@@ -15,6 +15,10 @@ gtk = "0.18"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 gtk-test = "0.18"
+# Same version `gtk-test` itself pins internally (see its own Cargo.toml) —
+# used directly (not via `gtk_test::click`) for the web-standards opener
+# test's synthetic click; see that test's doc comment for why.
+enigo = "0.0.14"
 # Test-only: a fake local server standing in for `bw serve`, same use as in
 # browser-core's own bitwarden.rs tests.
 tiny_http = "0.12"

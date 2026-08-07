@@ -1172,6 +1172,7 @@ impl AppState {
                 let app = self_for_new_window.upgrade()?;
                 app.add_page_related(target_configuration).ok()
             },
+            |message| println!("{message}"),
         )?;
 
         let title = Rc::new(RefCell::new(String::new()));
@@ -1225,6 +1226,7 @@ impl AppState {
                 let app = self_for_new_window.upgrade()?;
                 app.add_page_related(target_configuration).ok()
             },
+            |message| println!("{message}"),
         )?;
 
         let raw_webview = engine.raw_webview();
@@ -1299,6 +1301,7 @@ impl AppState {
                 let app = self_for_new_window.upgrade()?;
                 app.add_page_related(target_configuration).ok()
             },
+            |message| println!("{message}"),
         ) {
             Ok(engine) => {
                 self.core.borrow_mut().install_engine(id, engine);

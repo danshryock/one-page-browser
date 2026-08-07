@@ -74,6 +74,44 @@ EOF
     fi
 done <<< "$TEST_EXES"
 
+echo "== building the web-standards driver =="
+(cd "$REPO_ROOT" && cargo build-web-standards-driver-windows)
+DRIVER_EXE=$(find "$REPO_ROOT/target/x86_64-pc-windows-msvc/debug" -maxdepth 1 -name 'web-standards-driver-windows.exe')
+if [ -z "$DRIVER_EXE" ]; then
+    echo "error: build succeeded but couldn't find web-standards-driver-windows.exe under target/x86_64-pc-windows-msvc/debug/" >&2
+    exit 1
+fi
+echo "built: $DRIVER_EXE"
+vm_deploy_file "$DRIVER_EXE"
+
+echo "== deploying web-standards-tests fixtures =="
+# Copied onto the shared folder's host-side directory first (cheap, plain
+# `cp`), then onto the VM's own C: drive (a real Windows path, not a UNC
+# one) via `xcopy` — the driver's fixture-URL-derived `expected.txt` reads
+# and the app's own `file:///C:/...` navigation both need a local path;
+# `\\host.lan\Data\...` UNC file:// URLs are a separate, murkier can of
+# worms this sidesteps entirely (never fully root-caused — see
+# `seed-fixture-session.ps1`'s own doc comment for the actual navigation
+# mechanism this now relies on instead).
+cp -r "$REPO_ROOT/web-standards-tests/fixtures" "$(vm_shared_dir)/"
+printf 'xcopy \\\\host.lan\\Data\\fixtures C:\\ClaudeBrowser\\fixtures\\ /E /I /Y\n' | vm_run
+
+echo "== seeding the default profile's session with every fixture case already open =="
+vm_deploy_file "./seed-fixture-session.ps1"
+printf 'powershell -ExecutionPolicy Bypass -File C:\\ClaudeBrowser\\seed-fixture-session.ps1\n' | vm_run
+
+echo "== running the web-standards driver inside the VM =="
+# `printf`, not a heredoc — matches `vm_deploy_file`'s own established fix
+# for the same trap: an unquoted heredoc collapses `\\` to a single `\`,
+# which silently breaks the `\\...\` paths below.
+if printf 'C:\\ClaudeBrowser\\web-standards-driver-windows.exe C:\\ClaudeBrowser\\%s C:\\ClaudeBrowser\\fixtures\n' "$(basename "$APP_EXE")" | vm_run
+then
+    echo "-- web-standards-driver-windows: PASS --"
+else
+    echo "-- web-standards-driver-windows: FAIL --"
+    overall_status=1
+fi
+
 if [ "$RUN_SMOKE" -eq 1 ]; then
     echo "== visual smoke test: launching the real app =="
     app_name=$(basename "$APP_EXE")

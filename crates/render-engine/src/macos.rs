@@ -21,6 +21,26 @@ impl HasWindowHandle for NsViewHandle {
     }
 }
 
+/// Overrides `console.log` to relay every call through `wry`'s IPC channel
+/// (`window.ipc.postMessage`) in addition to its normal behavior — see
+/// `WryEngine::new`'s `on_console_message` doc comment for why. Byte-identical
+/// copy of `render_engine::linux`'s constant of the same name (two separate
+/// compilation units, same reasoning `FILL_LOGIN_SCRIPT` is already
+/// duplicated between this file and `linux.rs` rather than shared).
+const CONSOLE_CAPTURE_SCRIPT: &str = r#"
+(function () {
+  var send = window.chrome && window.chrome.webview
+    ? function (m) { window.chrome.webview.postMessage(m); }
+    : window.ipc ? function (m) { window.ipc.postMessage(m); } : null;
+  if (!send) return;
+  var original = console.log;
+  console.log = function () {
+    original.apply(console, arguments);
+    try { send(Array.prototype.map.call(arguments, String).join(' ')); } catch (e) {}
+  };
+})();
+"#;
+
 pub struct WryEngine {
     webview: WebView,
 }
@@ -72,6 +92,7 @@ impl WryEngine {
         web_context: &mut WebContext,
         on_title_changed: impl Fn(String) + 'static,
         on_new_window_requested: impl Fn(String, Retained<WKWebViewConfiguration>) -> Option<Retained<WKWebView>> + 'static,
+        on_console_message: impl Fn(String) + 'static,
     ) -> anyhow::Result<Self> {
         let handle = NsViewHandle(NonNull::from(parent));
         let webview = WebViewBuilder::new_with_web_context(web_context)
@@ -83,6 +104,8 @@ impl WryEngine {
                     None => NewWindowResponse::Deny,
                 }
             })
+            .with_initialization_script(CONSOLE_CAPTURE_SCRIPT)
+            .with_ipc_handler(move |request| on_console_message(request.body().clone()))
             .build_as_child(&handle)?;
         Ok(Self { webview })
     }
@@ -98,6 +121,7 @@ impl WryEngine {
         target_configuration: Retained<WKWebViewConfiguration>,
         on_title_changed: impl Fn(String) + 'static,
         on_new_window_requested: impl Fn(String, Retained<WKWebViewConfiguration>) -> Option<Retained<WKWebView>> + 'static,
+        on_console_message: impl Fn(String) + 'static,
     ) -> anyhow::Result<Self> {
         let handle = NsViewHandle(NonNull::from(parent));
         let webview = WebViewBuilder::new()
@@ -109,6 +133,8 @@ impl WryEngine {
                     None => NewWindowResponse::Deny,
                 }
             })
+            .with_initialization_script(CONSOLE_CAPTURE_SCRIPT)
+            .with_ipc_handler(move |request| on_console_message(request.body().clone()))
             .build_as_child(&handle)?;
         Ok(Self { webview })
     }
