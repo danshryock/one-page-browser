@@ -130,7 +130,7 @@ mod macos_impl {
         let index_url = format!("file://{}", case_dir.join("index.html").to_string_lossy());
         let steps = read_actions(&case_dir)?;
 
-        let mut child = Command::new(app_exe).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+        let mut child = Command::new(app_exe).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
         let result = drive_and_capture(&mut child, &index_url, &steps, &expected);
         let _ = child.kill();
         let _ = child.wait();
@@ -162,16 +162,55 @@ mod macos_impl {
             .collect()
     }
 
-    fn drive_and_capture(child: &mut Child, index_url: &str, steps: &[Step], expected: &str) -> anyhow::Result<String> {
-        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("child had no stdout"))?;
+    /// Reads `reader` line-by-line into the returned channel until it hits
+    /// EOF (the child closed the stream — normal on exit) or a read error.
+    /// Deliberately *not* `std::io::BufRead::lines()`: that yields an `Err`
+    /// for any line that isn't valid UTF-8, and `.map_while(Result::ok)`
+    /// (this file's original approach) treats the first such `Err` as the
+    /// end of the whole iterator — silently abandoning the rest of a still-
+    /// running child's output after one stray non-UTF-8 byte sequence
+    /// (WebKit/AppKit framework logging noise, say) rather than actually
+    /// meaning the child exited. `String::from_utf8_lossy` degrades one bad
+    /// line instead of ending the stream.
+    fn spawn_line_reader<R: std::io::Read + Send + 'static>(reader: R) -> mpsc::Receiver<String> {
         let (tx, rx) = mpsc::channel::<String>();
         std::thread::spawn(move || {
             use std::io::BufRead;
-            let reader = std::io::BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
-                    break;
+            let mut reader = std::io::BufReader::new(reader);
+            loop {
+                let mut buf = Vec::new();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if buf.last() == Some(&b'\n') {
+                            buf.pop();
+                        }
+                        if buf.last() == Some(&b'\r') {
+                            buf.pop();
+                        }
+                        if tx.send(String::from_utf8_lossy(&buf).into_owned()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
                 }
+            }
+        });
+        rx
+    }
+
+    fn drive_and_capture(child: &mut Child, index_url: &str, steps: &[Step], expected: &str) -> anyhow::Result<String> {
+        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("child had no stdout"))?;
+        let stderr = child.stderr.take().ok_or_else(|| anyhow::anyhow!("child had no stderr"))?;
+        let rx = spawn_line_reader(stdout);
+        // Relayed straight to our own stderr (prefixed, so it's easy to
+        // pick out in CI logs) rather than dropped — this is exactly the
+        // channel a real app crash/panic would otherwise vanish into, with
+        // no other way to see why the driver stopped getting output.
+        let stderr_rx = spawn_line_reader(stderr);
+        std::thread::spawn(move || {
+            for line in stderr_rx {
+                eprintln!("[app stderr] {line}");
             }
         });
 
