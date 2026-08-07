@@ -166,6 +166,41 @@ jobs:
       # __test_target__-driven suite `browser-linux-gtk3`'s in-process test
       # and `windows_driver.rs` both run — see `web-standards-tests/`'s own
       # doc comments for the full design.
+      # Experimental, best-effort, allowed to fail: the first real run of
+      # this job showed (via mid-run screenshots) that the app launches and
+      # renders fine but every synthetic CGEvent the driver posts is a
+      # total no-op — the window never responds to any keystroke. The
+      # leading suspect is Accessibility/Input Monitoring TCC approval,
+      # which a fresh, ephemeral runner + a freshly built (different hash
+      # every run) binary has had no chance to ever be granted, and there's
+      # no GUI session here to click "Allow" through even once. This tries
+      # the classic direct-SQLite-write-to-TCC.db workaround some CI setups
+      # use — SIP protects both the system and per-user TCC.db on modern
+      # macOS specifically to close this off, so this may just fail
+      # cleanly, which is itself a useful, conclusive answer. Left in
+      # (rather than reverted) until that answer is confirmed either way.
+      - name: Attempt to pre-authorize Accessibility for the driver (experimental)
+        run: |
+          echo "SIP status:"
+          csrutil status || true
+          echo "macOS version:"
+          sw_vers
+          driver_path="$(pwd)/target/${{ matrix.target }}/debug/web-standards-driver-macos"
+          echo "granting Accessibility to: $driver_path"
+          tcc_db="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+          echo "user TCC.db path: $tcc_db"
+          if [ -f "$tcc_db" ]; then
+            echo "-- existing access table schema --"
+            sqlite3 "$tcc_db" ".schema access" || echo "(couldn't read schema)"
+          else
+            echo "user TCC.db doesn't exist yet"
+          fi
+          if sudo sqlite3 "$tcc_db" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('kTCCServiceAccessibility', '$driver_path', 1, 2, 2, 1)"; then
+            echo "TCC.db write: SUCCEEDED"
+          else
+            echo "TCC.db write: FAILED (see error above) — proceeding anyway, the driver step's screenshots will show whether this mattered"
+          fi
+
       - name: Run web-standards-driver-macos
         run: |
           set -euo pipefail
