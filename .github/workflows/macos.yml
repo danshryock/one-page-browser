@@ -195,11 +195,32 @@ jobs:
           else
             echo "user TCC.db doesn't exist yet"
           fi
-          if sudo sqlite3 "$tcc_db" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('kTCCServiceAccessibility', '$driver_path', 1, 2, 2, 1)"; then
-            echo "TCC.db write: SUCCEEDED"
-          else
-            echo "TCC.db write: FAILED (see error above) — proceeding anyway, the driver step's screenshots will show whether this mattered"
-          fi
+          # Granting both Accessibility and Input Monitoring (posting HID
+          # keyboard/mouse events can be gated by either depending on macOS
+          # version) to both binaries (driver does the posting, but the app
+          # is what CGEvent-based clicks ultimately need to land on).
+          for service in kTCCServiceAccessibility kTCCServiceListenEvent; do
+            for bin_path in "$driver_path" "$(pwd)/target/${{ matrix.target }}/debug/browser-macos-appkit"; do
+              if sudo sqlite3 "$tcc_db" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('$service', '$bin_path', 1, 2, 2, 1)"; then
+                echo "TCC.db write SUCCEEDED: $service -> $bin_path"
+              else
+                echo "TCC.db write FAILED: $service -> $bin_path (see error above)"
+              fi
+            done
+          done
+
+          # A first attempt (same INSERT, no restart) already showed the
+          # write itself succeeds silently but has no functional effect —
+          # tccd caches authorization state in memory and doesn't
+          # necessarily reload it just because the underlying file changed.
+          # Killing it (a keepalive launchd job, both the per-user agent and
+          # the system daemon match this name) forces a respawn that reads
+          # the file fresh.
+          echo "restarting tccd to force it to reload from disk..."
+          sudo pkill -x tccd || true
+          sleep 3
+          echo "tccd processes now running:"
+          pgrep -fl tccd || echo "(none found — may still be respawning)"
 
       - name: Run web-standards-driver-macos
         run: |
