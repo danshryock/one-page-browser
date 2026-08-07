@@ -177,6 +177,22 @@ jobs:
               exit 1
             fi
           done
+
+          # Background screenshots taken *during* the run, in this same
+          # step/shell so they're guaranteed to actually fire while the
+          # driver is mid-flight rather than risk being reaped between
+          # steps. See this job's earlier comment history for why: the
+          # first real run failed with no __test_target__ report ever
+          # arriving and the app process never exiting either, and the
+          # leading suspect is CGEvent-based synthetic input silently
+          # no-opping on a fresh runner (no error return to signal a TCC
+          # block) — these screenshots directly show whether the
+          # switcher/keystrokes visibly did anything at all.
+          mkdir -p mid-run-screenshots
+          (sleep 6 && screencapture -x mid-run-screenshots/t6.png) &
+          (sleep 10 && screencapture -x mid-run-screenshots/t10.png) &
+          (sleep 16 && screencapture -x mid-run-screenshots/t16.png) &
+
           "$driver" "$app" web-standards-tests/fixtures 2>&1 | tee web-standards-macos-${{ matrix.arch }}.log
 
       - name: Upload log
@@ -185,4 +201,12 @@ jobs:
         with:
           name: web-standards-macos-log-${{ matrix.arch }}
           path: web-standards-macos-${{ matrix.arch }}.log
+          if-no-files-found: ignore
+
+      - name: Upload mid-run screenshots (diagnostic)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-standards-macos-mid-run-screenshots-${{ matrix.arch }}
+          path: mid-run-screenshots/
           if-no-files-found: ignore

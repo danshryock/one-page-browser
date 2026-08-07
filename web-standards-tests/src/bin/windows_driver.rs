@@ -429,9 +429,20 @@ mod windows_impl {
             if remaining.is_zero() {
                 anyhow::bail!("no __test_target__ report for {target:?} arrived within {MESSAGE_WAIT:?}");
             }
+            // `recv_timeout` returns `Err` both when `remaining` genuinely
+            // elapses with nothing sent (`Timeout` — a plain "never showed
+            // up," no different from the `remaining.is_zero()` case above)
+            // and when the sender was dropped (`Disconnected` — the reader
+            // thread's stream really did end). Conflating them here would
+            // misreport an ordinary timeout as "the app crashed."
             match rx.recv_timeout(remaining) {
                 Ok(line) => captured.push(line),
-                Err(_) => anyhow::bail!("child stdout ended before a __test_target__ report for {target:?} arrived"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    anyhow::bail!("no __test_target__ report for {target:?} arrived within {MESSAGE_WAIT:?}")
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("child stdout ended before a __test_target__ report for {target:?} arrived")
+                }
             }
         }
     }
