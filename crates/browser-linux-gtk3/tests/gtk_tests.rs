@@ -57,6 +57,29 @@ fn gtk_thread() -> &'static Sender<Job> {
     SENDER.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<Job>();
         std::thread::spawn(move || {
+            // Forces the X11 backend before GDK picks one on its own. Under
+            // `xwfb-run` (see README.md's Testing section), the test process
+            // sees *both* `DISPLAY` (the nested Xwayland server) and
+            // `WAYLAND_DISPLAY` (the headless compositor hosting it) set at
+            // once, and GDK's own backend auto-detection prefers Wayland
+            // when both are present — so without this, the app becomes a
+            // native Wayland client of the compositor, invisible to X11
+            // entirely. That silently broke every synthetic click this file
+            // sends via `enigo` (XTest, which only ever talks to the X11
+            // server): `enigo` still "succeeds" with no error, but the
+            // click lands on an X server with zero mapped windows in it —
+            // confirmed directly by cross-checking `xwininfo -root -tree`
+            // against the actual `DISPLAY` while a probe app was running
+            // (0 children) and by rerunning the exact same probe with
+            // `GDK_BACKEND=x11` forced (window becomes a real Xwayland
+            // client, `is_active()` flips to `true`, and the synthetic
+            // click starts arriving). A real desktop session should still
+            // default to Wayland when running natively — this only forces
+            // X11 inside this test process, not anywhere in the shipped
+            // app.
+            unsafe {
+                std::env::set_var("GDK_BACKEND", "x11");
+            }
             gtk::init().expect("gtk::init should succeed against a real display");
             for job in rx {
                 job();

@@ -47,13 +47,20 @@ build/run instructions.
   (`web-standards-tests/src/bin/windows_driver.rs`, real `SendInput`, `scripts/windows-vm/build-and-test.sh`
   runs it in the real VM); macos-appkit's driver (`macos_driver.rs`) exists and cross-compiles but is
   link-check-only in this environment (same standing caveat as every other macOS deliverable).
-  - **gtk3**: implemented and verified working end-to-end via direct testing — but the two new
-    `#[test]`s can't be *proven passing* in this dev sandbox specifically: isolated down to `enigo`'s
-    XTest-based synthetic mouse click not landing at all here (confirmed with a minimal probe: a plain
-    `gtk::Button`'s `clicked` signal never fires from the same `mouse_move_to`/`mouse_click` call, tried
-    against both the real `:0` desktop and an isolated `xwfb-run -c cage` session) — a sandbox/XTest
-    limitation, not a defect in the test or the app; likely to just work on a normal desktop or a CI runner
-    with confirmed-working `xvfb`/`xdotool`.
+  - **gtk3**: implemented and verified working end-to-end, both new `#[test]`s passing for real under
+    `xwfb-run -c cage`. Along the way, `enigo`'s XTest-based synthetic click appeared not to land at all in
+    this dev sandbox (confirmed with a minimal probe: a plain `gtk::Button`'s `clicked` signal never fired
+    from the same `mouse_move_to`/`mouse_click` call) — initially assumed to be an unfixable sandbox/XTest
+    limitation, but root-caused for real: under `xwfb-run`, the test process sees both `DISPLAY` (the nested
+    Xwayland server) and `WAYLAND_DISPLAY` (the headless compositor hosting it) set at once, and GDK's own
+    backend auto-detection prefers Wayland when both are present — so the app was silently becoming a native
+    Wayland client, invisible to X11 entirely. `enigo`'s XTest calls (which only ever talk to the X11 server)
+    still "succeeded" with no error, but landed on an X server with zero mapped windows in it — confirmed
+    directly by cross-checking `xwininfo -root -tree` against the actual `DISPLAY` while a probe app was
+    running (0 children) and by rerunning the same probe with `GDK_BACKEND=x11` forced (the window becomes a
+    real Xwayland client, `is_active()` flips to `true`, and the synthetic click starts arriving). Fixed by
+    forcing `GDK_BACKEND=x11` on `gtk_tests.rs`'s single GTK-owning worker thread before `gtk::init()` — test
+    process only, doesn't touch the shipped app, which should keep defaulting to Wayland on a real desktop.
   - **windows-reactor**: verified passing for real in the VM, but along the way surfaced (and fixed) a real,
     severe, previously-unknown bug this test suite's own console-capture wiring introduced: injecting the
     shim via `WebView::add_script_to_execute_on_document_created` directly inside `page_element`'s `on_ready`
