@@ -26,6 +26,9 @@ pub trait RenderEngine {
 pub struct AssertSend<T>(pub T);
 unsafe impl<T> Send for AssertSend<T> {}
 
+mod scripts;
+pub use scripts::{CONSOLE_CAPTURE_SCRIPT, FILL_LOGIN_SCRIPT};
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]

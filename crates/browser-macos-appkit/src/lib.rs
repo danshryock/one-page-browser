@@ -367,6 +367,16 @@ struct AppState {
     /// `"default"`) — kept so the settings overlay's Save action re-saves to
     /// the same place `Settings::load`/`Keybindings::load` read from.
     profile: Profile,
+    /// Set for the duration of `open_start_page_or_restored_session`'s
+    /// restore loop — `save_session` no-ops while this is set. Unlike
+    /// `browser-linux-gtk3` (whose equivalent flag exists to prevent real
+    /// data loss — see that crate's own doc comment), this platform's
+    /// restore loop calls `add_page` eagerly for every restored URL, so
+    /// every intermediate `set_active` call during it already produces a
+    /// correct (if partial-so-far) session and the final explicit
+    /// `set_active` call still ends up saving the right complete one
+    /// regardless; this just avoids the redundant disk churn.
+    restoring: Cell<bool>,
 }
 
 impl AppState {
@@ -1569,6 +1579,15 @@ impl AppState {
                 if app.core.borrow().active_id() == id_for_title {
                     app.refresh_title_label();
                 }
+                // A title arrives asynchronously, well after `add_page`'s
+                // own sync already ran with an empty placeholder — confirmed
+                // directly (real hardware): without this, a freshly restored
+                // or opened page's title stayed "" in the saved session
+                // indefinitely, until some *other* open/close/switch event
+                // happened to sync it. `save_session` itself no-ops while
+                // `restoring`, so this is safe to call unconditionally even
+                // for a title arriving mid-restore.
+                app.save_session();
             },
             move |_new_window_url, target_configuration| {
                 let app = self_for_new_window.upgrade()?;
@@ -1623,6 +1642,15 @@ impl AppState {
                 if app.core.borrow().active_id() == id_for_title {
                     app.refresh_title_label();
                 }
+                // A title arrives asynchronously, well after `add_page`'s
+                // own sync already ran with an empty placeholder — confirmed
+                // directly (real hardware): without this, a freshly restored
+                // or opened page's title stayed "" in the saved session
+                // indefinitely, until some *other* open/close/switch event
+                // happened to sync it. `save_session` itself no-ops while
+                // `restoring`, so this is safe to call unconditionally even
+                // for a title arriving mid-restore.
+                app.save_session();
             },
             move |_new_window_url, target_configuration| {
                 let app = self_for_new_window.upgrade()?;
@@ -1636,6 +1664,9 @@ impl AppState {
         let evicted = self.core.borrow_mut().insert_background(id.clone(), engine, title);
         self.unload_engines(&evicted);
         self.containers.borrow_mut().insert(id.clone(), container);
+        // A background tab never calls `set_active`, which is where every
+        // other "opened" case's sync happens — needs its own call here.
+        self.save_session();
         Ok(raw_webview)
     }
 
@@ -1698,6 +1729,15 @@ impl AppState {
                 if app.core.borrow().active_id() == id_for_title {
                     app.refresh_title_label();
                 }
+                // A title arrives asynchronously, well after `add_page`'s
+                // own sync already ran with an empty placeholder — confirmed
+                // directly (real hardware): without this, a freshly restored
+                // or opened page's title stayed "" in the saved session
+                // indefinitely, until some *other* open/close/switch event
+                // happened to sync it. `save_session` itself no-ops while
+                // `restoring`, so this is safe to call unconditionally even
+                // for a title arriving mid-restore.
+                app.save_session();
             },
             move |_new_window_url, target_configuration| {
                 let app = self_for_new_window.upgrade()?;
@@ -1721,6 +1761,7 @@ impl AppState {
     fn open_start_page_or_restored_session(self: &Rc<Self>, start_page: &str) {
         let session = Session::load(&self.profile);
         let plan = browser_chrome_core::resolve_restore_plan(&session, start_page);
+        self.restoring.set(true);
         for url in &plan.urls {
             if let Err(err) = self.add_page(url) {
                 eprintln!("failed to open restored page {url:?}: {err}");
@@ -1737,6 +1778,8 @@ impl AppState {
         if let Some(id) = active_page_id {
             self.set_active(&id);
         }
+        self.restoring.set(false);
+        self.save_session();
     }
 
     /// Snapshots the currently-open pages (URL + title, in `PageManager`'s
@@ -1750,12 +1793,19 @@ impl AppState {
         Session { pages, active_index }
     }
 
-    /// The real "the whole app is closing" hook's save half — called from
-    /// `windowWillClose:` (both the red-traffic-light button and
-    /// `Action::Quit`'s `self.window.close()` route through it, since
-    /// closing the window is what triggers that delegate method) before
-    /// `NSApplication::terminate` actually exits the process.
+    /// Called continuously (`add_page`/`add_page_related`/`close_page`/
+    /// `set_active`), not just from `windowWillClose:` — the session on
+    /// disk is meant to always already reflect current state rather than
+    /// rely on a single "serialize on the way out" hook, matching
+    /// `browser-linux-gtk3`'s identical change (see that crate's own
+    /// `save_session` doc comment for the motivating gap this closes on
+    /// `browser-windows-reactor`). No-ops during
+    /// `open_start_page_or_restored_session`'s restore loop — see
+    /// `restoring`'s own doc comment for why.
     fn save_session(&self) {
+        if self.restoring.get() {
+            return;
+        }
         let session = self.build_session();
         if let Err(err) = session.save(&self.profile) {
             eprintln!("failed to save session: {err}");
@@ -1797,6 +1847,10 @@ impl AppState {
         self.refresh_title_label();
         self.refresh_bookmark_toggle_button();
         self.relayout();
+        // Covers both "switched to" (direct callers) and "opened" (`add_page`
+        // always calls this for the page it just created) — see
+        // `save_session`'s own doc comment.
+        self.save_session();
     }
 
     fn close_page(self: &Rc<Self>, id: &str) {
@@ -1818,6 +1872,10 @@ impl AppState {
             }
         }
         self.rebuild_switcher_rows();
+        // Redundant (already harmless/idempotent) when `was_active` synced
+        // via `set_active`/`add_page` above — needed for the non-active
+        // "closed a background tab" case, which neither of those cover.
+        self.save_session();
     }
 
     /// Enter in the address bar: navigates the active page, unless the
@@ -3541,6 +3599,7 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
         encrypted_checkbox,
         history,
         profile,
+        restoring: Cell::new(false),
     });
     delegate.ivars().state.replace(Some(Rc::clone(&state)));
     state.apply_theme();

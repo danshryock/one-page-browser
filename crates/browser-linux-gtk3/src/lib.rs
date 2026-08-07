@@ -217,6 +217,15 @@ pub struct AppState {
     /// re-save to the same place `Settings::load` read from, without
     /// re-parsing `std::env::args()`.
     profile: Profile,
+    /// Set for the duration of `open_start_page_or_restored_session`'s
+    /// restore loop — `save_session` no-ops while this is set, so restoring
+    /// several saved pages (only the active one gets a real `add_page`, see
+    /// that method's own doc comment; every other one is registered via
+    /// `add_unloaded_page`, which never triggers a save on its own) can't
+    /// have the *first* page's `add_page`/`set_active` call overwrite the
+    /// just-loaded, complete session on disk with a partial one-page
+    /// version before the loop even finishes registering the rest.
+    restoring: Cell<bool>,
 }
 
 impl AppState {
@@ -311,6 +320,16 @@ impl AppState {
                     if app.core.borrow().active_id() == id_for_cb {
                         app.refresh_title_label();
                     }
+                    // A title arrives asynchronously, well after `add_page`'s
+                    // own sync already ran with an empty placeholder —
+                    // confirmed directly on macOS (same shape of bug):
+                    // without this, a freshly restored or opened page's
+                    // title stayed "" in the saved session indefinitely,
+                    // until some *other* open/close/switch event happened
+                    // to sync it. `save_session` itself no-ops while
+                    // `restoring`, so this is safe to call unconditionally
+                    // even for a title arriving mid-restore.
+                    app.save_session();
                 }
             },
             move |playing| {
@@ -379,6 +398,16 @@ impl AppState {
                     if app.core.borrow().active_id() == id_for_cb {
                         app.refresh_title_label();
                     }
+                    // A title arrives asynchronously, well after `add_page`'s
+                    // own sync already ran with an empty placeholder —
+                    // confirmed directly on macOS (same shape of bug):
+                    // without this, a freshly restored or opened page's
+                    // title stayed "" in the saved session indefinitely,
+                    // until some *other* open/close/switch event happened
+                    // to sync it. `save_session` itself no-ops while
+                    // `restoring`, so this is safe to call unconditionally
+                    // even for a title arriving mid-restore.
+                    app.save_session();
                 }
             },
             move |playing| {
@@ -404,6 +433,10 @@ impl AppState {
         let evicted = self.core.borrow_mut().insert_background(id.clone(), engine, title);
         self.unload_engines(&evicted);
         self.rebuild_switcher_grid();
+        // A background tab (`window.open()`/target="_blank") never calls
+        // `set_active`, which is where every other "opened" case's sync
+        // happens — needs its own call here for the same reason.
+        self.save_session();
         Ok(widget)
     }
 
@@ -443,6 +476,7 @@ impl AppState {
         let plan = browser_chrome_core::resolve_restore_plan(&session, &start_page);
         let active_index = plan.active_index.unwrap_or(0);
 
+        self.restoring.set(true);
         for (idx, url) in plan.urls.iter().enumerate() {
             if idx == active_index {
                 if let Err(err) = self.add_page(url) {
@@ -453,6 +487,13 @@ impl AppState {
                 self.add_unloaded_page(url, title);
             }
         }
+        self.restoring.set(false);
+        // The active page's own `add_page` (above) ran while `restoring`
+        // was still set, so nothing has actually synced the freshly-built
+        // session yet — do that once now that every page (loaded and
+        // unloaded) is registered, rather than waiting for the next real
+        // open/close/switch.
+        self.save_session();
     }
 
     /// Snapshots the currently-open pages (URL + title, in `PageManager`'s
@@ -475,14 +516,29 @@ impl AppState {
         gtk::main_quit();
     }
 
-    /// The save half of `quit`, split out so tests can exercise a real
-    /// save-then-restore round trip without also calling `gtk::main_quit()`
-    /// — the shared GTK worker thread every test in this suite runs on
-    /// (see `gtk_tests.rs`'s module doc comment) never actually calls
+    /// Called continuously (`add_page`/`add_page_related`/`close_page`/
+    /// `set_active`) as well as from `quit` — the session on disk is meant
+    /// to always already reflect current state, not rely on a single
+    /// "serialize on the way out" hook (which — see
+    /// `browser-windows-reactor`'s own version of this method — is exactly
+    /// the kind of thing that can quietly go unreachable on one platform's
+    /// OS close button and nobody notices for a while). No-ops during
+    /// `open_start_page_or_restored_session`'s restore loop (`restoring`) —
+    /// see that field's own doc comment for why: the first restored page's
+    /// `add_page` would otherwise save a one-page session over the real,
+    /// complete one still being loaded.
+    ///
+    /// Split out from `quit` so tests can exercise a real save-then-restore
+    /// round trip without also calling `gtk::main_quit()` — the shared GTK
+    /// worker thread every test in this suite runs on (see
+    /// `gtk_tests.rs`'s module doc comment) never actually calls
     /// `gtk::main()` itself (each test's job runs directly, not inside a
     /// driven main loop), so quitting it for real isn't something a test
     /// should risk relying on being harmless.
     fn save_session(&self) {
+        if self.restoring.get() {
+            return;
+        }
         let session = self.build_session();
         if let Err(err) = session.save(&self.profile) {
             eprintln!("failed to save session: {err}");
@@ -595,6 +651,16 @@ impl AppState {
                     if app.core.borrow().active_id() == id_for_cb {
                         app.refresh_title_label();
                     }
+                    // A title arrives asynchronously, well after `add_page`'s
+                    // own sync already ran with an empty placeholder —
+                    // confirmed directly on macOS (same shape of bug):
+                    // without this, a freshly restored or opened page's
+                    // title stayed "" in the saved session indefinitely,
+                    // until some *other* open/close/switch event happened
+                    // to sync it. `save_session` itself no-ops while
+                    // `restoring`, so this is safe to call unconditionally
+                    // even for a title arriving mid-restore.
+                    app.save_session();
                 }
             },
             move |playing| {
@@ -630,6 +696,11 @@ impl AppState {
         self.stack.set_visible_child_name(id);
         self.refresh_title_label();
         self.refresh_bookmark_toggle_button();
+        // Covers both "switched to" (direct callers) and "opened" (`add_page`
+        // always calls this for the page it just created) — see
+        // `save_session`'s own doc comment for why this isn't just a
+        // quit-time hook anymore.
+        self.save_session();
     }
 
     /// Shared by `open_switcher`/`open_switcher_editing_url`: everything
@@ -2103,6 +2174,10 @@ impl AppState {
             }
         }
         self.rebuild_switcher_grid();
+        // Redundant (already harmless/idempotent) when `was_active` synced
+        // via `set_active`/`add_page` above — needed for the non-active
+        // "closed a background tab" case, which neither of those cover.
+        self.save_session();
     }
 
     /// Rebuilds every tile from scratch, sourcing the row list itself from
@@ -3443,6 +3518,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         settings: RefCell::new(settings),
         history,
         profile,
+        restoring: Cell::new(false),
     });
     app.apply_theme();
 

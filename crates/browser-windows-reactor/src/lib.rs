@@ -142,6 +142,7 @@ use browser_core::{
     PageManager, Profile, Session, SessionPage, Settings, APP_TITLE, HOME_URL,
 };
 use engine::ReactorWebViewEngine;
+use render_engine::CONSOLE_CAPTURE_SCRIPT;
 use windows_reactor::*;
 use windows_webview::{webview, Deferral, NewWindowRequestedArgs, WebMessageReceivedArgs, WebView};
 
@@ -198,6 +199,15 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     let (active_id, set_active_id) = cx.use_state(String::new());
     let active_id_ref = cx.use_ref(active_id.clone());
     *active_id_ref.borrow_mut() = active_id.clone();
+    // Set for the duration of the bootstrap restore loop below —
+    // `save_session` no-ops while this is set, mirroring
+    // `browser-macos-appkit`'s identically-named field/reasoning: `do_add_page`
+    // makes each restored page active in turn (via `PageManager::insert`,
+    // which already sets `active_id` itself), so every intermediate
+    // `switch_to`/`add_page_and_switch` sync during the loop would already
+    // save a *correct* (if not-yet-final) session regardless — this just
+    // avoids the redundant disk churn while restoring several tabs.
+    let restoring: HookRef<bool> = cx.use_ref(false);
     // New-window requests (`window.open()`/`target="_blank"`) waiting on a
     // specific not-yet-ready page's own `WebView2` to finish constructing —
     // see `page_element`'s `on_ready` for both halves of this (inserting a
@@ -304,6 +314,8 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         let active_id_ref = active_id_ref.clone();
         let set_overlay = set_overlay.clone();
         let bump = bump.clone();
+        let shared = Rc::clone(shared);
+        let restoring = restoring.clone();
         move |id: String| {
             ensure_engine_loaded(&core, &id);
             core.borrow_mut().set_active(&id);
@@ -311,6 +323,7 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
             set_active_id.call(id.clone());
             set_overlay.call(Overlay::None);
             bump.invoke(());
+            save_session(&core, &shared.profile, &restoring);
         }
     });
 
@@ -327,6 +340,7 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         let session = Session::load(&shared.profile);
         let start_page = shared.settings.borrow().start_page.clone();
         let plan = browser_chrome_core::resolve_restore_plan(&session, &start_page);
+        *restoring.borrow_mut() = true;
         for url in &plan.urls {
             do_add_page(&core, url, &set_active_id, &active_id_ref);
         }
@@ -340,6 +354,8 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         if let Some(id) = active_page_id {
             switch_to.invoke(id);
         }
+        *restoring.borrow_mut() = false;
+        save_session(&core, &shared.profile, &restoring);
     }
 
     let add_page_and_switch: Callback<String> = Callback::new({
@@ -348,10 +364,13 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         let active_id_ref = active_id_ref.clone();
         let set_overlay = set_overlay.clone();
         let bump = bump.clone();
+        let shared = Rc::clone(shared);
+        let restoring = restoring.clone();
         move |url: String| {
             do_add_page(&core, &url, &set_active_id, &active_id_ref);
             set_overlay.call(Overlay::None);
             bump.invoke(());
+            save_session(&core, &shared.profile, &restoring);
         }
     });
 
@@ -361,6 +380,7 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         let switch_to = switch_to.clone();
         let add_page_and_switch = add_page_and_switch.clone();
         let bump = bump.clone();
+        let restoring = restoring.clone();
         move |id: String| {
             let was_active = core.borrow().active_id() == id;
             core.borrow_mut().remove(&id);
@@ -372,6 +392,11 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
                 }
             }
             bump.invoke(());
+            // Redundant (already harmless/idempotent) when `was_active`
+            // synced via `switch_to`/`add_page_and_switch` above — needed
+            // for the non-active "closed a background tab" case, which
+            // neither of those cover.
+            save_session(&core, &shared.profile, &restoring);
         }
     });
 
@@ -584,6 +609,7 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
         let open_profile = open_profile.clone();
         let switch_to = switch_to.clone();
         let shared = Rc::clone(shared);
+        let restoring = restoring.clone();
         move |action: Action| {
             trace(&format!("dispatch_action: fired for {action:?}"));
             use render_engine::RenderEngine;
@@ -637,17 +663,22 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
                 // `pub(crate)` — confirmed by direct compile error, not
                 // assumed — so unlike the other three front ends, this one
                 // has no way to trigger a real window close (or intercept
-                // one) from outside the crate at all. Saves synchronously
-                // and exits directly instead — mirrors `run_chooser`'s own
+                // one) from outside the crate at all: the *OS* close button
+                // (the window chrome's own X) has no save hook reachable
+                // from this crate either. That used to mean this Ctrl+Q path
+                // was the *only* place a session ever got saved on this
+                // front end (a real, honest gap — see git history/
+                // ROADMAP.md) — no longer true now that `save_session` runs
+                // continuously (`switch_to`/`add_page_and_switch`/
+                // `close_page`/a new background tab, see that function's own
+                // doc comment), so the file on disk is already correct
+                // regardless of how the window actually closes. This call
+                // is now just a final, redundant-but-harmless flush before
+                // exiting synchronously — mirrors `run_chooser`'s own
                 // `std::process::exit(0)` elsewhere in this crate for the
-                // same "no other way to end this process" reason. One real,
-                // honest gap versus the other three front ends: the *OS*
-                // close button (the window chrome's own X) has no save hook
-                // reachable from this crate either, so only this Ctrl+Q
-                // path actually saves a session on this front end — see
-                // ROADMAP.md.
+                // same "no other way to end this process" reason.
                 Action::Quit => {
-                    save_session(&core, &shared.profile);
+                    save_session(&core, &shared.profile, &restoring);
                     std::process::exit(0);
                 }
                 Action::ToggleBookmark
@@ -764,7 +795,7 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     for id in &page_ids {
         if core.borrow().is_page_loaded(id) {
             let is_active = *id == active_id;
-            page_elements.push(page_element(id.clone(), &core, &shared, &active_id_ref, &bump, &pending_new_windows, is_active));
+            page_elements.push(page_element(id.clone(), &core, &shared, &active_id_ref, &bump, &pending_new_windows, &restoring, is_active));
         }
     }
     let content = grid(page_elements);
@@ -854,10 +885,23 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
 }
 
 /// Snapshots the currently-open pages (URL + title, in `PageManager`'s own
-/// creation order) plus which one is active, and saves it — called from
-/// `Action::Quit`'s dispatch arm (see its own comment for why that's the
-/// *only* save point on this front end, unlike the other three).
-fn save_session(core: &HookRef<PageManager<ReactorWebViewEngine>>, profile: &Profile) {
+/// creation order) plus which one is active, and saves it — called
+/// continuously (`switch_to`/`add_page_and_switch`/`close_page`/a new
+/// background tab), not just from `Action::Quit`'s dispatch arm anymore.
+/// This closes a real, previously-documented gap on this front end
+/// specifically: the *OS* close button's X has no save hook reachable from
+/// this crate at all (see `Action::Quit`'s own comment, still accurate —
+/// Ctrl+Q is still the only real "app is closing" hook here), so before
+/// this change, closing the window any other way lost whatever changed
+/// since the last Ctrl+Q. Continuous sync means the file on disk is never
+/// more than one page-lifecycle event stale, so that gap stops mattering:
+/// there's no longer a single "serialize on the way out" moment the rest of
+/// this depends on. No-ops while `restoring` is set — see its own doc
+/// comment.
+fn save_session(core: &HookRef<PageManager<ReactorWebViewEngine>>, profile: &Profile, restoring: &HookRef<bool>) {
+    if *restoring.borrow() {
+        return;
+    }
     let core = core.borrow();
     let active_id = core.active_id();
     let active_index = core.pages().iter().position(|p| p.id == active_id);
@@ -960,46 +1004,6 @@ fn ensure_engine_loaded(core: &HookRef<PageManager<ReactorWebViewEngine>>, id: &
     }
 }
 
-/// Overrides `console.log` to relay every call through
-/// `window.chrome.webview.postMessage`, captured below via
-/// `on_web_message_received` and printed to stdout — the same shim
-/// (byte-identical) as `render_engine::linux`/`macos`'s constant of the same
-/// name, letting `web-standards-tests/`'s external driver read a fixture
-/// page's own plain `console.log` output from this app's piped stdout,
-/// without any test-only Rust logic on this side. Always injected,
-/// production and test alike, same reasoning as `render_engine`'s copies:
-/// cheap, harmless, and a real incidental debugging benefit (page
-/// `console.log` becomes visible in the terminal during normal development).
-///
-/// Also reports where a fixture's `data-test-target="<name>"` elements are
-/// on screen, via the same relayed `console.log` — `__test_target__ <name>
-/// <rect-json>` — once the page finishes loading; see
-/// `render_engine::linux`'s identical constant for the full rationale (the
-/// external driver has no way to run arbitrary script against the page and
-/// get a structured answer back, but already reads this same relay off
-/// stdout for the test's real assertion).
-const CONSOLE_CAPTURE_SCRIPT: &str = r#"
-(function () {
-  var send = window.chrome && window.chrome.webview
-    ? function (m) { window.chrome.webview.postMessage(m); }
-    : window.ipc ? function (m) { window.ipc.postMessage(m); } : null;
-  if (!send) return;
-  var original = console.log;
-  console.log = function () {
-    original.apply(console, arguments);
-    try { send(Array.prototype.map.call(arguments, String).join(' ')); } catch (e) {}
-  };
-  window.addEventListener('load', function () {
-    var targets = document.querySelectorAll('[data-test-target]');
-    for (var i = 0; i < targets.length; i++) {
-      var el = targets[i];
-      var r = el.getBoundingClientRect();
-      console.log('__test_target__ ' + el.getAttribute('data-test-target') + ' ' + JSON.stringify({ x: r.x, y: r.y, width: r.width, height: r.height }));
-    }
-  });
-})();
-"#;
-
 /// Builds one page's always-mounted `webview(..)` element, filling in the
 /// same `Rc`s `core`'s `ReactorWebViewEngine` already owns for this page
 /// (see this module's doc comment) — `RenderEngine`'s methods and this
@@ -1011,6 +1015,7 @@ fn page_element(
     active_id_ref: &HookRef<String>,
     bump: &Callback<()>,
     pending_new_windows: &HookRef<HashMap<String, PendingNewWindow>>,
+    restoring: &HookRef<bool>,
     is_active: bool,
 ) -> Element {
     let Some((
@@ -1054,6 +1059,7 @@ fn page_element(
     let active_id_ref = active_id_ref.clone();
     let bump = bump.clone();
     let pending_new_windows = pending_new_windows.clone();
+    let restoring = restoring.clone();
     let id_for_ready = id.clone();
 
     let on_ready = move |ready: WebView| {
@@ -1082,6 +1088,7 @@ fn page_element(
         let active_id_ref = active_id_ref.clone();
         let bump = bump.clone();
         let pending_new_windows = pending_new_windows.clone();
+        let restoring = restoring.clone();
         let id_for_ready = id_for_ready.clone();
         let start_url = start_url.clone();
         xaml_interop::defer_to_next_tick(move || {
@@ -1173,11 +1180,24 @@ fn page_element(
             let active_id_ref = active_id_ref.clone();
             let id = id_for_ready.clone();
             let title_cell = Rc::clone(&title_cell);
+            let core = core.clone();
+            let shared = Rc::clone(&shared);
+            let restoring = restoring.clone();
             move |new_title: String| {
                 *title_cell.borrow_mut() = new_title;
                 if *active_id_ref.borrow() == id {
                     bump.invoke(());
                 }
+                // A title arrives asynchronously, well after
+                // `add_page_and_switch`'s own sync already ran with an
+                // empty placeholder — confirmed directly on macOS (same
+                // shape of bug there): without this, a freshly restored or
+                // opened page's title stayed "" in the saved session
+                // indefinitely, until some *other* open/close/switch event
+                // happened to sync it. `save_session` itself no-ops while
+                // `restoring`, so this is safe to call unconditionally even
+                // for a title arriving mid-restore.
+                save_session(&core, &shared.profile, &restoring);
             }
         };
         if let Ok(registration) = ready.on_document_title_changed(title_changed) {
@@ -1208,12 +1228,18 @@ fn page_element(
             let core = core.clone();
             let bump = bump.clone();
             let pending_new_windows = pending_new_windows.clone();
+            let shared = Rc::clone(&shared);
+            let restoring = restoring.clone();
             move |args: NewWindowRequestedArgs| {
                 let _ = args.set_handled(true);
                 if args.is_user_initiated() {
                     if let Ok(deferral) = args.defer() {
                         let new_id = do_add_page_pending_new_window(&core, &bump);
                         pending_new_windows.borrow_mut().insert(new_id, PendingNewWindow { args, deferral });
+                        // A background tab never goes through `switch_to`/
+                        // `add_page_and_switch`, where every other "opened"
+                        // case's sync happens — needs its own call here.
+                        save_session(&core, &shared.profile, &restoring);
                     }
                 }
             }

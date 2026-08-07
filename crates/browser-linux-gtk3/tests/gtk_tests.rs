@@ -385,8 +385,8 @@ fn add_page_related_opens_without_switching_away() {
         app.open_switcher();
         assert_eq!(
             app.switcher_grid_tile_count(),
-            3,
-            "the related page should still get a switcher tile (2 open pages + the always-present Add tile)"
+            4,
+            "the related page should still get a switcher tile (an \"Open Pages\" header + 2 open pages + the always-present Add tile)"
         );
 
         cleanup_test_profile(&profile);

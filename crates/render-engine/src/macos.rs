@@ -6,7 +6,7 @@ use objc2_web_kit::{WKWebView, WKWebViewConfiguration};
 use wry::raw_window_handle::{AppKitWindowHandle, HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
 use wry::{NewWindowResponse, Rect, WebContext, WebView, WebViewBuilder, WebViewBuilderExtMacos, WebViewExtMacOS};
 
-use crate::RenderEngine;
+use crate::{RenderEngine, CONSOLE_CAPTURE_SCRIPT, FILL_LOGIN_SCRIPT};
 
 /// Thin `HasWindowHandle` wrapper around a raw `NSView` pointer. Needed
 /// because we create the window/view hierarchy directly via AppKit (no
@@ -20,41 +20,6 @@ impl HasWindowHandle for NsViewHandle {
         Ok(unsafe { WindowHandle::borrow_raw(raw) })
     }
 }
-
-/// Overrides `console.log` to relay every call through `wry`'s IPC channel
-/// (`window.ipc.postMessage`) in addition to its normal behavior — see
-/// `WryEngine::new`'s `on_console_message` doc comment for why. Byte-identical
-/// copy of `render_engine::linux`'s constant of the same name (two separate
-/// compilation units, same reasoning `FILL_LOGIN_SCRIPT` is already
-/// duplicated between this file and `linux.rs` rather than shared).
-///
-/// Also reports where a fixture's `data-test-target="<name>"` elements are
-/// on screen, via the *same* relayed `console.log` — `__test_target__ <name>
-/// <rect-json>` — once the page finishes loading; see `render_engine::linux`'s
-/// identical constant for the full rationale (an external driver process has
-/// no way to run arbitrary script against the page and get an answer back,
-/// but already reads this same relay for the test's real assertion).
-const CONSOLE_CAPTURE_SCRIPT: &str = r#"
-(function () {
-  var send = window.chrome && window.chrome.webview
-    ? function (m) { window.chrome.webview.postMessage(m); }
-    : window.ipc ? function (m) { window.ipc.postMessage(m); } : null;
-  if (!send) return;
-  var original = console.log;
-  console.log = function () {
-    original.apply(console, arguments);
-    try { send(Array.prototype.map.call(arguments, String).join(' ')); } catch (e) {}
-  };
-  window.addEventListener('load', function () {
-    var targets = document.querySelectorAll('[data-test-target]');
-    for (var i = 0; i < targets.length; i++) {
-      var el = targets[i];
-      var r = el.getBoundingClientRect();
-      console.log('__test_target__ ' + el.getAttribute('data-test-target') + ' ' + JSON.stringify({ x: r.x, y: r.y, width: r.width, height: r.height }));
-    }
-  });
-})();
-"#;
 
 pub struct WryEngine {
     webview: WebView,
@@ -202,52 +167,6 @@ impl WryEngine {
         Ok(())
     }
 }
-
-/// Finds the password field (preferring `autocomplete="current-password"`,
-/// falling back to the page's first `input[type="password"]`) and, if a
-/// non-empty username was given, the identifier field (preferring
-/// `autocomplete="username"`/`"email"`, falling back to positional
-/// proximity) — see `render_engine::linux`'s identical constant for the
-/// full rationale (same script, kept as a separate copy since these are two
-/// separate files, not a shared module, mirroring how `go_back`/
-/// `go_forward`/etc. are already duplicated between them rather than
-/// factored out).
-const FILL_LOGIN_SCRIPT: &str = r#"
-(function () {
-  var password = document.querySelector('input[autocomplete="current-password"]') ||
-                  document.querySelector('input[type="password"]');
-  if (!password) return;
-
-  function setNativeValue(el, value) {
-    var proto = Object.getPrototypeOf(el);
-    var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-    setter.call(el, value);
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-  }
-
-  var username = "__USERNAME__";
-  if (username.length > 0) {
-    var form = password.closest('form');
-    var scope = form || document;
-    var usernameField = scope.querySelector('input[autocomplete="username"], input[autocomplete="email"]');
-    if (!usernameField) {
-      var candidates = scope.querySelectorAll('input');
-      for (var i = 0; i < candidates.length; i++) {
-        var el = candidates[i];
-        if (el === password) break;
-        var type = (el.getAttribute('type') || 'text').toLowerCase();
-        if (type === 'text' || type === 'email' || type === 'tel') {
-          usernameField = el;
-        }
-      }
-    }
-    if (usernameField) setNativeValue(usernameField, username);
-  }
-
-  setNativeValue(password, "__PASSWORD__");
-})();
-"#;
 
 impl RenderEngine for WryEngine {
     fn navigate(&self, url: &str) -> anyhow::Result<()> {
