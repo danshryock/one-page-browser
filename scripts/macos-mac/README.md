@@ -114,18 +114,31 @@ runs the driver — faster for a quick pass/fail check.
 | `bootstrap.sh` | Idempotent: SSH reachability, real-console-session check, macOS version/arch, remote dir setup. |
 | `build-and-test.sh` | The main orchestrator — see above. |
 
-## Also covered in CI
+## Why this can't just run in CI instead
 
-The same driver + fixtures also run on GitHub's real `macos-13` (Intel,
-matching this same `x86_64-apple-darwin` target) and `macos-14` (Apple
-Silicon) Actions runners — see `.github/workflows/macos.yml`'s
-`web-standards-macos` job. That path needs none of this directory (GitHub's
-runners come pre-logged-into a real console session), but running the exact
-same driver+fixtures against a genuinely different piece of hardware here is
-still worth doing: real hardware, real display geometry, real timing, and
-the only way to validate `web-standards-tests/src/bin/macos_driver.rs`'s
-`content_area_origin()` calibration is against something CI itself can't
-promise stays identical to your laptop's actual window chrome.
+`.github/workflows/macos.yml`'s `web-standards-macos` job builds
+`browser-macos-appkit` and `web-standards-driver-macos` on GitHub's real
+`macos-13`/`macos-14` Actions runners, but only compile-checks them — it
+does **not** run the actual click-driven test there. The driver's synthetic
+clicks (`CGEvent`, posted to the HID event system) need a one-time
+Accessibility/Input Monitoring permission grant, and GitHub's runners are
+fully ephemeral: a fresh VM every run, with a freshly built (different hash
+every time) binary that's never had a chance to be granted anything, and no
+GUI session to click "Allow" through even once.
+
+This was tested, not assumed: three separate attempts to pre-authorize it
+via a direct SQLite write to `TCC.db` (confirmed `SIP` is actually
+*disabled* on these runners, and every write reported success) all failed
+identically — mid-run screenshots showed the app launching and rendering a
+real window fine, but never responding to a single synthetic keystroke
+across any attempt. Apple has evidently hardened TCC.db against exactly
+this class of bypass beyond SIP alone (see `.github/workflows/macos.yml`'s
+git history for the full investigation, including the screenshots).
+
+A real Mac with a real, persistently-logged-in console session — this
+directory — is the actual answer: the permission grant happens once,
+physically, and then persists across every future SSH-driven run, unlike a
+runner that never remembers anything between jobs.
 
 ## Known limitations
 

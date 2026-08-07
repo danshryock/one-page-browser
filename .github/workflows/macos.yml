@@ -134,7 +134,7 @@ jobs:
           if-no-files-found: ignore
 
   web-standards-macos:
-    name: web-standards-tests (native macOS, ${{ matrix.arch }})
+    name: Build web-standards-driver-macos (native macOS, ${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
@@ -152,117 +152,22 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Compile-check only — this crate's actual click-driven test flow
+      # (CGEvent-based synthetic input, driving the real app through
+      # actions.json/__test_target__) needs Accessibility/Input Monitoring
+      # TCC approval for the binary posting the events, which a fully
+      # ephemeral runner + a freshly built (different hash every run)
+      # binary has no way to ever be granted: there's no GUI session here
+      # to click "Allow" through, and three separate direct-SQLite-write-to-
+      # TCC.db workarounds all failed identically despite SIP being
+      # disabled on these runners and every write reporting success —
+      # confirmed via mid-run screenshots showing the app launches and
+      # renders fine but never responds to a single synthetic keystroke,
+      # across every attempt (see this job's git history for the full
+      # investigation). Real click-driven verification instead runs against
+      # a real Mac over SSH — see scripts/macos-mac/README.md — where the
+      # permission grant is a one-time, physical, persistent click.
       - name: Build browser-macos-appkit + web-standards-driver-macos
         run: |
           cargo build --target ${{ matrix.target }} -p browser-macos-appkit --verbose
           cargo build --target ${{ matrix.target }} -p web-standards-tests --bin web-standards-driver-macos --verbose
-
-      # Native execution, no cross-compile-and-hope and (unlike
-      # scripts/macos-mac/, the Linux-dev-machine -> real-laptop pipeline —
-      # see its own README.md) no SSH round-trip either: this runner already
-      # has a real, logged-in console/WindowServer session, which is what
-      # both the app's own window and the driver's synthetic `CGEvent`
-      # clicks need to work at all. This is the same actions.json/
-      # __test_target__-driven suite `browser-linux-gtk3`'s in-process test
-      # and `windows_driver.rs` both run — see `web-standards-tests/`'s own
-      # doc comments for the full design.
-      # Experimental, best-effort, allowed to fail: the first real run of
-      # this job showed (via mid-run screenshots) that the app launches and
-      # renders fine but every synthetic CGEvent the driver posts is a
-      # total no-op — the window never responds to any keystroke. The
-      # leading suspect is Accessibility/Input Monitoring TCC approval,
-      # which a fresh, ephemeral runner + a freshly built (different hash
-      # every run) binary has had no chance to ever be granted, and there's
-      # no GUI session here to click "Allow" through even once. This tries
-      # the classic direct-SQLite-write-to-TCC.db workaround some CI setups
-      # use — SIP protects both the system and per-user TCC.db on modern
-      # macOS specifically to close this off, so this may just fail
-      # cleanly, which is itself a useful, conclusive answer. Left in
-      # (rather than reverted) until that answer is confirmed either way.
-      - name: Attempt to pre-authorize Accessibility for the driver (experimental)
-        run: |
-          echo "SIP status:"
-          csrutil status || true
-          echo "macOS version:"
-          sw_vers
-          driver_path="$(pwd)/target/${{ matrix.target }}/debug/web-standards-driver-macos"
-          echo "granting Accessibility to: $driver_path"
-          tcc_db="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
-          echo "user TCC.db path: $tcc_db"
-          if [ -f "$tcc_db" ]; then
-            echo "-- existing access table schema --"
-            sqlite3 "$tcc_db" ".schema access" || echo "(couldn't read schema)"
-          else
-            echo "user TCC.db doesn't exist yet"
-          fi
-          # Granting both Accessibility and Input Monitoring (posting HID
-          # keyboard/mouse events can be gated by either depending on macOS
-          # version) to both binaries (driver does the posting, but the app
-          # is what CGEvent-based clicks ultimately need to land on).
-          for service in kTCCServiceAccessibility kTCCServiceListenEvent; do
-            for bin_path in "$driver_path" "$(pwd)/target/${{ matrix.target }}/debug/browser-macos-appkit"; do
-              if sudo sqlite3 "$tcc_db" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('$service', '$bin_path', 1, 2, 2, 1)"; then
-                echo "TCC.db write SUCCEEDED: $service -> $bin_path"
-              else
-                echo "TCC.db write FAILED: $service -> $bin_path (see error above)"
-              fi
-            done
-          done
-
-          # A first attempt (same INSERT, no restart) already showed the
-          # write itself succeeds silently but has no functional effect —
-          # tccd caches authorization state in memory and doesn't
-          # necessarily reload it just because the underlying file changed.
-          # Killing it (a keepalive launchd job, both the per-user agent and
-          # the system daemon match this name) forces a respawn that reads
-          # the file fresh.
-          echo "restarting tccd to force it to reload from disk..."
-          sudo pkill -x tccd || true
-          sleep 3
-          echo "tccd processes now running:"
-          pgrep -fl tccd || echo "(none found — may still be respawning)"
-
-      - name: Run web-standards-driver-macos
-        run: |
-          set -euo pipefail
-          app="target/${{ matrix.target }}/debug/browser-macos-appkit"
-          driver="target/${{ matrix.target }}/debug/web-standards-driver-macos"
-          for bin in "$app" "$driver"; do
-            if [ ! -x "$bin" ]; then
-              echo "$bin not found after build" >&2
-              exit 1
-            fi
-          done
-
-          # Background screenshots taken *during* the run, in this same
-          # step/shell so they're guaranteed to actually fire while the
-          # driver is mid-flight rather than risk being reaped between
-          # steps. See this job's earlier comment history for why: the
-          # first real run failed with no __test_target__ report ever
-          # arriving and the app process never exiting either, and the
-          # leading suspect is CGEvent-based synthetic input silently
-          # no-opping on a fresh runner (no error return to signal a TCC
-          # block) — these screenshots directly show whether the
-          # switcher/keystrokes visibly did anything at all.
-          mkdir -p mid-run-screenshots
-          (sleep 6 && screencapture -x mid-run-screenshots/t6.png) &
-          (sleep 10 && screencapture -x mid-run-screenshots/t10.png) &
-          (sleep 16 && screencapture -x mid-run-screenshots/t16.png) &
-
-          "$driver" "$app" web-standards-tests/fixtures 2>&1 | tee web-standards-macos-${{ matrix.arch }}.log
-
-      - name: Upload log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: web-standards-macos-log-${{ matrix.arch }}
-          path: web-standards-macos-${{ matrix.arch }}.log
-          if-no-files-found: ignore
-
-      - name: Upload mid-run screenshots (diagnostic)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: web-standards-macos-mid-run-screenshots-${{ matrix.arch }}
-          path: mid-run-screenshots/
-          if-no-files-found: ignore
