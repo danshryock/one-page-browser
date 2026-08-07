@@ -9,12 +9,22 @@
 //! Real, honest caveat, same as every other macOS deliverable in this
 //! codebase: this only ever gets *cross-compile-verified* from this Linux
 //! dev machine (`.cargo/build-macos-appkit.sh`) — nobody has run it against
-//! a real window on real hardware. In particular, `content_click_point`'s
+//! a real window on real hardware. In particular, `content_area_origin`'s
 //! hardcoded window-bounds guess (see its own doc comment) is the one piece
 //! here most likely to need real-hardware calibration, the same way
 //! `windows_driver.rs`'s `switcher_button_pos`/`search_box_pos` needed a
 //! real VM screenshot session to get right rather than being guessed
 //! correctly on the first try.
+//!
+//! Per-fixture interactions come from `fixtures_root/<case>/actions.json`
+//! (currently just `{"action": "click", "target": "<name>"}` steps), and a
+//! `click` step's on-screen point is resolved via the same
+//! `__test_target__` console-log mechanism `windows_driver.rs` and
+//! `browser-linux-gtk3`'s in-process test both use — see `windows_driver.rs`'s
+//! top-of-file doc comment for the full rationale (no separate RPC channel
+//! into the app exists, so this rides the same stdout relay already read for
+//! the real assertion). Those `__test_target__` lines are filtered out
+//! before comparing captured output against `expected.txt`.
 //!
 //! Usage: `web-standards-driver-macos <app path> <fixtures root>`
 
@@ -118,9 +128,10 @@ mod macos_impl {
         let case_dir = Path::new(fixtures_root).join(case);
         let expected = std::fs::read_to_string(case_dir.join("expected.txt"))?;
         let index_url = format!("file://{}", case_dir.join("index.html").to_string_lossy());
+        let steps = read_actions(&case_dir)?;
 
         let mut child = Command::new(app_exe).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
-        let result = drive_and_capture(&mut child, &index_url, &expected);
+        let result = drive_and_capture(&mut child, &index_url, &steps, &expected);
         let _ = child.kill();
         let _ = child.wait();
         let actual = result?;
@@ -130,7 +141,28 @@ mod macos_impl {
         Ok(actual == expected)
     }
 
-    fn drive_and_capture(child: &mut Child, index_url: &str, expected: &str) -> anyhow::Result<String> {
+    /// One `{"action": "click", "target": "<name>"}` entry from a fixture's
+    /// `actions.json` — see this crate's top-of-file doc comment.
+    struct Step {
+        action: String,
+        target: String,
+    }
+
+    fn read_actions(case_dir: &Path) -> anyhow::Result<Vec<Step>> {
+        let text = std::fs::read_to_string(case_dir.join("actions.json"))?;
+        let parsed: serde_json::Value = serde_json::from_str(&text)?;
+        let steps = parsed["steps"].as_array().ok_or_else(|| anyhow::anyhow!("actions.json should have a \"steps\" array"))?;
+        steps
+            .iter()
+            .map(|step| {
+                let action = step["action"].as_str().ok_or_else(|| anyhow::anyhow!("actions.json step missing \"action\""))?;
+                let target = step["target"].as_str().ok_or_else(|| anyhow::anyhow!("actions.json step missing \"target\""))?;
+                Ok(Step { action: action.to_string(), target: target.to_string() })
+            })
+            .collect()
+    }
+
+    fn drive_and_capture(child: &mut Child, index_url: &str, steps: &[Step], expected: &str) -> anyhow::Result<String> {
         let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("child had no stdout"))?;
         let (tx, rx) = mpsc::channel::<String>();
         std::thread::spawn(move || {
@@ -166,30 +198,76 @@ mod macos_impl {
         send_key(KEYCODE_RETURN, CGEventFlags::empty());
         std::thread::sleep(NAVIGATION_SETTLE);
 
-        let (x, y) = content_click_point();
-        click_at(x, y);
+        let mut captured: Vec<String> = Vec::new();
+        for step in steps {
+            match step.action.as_str() {
+                "click" => {
+                    let (x, y) = resolve_target_point(&rx, &mut captured, &step.target)?;
+                    click_at(x, y);
+                }
+                other => anyhow::bail!("unknown actions.json action {other:?}"),
+            }
+        }
 
-        let mut collected = String::new();
         let deadline = Instant::now() + MESSAGE_WAIT;
         loop {
+            if real_assertion_lines(&captured) == expected {
+                break;
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
             match rx.recv_timeout(remaining) {
-                Ok(line) => {
-                    collected.push_str(&line);
-                    collected.push('\n');
-                    if collected == expected {
-                        break;
-                    }
-                }
+                Ok(line) => captured.push(line),
                 Err(_) => break,
             }
         }
-        Ok(collected)
+        Ok(real_assertion_lines(&captured))
     }
 
+    /// `captured`'s lines with any `__test_target__ ...` coordinate reports
+    /// filtered out, joined back into the same newline-terminated shape
+    /// `expected.txt` uses.
+    fn real_assertion_lines(captured: &[String]) -> String {
+        captured.iter().filter(|line| !line.starts_with("__test_target__ ")).flat_map(|line| [line.as_str(), "\n"]).collect()
+    }
+
+    /// Waits for a `__test_target__ <target> <rect-json>` line (already
+    /// received into `captured`, or arriving on `rx` before `MESSAGE_WAIT`
+    /// elapses) and resolves it to a real screen point: `content_area_origin`
+    /// plus the reported rect's center.
+    fn resolve_target_point(rx: &mpsc::Receiver<String>, captured: &mut Vec<String>, target: &str) -> anyhow::Result<(f64, f64)> {
+        let prefix = format!("__test_target__ {target} ");
+        let deadline = Instant::now() + MESSAGE_WAIT;
+        loop {
+            if let Some(rect_json) = captured.iter().find_map(|line| line.strip_prefix(prefix.as_str())) {
+                let parsed: serde_json::Value = serde_json::from_str(rect_json)?;
+                let rx_ = parsed["x"].as_f64().ok_or_else(|| anyhow::anyhow!("__test_target__ rect missing x"))?;
+                let ry_ = parsed["y"].as_f64().ok_or_else(|| anyhow::anyhow!("__test_target__ rect missing y"))?;
+                let rw = parsed["width"].as_f64().ok_or_else(|| anyhow::anyhow!("__test_target__ rect missing width"))?;
+                let rh = parsed["height"].as_f64().ok_or_else(|| anyhow::anyhow!("__test_target__ rect missing height"))?;
+                let (origin_x, origin_y) = content_area_origin();
+                return Ok((origin_x + rx_ + rw / 2.0, origin_y + ry_ + rh / 2.0));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("no __test_target__ report for {target:?} arrived within {MESSAGE_WAIT:?}");
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(line) => captured.push(line),
+                Err(_) => anyhow::bail!("child stdout ended before a __test_target__ report for {target:?} arrived"),
+            }
+        }
+    }
+
+    /// The app window's content area (below the toolbar strip) top-left
+    /// corner, in absolute screen coordinates — a `__test_target__` rect is
+    /// reported by the page in CSS/viewport coordinates
+    /// (`getBoundingClientRect()`, relative to the content area's own
+    /// top-left), so this is the offset needed to turn one into a real
+    /// screen point.
+    ///
     /// Real, honest limitation: unlike `windows_driver.rs`'s
     /// `switcher_button_pos`/`search_box_pos` (calibrated against an actual
     /// screenshot of a real running window in the Windows VM), there's no
@@ -197,15 +275,8 @@ mod macos_impl {
     /// to calibrate against — this is a plausible guess (a window opened
     /// near the top-left of a typical display, below the menu bar/title
     /// bar, sized similarly to `browser-windows-reactor`'s own observed
-    /// default window), not a verified one. The fixture's own link covers a
-    /// large fixed 4000x4000px area starting at the page's top-left (see
-    /// `web-standards-tests/fixtures/opener-default/index.html`'s doc
-    /// comment for why), so this only needs to land *somewhere* inside the
-    /// content area below the toolbar, not hit a precise target — but
-    /// "somewhere inside the content area" still depends on knowing
-    /// roughly where the window is, which is the part that needs real-
-    /// hardware verification to get right.
-    fn content_click_point() -> (f64, f64) {
+    /// default window), not a verified one.
+    fn content_area_origin() -> (f64, f64) {
         (300.0, 300.0)
     }
 

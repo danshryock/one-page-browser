@@ -5,16 +5,28 @@
 //! gtk_tests.rs`).
 //!
 //! Launches the real app (no `--url` — that routes through the profile
-//! chooser window on every platform, see each `main.rs` directly), opens
-//! the switcher via the default `Ctrl+T` (`browser_core::keybindings`'s
-//! `Action::OpenSwitcher` default binding), types a fixture's `file://`
-//! URL, presses Enter, sends one real `SendInput` click, and reads whatever
-//! the fixture page's own `console.log` output the app relays to stdout
-//! (via `browser_windows_reactor::CONSOLE_CAPTURE_SCRIPT`'s
+//! chooser window on every platform, see each `main.rs` directly), switches
+//! to a pre-seeded fixture page (see `drive_and_capture`'s doc comment for
+//! why an already-open page, not a fresh navigation), then drives whatever
+//! interactions `fixtures_root/<case>/actions.json` describes (currently
+//! just `{"action": "click", "target": "<name>"}` steps) before reading the
+//! fixture page's own `console.log` output the app relays to stdout (via
+//! `browser_windows_reactor::CONSOLE_CAPTURE_SCRIPT`'s
 //! `on_web_message_received` -> `println!` wiring — real, standard
 //! `console.log` content, no custom test-only line format) — diffed against
 //! `expected.txt`, same golden-file convention as `browser-linux-gtk3`'s
 //! test.
+//!
+//! A `click` step's on-screen target point comes from the same
+//! `__test_target__` mechanism `browser-linux-gtk3`'s in-process test uses:
+//! `CONSOLE_CAPTURE_SCRIPT` reports every `[data-test-target]` element's
+//! `getBoundingClientRect()` via `console.log('__test_target__ <name>
+//! <rect-json>')` on page load, riding the exact same stdout-relay channel
+//! already read for the real assertion — this driver has no separate RPC
+//! channel into the app to ask for element positions directly, so reusing
+//! the one channel that already exists end-to-end is the only option that
+//! doesn't require inventing a new one. Those `__test_target__` lines are
+//! filtered out before comparing captured output against `expected.txt`.
 //!
 //! Usage: `web-standards-driver-windows.exe <app.exe path> <fixtures root>`
 //! Runs every fixture case under `<fixtures root>` (each subdirectory with
@@ -173,9 +185,10 @@ mod windows_impl {
     fn run_case(app_exe: &str, fixtures_root: &str, case: &str) -> anyhow::Result<bool> {
         let case_dir = Path::new(fixtures_root).join(case);
         let expected = std::fs::read_to_string(case_dir.join("expected.txt"))?;
+        let steps = read_actions(&case_dir)?;
 
         let mut child = Command::new(app_exe).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
-        let result = drive_and_capture(&mut child, case, &expected);
+        let result = drive_and_capture(&mut child, case, &steps, &expected);
         let _ = child.kill();
         let _ = child.wait();
         let actual = result?;
@@ -183,6 +196,27 @@ mod windows_impl {
         println!("expected: {:?}", expected.trim_end());
         println!("actual:   {:?}", actual.trim_end());
         Ok(actual == expected)
+    }
+
+    /// One `{"action": "click", "target": "<name>"}` entry from a fixture's
+    /// `actions.json` — see this crate's top-of-file doc comment.
+    struct Step {
+        action: String,
+        target: String,
+    }
+
+    fn read_actions(case_dir: &Path) -> anyhow::Result<Vec<Step>> {
+        let text = std::fs::read_to_string(case_dir.join("actions.json"))?;
+        let parsed: serde_json::Value = serde_json::from_str(&text)?;
+        let steps = parsed["steps"].as_array().ok_or_else(|| anyhow::anyhow!("actions.json should have a \"steps\" array"))?;
+        steps
+            .iter()
+            .map(|step| {
+                let action = step["action"].as_str().ok_or_else(|| anyhow::anyhow!("actions.json step missing \"action\""))?;
+                let target = step["target"].as_str().ok_or_else(|| anyhow::anyhow!("actions.json step missing \"target\""))?;
+                Ok(Step { action: action.to_string(), target: target.to_string() })
+            })
+            .collect()
     }
 
     /// `case` (e.g. `"opener-default"`) is typed into the switcher's search
@@ -201,7 +235,7 @@ mod windows_impl {
     /// `scripts/windows-vm/build-and-test.sh`'s seeding step) — with each
     /// case open from the start, this only ever needs to *switch to* one,
     /// the mechanism that's actually reliable.
-    fn drive_and_capture(child: &mut Child, case: &str, expected: &str) -> anyhow::Result<String> {
+    fn drive_and_capture(child: &mut Child, case: &str, steps: &[Step], expected: &str) -> anyhow::Result<String> {
         let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("child had no stdout"))?;
         let (tx, rx) = mpsc::channel::<String>();
         std::thread::spawn(move || {
@@ -270,56 +304,90 @@ mod windows_impl {
         // documented note on `title_changed` ("doesn't reliably produce a
         // new render on its own... until some unrelated, genuinely
         // UI-thread-originated event... forced the next render, which then
-        // picked up the already-correct value"). Since the exact number of
-        // renders needed varies, this retries the whole
-        // nudge-then-click-content sequence a few times, each with its own
-        // short wait for the popup's console.log to arrive, rather than
-        // gambling everything on one fixed-timing attempt.
-        // Nudges once (see this block's earlier history for why: a real,
-        // pre-existing windows-reactor gap where a newly-activated page's
-        // XAML visibility toggle doesn't reliably apply on the render
-        // immediately after switching — matching this codebase's own
-        // documented note on `title_changed` needing "some unrelated,
-        // genuinely UI-thread-originated event" to force the next render).
-        // Deliberately only ONE click on the content area, not several:
-        // confirmed by direct testing that *re*-clicking while a popup from
-        // an earlier click in the same run is still being created interferes
-        // rather than helps (a second click can land on/close the very
-        // popup the first one just opened) — a single click, backed by a
-        // generous wait below for whatever render count it actually takes
-        // to settle, is more reliable than retrying the click itself.
+        // picked up the already-correct value"). Nudges once (clicking the
+        // switcher button open-then-shut again) before proceeding, the same
+        // workaround this block has always used.
         click_at(switcher_x, switcher_y);
         std::thread::sleep(Duration::from_millis(300));
         click_at(switcher_x, switcher_y);
         std::thread::sleep(Duration::from_millis(2000));
 
-        click_window_content(&rect);
-        println!("checkpoint: clicked content area");
+        let mut captured: Vec<String> = Vec::new();
+        for step in steps {
+            match step.action.as_str() {
+                "click" => {
+                    let (x, y) = resolve_target_point(&rx, &mut captured, &step.target, &rect)?;
+                    // Deliberately only one click per target, not several:
+                    // confirmed by direct testing that *re*-clicking while a
+                    // popup from an earlier click in the same run is still
+                    // being created interferes rather than helps (a second
+                    // click can land on/close the very popup the first one
+                    // just opened).
+                    click_at(x, y);
+                    println!("checkpoint: clicked {:?} at ({x}, {y})", step.target);
+                }
+                other => anyhow::bail!("{case}: unknown actions.json action {other:?}"),
+            }
+        }
         if let Ok(dir) = std::env::var("WEB_STANDARDS_DEBUG_SCREENSHOT_DIR") {
             std::thread::sleep(Duration::from_millis(300));
             let path = Path::new(&dir).join("after-click.bmp");
             let _ = save_window_screenshot(hwnd, &path);
         }
 
-        let mut collected = String::new();
         let deadline = Instant::now() + MESSAGE_WAIT;
         loop {
+            if real_assertion_lines(&captured) == expected {
+                break;
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
             match rx.recv_timeout(remaining) {
-                Ok(line) => {
-                    collected.push_str(&line);
-                    collected.push('\n');
-                    if collected == expected {
-                        break;
-                    }
-                }
+                Ok(line) => captured.push(line),
                 Err(_) => break,
             }
         }
-        Ok(collected)
+        Ok(real_assertion_lines(&captured))
+    }
+
+    /// `captured`'s lines with any `__test_target__ ...` coordinate reports
+    /// (see this file's top-of-file doc comment) filtered out, joined back
+    /// into the same newline-terminated shape `expected.txt` uses — the real
+    /// page console output a fixture's own assertion actually checks.
+    fn real_assertion_lines(captured: &[String]) -> String {
+        let joined: String = captured.iter().filter(|line| !line.starts_with("__test_target__ ")).flat_map(|line| [line.as_str(), "\n"]).collect();
+        joined
+    }
+
+    /// Waits for a `__test_target__ <target> <rect-json>` line (already
+    /// received into `captured`, or arriving on `rx` before `MESSAGE_WAIT`
+    /// elapses) and resolves it to a real screen point: the app window's
+    /// content-area origin (see `content_area_origin`) plus the reported
+    /// rect's center.
+    fn resolve_target_point(rx: &mpsc::Receiver<String>, captured: &mut Vec<String>, target: &str, rect: &RECT) -> anyhow::Result<(i32, i32)> {
+        let prefix = format!("__test_target__ {target} ");
+        let deadline = Instant::now() + MESSAGE_WAIT;
+        loop {
+            if let Some(rect_json) = captured.iter().find_map(|line| line.strip_prefix(prefix.as_str())) {
+                let parsed: serde_json::Value = serde_json::from_str(rect_json)?;
+                let rx_ = parsed["x"].as_f64().ok_or_else(|| anyhow::anyhow!("__test_target__ rect missing x"))?;
+                let ry_ = parsed["y"].as_f64().ok_or_else(|| anyhow::anyhow!("__test_target__ rect missing y"))?;
+                let rw = parsed["width"].as_f64().ok_or_else(|| anyhow::anyhow!("__test_target__ rect missing width"))?;
+                let rh = parsed["height"].as_f64().ok_or_else(|| anyhow::anyhow!("__test_target__ rect missing height"))?;
+                let (origin_x, origin_y) = content_area_origin(rect);
+                return Ok((origin_x + (rx_ + rw / 2.0) as i32, origin_y + (ry_ + rh / 2.0) as i32));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("no __test_target__ report for {target:?} arrived within {MESSAGE_WAIT:?}");
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(line) => captured.push(line),
+                Err(_) => anyhow::bail!("child stdout ended before a __test_target__ report for {target:?} arrived"),
+            }
+        }
     }
 
     fn wait_for_window(timeout: Duration) -> anyhow::Result<HWND> {
@@ -461,17 +529,16 @@ mod windows_impl {
         send_mouse_click();
     }
 
-    fn click_window_content(rect: &RECT) {
-        // Roughly centered, biased slightly down from the top so this never
-        // lands on the toolbar strip regardless of its exact height — the
-        // fixture's own link covers a large fixed pixel area (see
-        // `web-standards-tests/fixtures/opener-default/index.html`'s doc
-        // comment for why a precise DOM-element target isn't otherwise
-        // reachable from a synthetic-input driver), so any point well
-        // inside the content area hits it.
-        let x = (rect.left + rect.right) / 2;
-        let y = rect.top + (rect.bottom - rect.top) * 2 / 3;
-        click_at(x, y);
+    /// The app window's content area (below the toolbar strip) top-left
+    /// corner, in absolute screen coordinates — a `__test_target__` rect is
+    /// reported by the page in CSS/viewport coordinates (`getBoundingClient
+    /// Rect()`, relative to the content area's own top-left), so this is
+    /// the offset needed to turn one into a real screen point. `+ 47`: the
+    /// toolbar's known height from this session's own calibration
+    /// screenshots, the same session `switcher_button_pos`/`search_box_pos`
+    /// were calibrated against.
+    fn content_area_origin(rect: &RECT) -> (i32, i32) {
+        (rect.left, rect.top + 47)
     }
 
     fn send_key(vk: VIRTUAL_KEY) {

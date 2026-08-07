@@ -27,6 +27,13 @@ impl HasWindowHandle for NsViewHandle {
 /// copy of `render_engine::linux`'s constant of the same name (two separate
 /// compilation units, same reasoning `FILL_LOGIN_SCRIPT` is already
 /// duplicated between this file and `linux.rs` rather than shared).
+///
+/// Also reports where a fixture's `data-test-target="<name>"` elements are
+/// on screen, via the *same* relayed `console.log` — `__test_target__ <name>
+/// <rect-json>` — once the page finishes loading; see `render_engine::linux`'s
+/// identical constant for the full rationale (an external driver process has
+/// no way to run arbitrary script against the page and get an answer back,
+/// but already reads this same relay for the test's real assertion).
 const CONSOLE_CAPTURE_SCRIPT: &str = r#"
 (function () {
   var send = window.chrome && window.chrome.webview
@@ -38,6 +45,14 @@ const CONSOLE_CAPTURE_SCRIPT: &str = r#"
     original.apply(console, arguments);
     try { send(Array.prototype.map.call(arguments, String).join(' ')); } catch (e) {}
   };
+  window.addEventListener('load', function () {
+    var targets = document.querySelectorAll('[data-test-target]');
+    for (var i = 0; i < targets.length; i++) {
+      var el = targets[i];
+      var r = el.getBoundingClientRect();
+      console.log('__test_target__ ' + el.getAttribute('data-test-target') + ' ' + JSON.stringify({ x: r.x, y: r.y, width: r.width, height: r.height }));
+    }
+  });
 })();
 "#;
 

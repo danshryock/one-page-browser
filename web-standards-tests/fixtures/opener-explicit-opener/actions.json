@@ -1,0 +1,5 @@
+{
+  "steps": [
+    { "action": "click", "target": "link" }
+  ]
+}

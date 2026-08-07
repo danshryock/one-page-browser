@@ -202,6 +202,14 @@ pub struct AppState {
     /// GTK `Stack` children, keyed by page id — `browser_core::Page` doesn't
     /// hold these since they're a GTK-only concept.
     containers: RefCell<HashMap<String, gtk::Box>>,
+    /// Every `console.log` call any page (including background/popup pages —
+    /// see `add_page_related`) has made this session, in order — pushed to
+    /// alongside the existing `eprintln!` at each `WryEngine::new`/
+    /// `new_related` call site's `on_console_message` closure. Exists purely
+    /// for `console_messages_for_test`: production code never reads this
+    /// back, only appends to it (matching this file's existing `_for_test`
+    /// accessor convention, e.g. `evaluate_script_on_active_page_for_test`).
+    console_messages: RefCell<Vec<String>>,
     settings: RefCell<Settings>,
     history: HistoryStore,
     /// Resolved once at startup (from `--profile`, defaulting to
@@ -290,6 +298,7 @@ impl AppState {
         let app_weak_audio = Rc::downgrade(self);
         let id_for_audio_cb = id.clone();
         let app_weak_new_window = Rc::downgrade(self);
+        let app_weak_console = Rc::downgrade(self);
         let engine = WryEngine::new(
             &container,
             url,
@@ -315,7 +324,12 @@ impl AppState {
                 }
                 app_weak_new_window.upgrade()?.add_page_related(&opener).ok()
             },
-            |message| eprintln!("console.log: {message}"),
+            move |message| {
+                eprintln!("console.log: {message}");
+                if let Some(app) = app_weak_console.upgrade() {
+                    app.console_messages.borrow_mut().push(message);
+                }
+            },
         )?;
 
         let evicted = self.core.borrow_mut().insert(id.clone(), engine, title);
@@ -352,6 +366,7 @@ impl AppState {
         let app_weak_audio = Rc::downgrade(self);
         let id_for_audio_cb = id.clone();
         let app_weak_new_window = Rc::downgrade(self);
+        let app_weak_console = Rc::downgrade(self);
         let engine = WryEngine::new_related(
             &container,
             related_to,
@@ -377,7 +392,12 @@ impl AppState {
                 }
                 app_weak_new_window.upgrade()?.add_page_related(&opener).ok()
             },
-            |message| eprintln!("console.log: {message}"),
+            move |message| {
+                eprintln!("console.log: {message}");
+                if let Some(app) = app_weak_console.upgrade() {
+                    app.console_messages.borrow_mut().push(message);
+                }
+            },
         )?;
 
         let widget = engine.widget();
@@ -562,6 +582,7 @@ impl AppState {
         let app_weak_audio = Rc::downgrade(self);
         let id_for_audio_cb = id.to_string();
         let app_weak_new_window = Rc::downgrade(self);
+        let app_weak_console = Rc::downgrade(self);
         match WryEngine::new(
             &container,
             &url,
@@ -587,7 +608,12 @@ impl AppState {
                 }
                 app_weak_new_window.upgrade()?.add_page_related(&opener).ok()
             },
-            |message| eprintln!("console.log: {message}"),
+            move |message| {
+                eprintln!("console.log: {message}");
+                if let Some(app) = app_weak_console.upgrade() {
+                    app.console_messages.borrow_mut().push(message);
+                }
+            },
         ) {
             Ok(engine) => self.core.borrow_mut().install_engine(id, engine),
             Err(err) => eprintln!("failed to reload unloaded page: {err}"),
@@ -1597,6 +1623,26 @@ impl AppState {
         }
     }
 
+    /// Test helper: every `console.log` call any page (including
+    /// background/popup pages) has relayed this session, in order — see
+    /// `console_messages`'s own doc comment for why this exists (real,
+    /// production console-log capture, not something bolted on just for
+    /// tests) and `web-standards-tests/`'s fixtures for what reads this back
+    /// (`__test_target__ <name> <rect>` lines for resolving where to click,
+    /// plus the fixture's own real assertion output).
+    pub fn console_messages_for_test(&self) -> Vec<String> {
+        self.console_messages.borrow().clone()
+    }
+
+    /// Test helper: the active page's real webview widget — lets a test
+    /// compute where a `data-test-target` element actually is on screen
+    /// (widget allocation + toplevel origin) before sending a genuine OS
+    /// click there, the same way `evaluate_script_on_active_page_for_test`
+    /// reaches the active page's engine for script evaluation.
+    pub fn active_page_widget_for_test(&self) -> Option<gtk::Widget> {
+        let core = self.core.borrow();
+        core.active().and_then(|page| page.engine.as_ref()).map(|engine| engine.widget())
+    }
 
     /// Test helper: simulates clicking "Edit" on a Bitwarden row with this
     /// id — same reasoning as `start_editing_local_login`, just looking the
@@ -3363,6 +3409,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         core: RefCell::new(core),
         web_context: RefCell::new(web_context),
         containers: RefCell::new(HashMap::new()),
+        console_messages: RefCell::new(Vec::new()),
         settings: RefCell::new(settings),
         history,
         profile,

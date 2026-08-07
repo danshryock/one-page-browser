@@ -970,6 +970,14 @@ fn ensure_engine_loaded(core: &HookRef<PageManager<ReactorWebViewEngine>>, id: &
 /// production and test alike, same reasoning as `render_engine`'s copies:
 /// cheap, harmless, and a real incidental debugging benefit (page
 /// `console.log` becomes visible in the terminal during normal development).
+///
+/// Also reports where a fixture's `data-test-target="<name>"` elements are
+/// on screen, via the same relayed `console.log` — `__test_target__ <name>
+/// <rect-json>` — once the page finishes loading; see
+/// `render_engine::linux`'s identical constant for the full rationale (the
+/// external driver has no way to run arbitrary script against the page and
+/// get a structured answer back, but already reads this same relay off
+/// stdout for the test's real assertion).
 const CONSOLE_CAPTURE_SCRIPT: &str = r#"
 (function () {
   var send = window.chrome && window.chrome.webview
@@ -981,6 +989,14 @@ const CONSOLE_CAPTURE_SCRIPT: &str = r#"
     original.apply(console, arguments);
     try { send(Array.prototype.map.call(arguments, String).join(' ')); } catch (e) {}
   };
+  window.addEventListener('load', function () {
+    var targets = document.querySelectorAll('[data-test-target]');
+    for (var i = 0; i < targets.length; i++) {
+      var el = targets[i];
+      var r = el.getBoundingClientRect();
+      console.log('__test_target__ ' + el.getAttribute('data-test-target') + ' ' + JSON.stringify({ x: r.x, y: r.y, width: r.width, height: r.height }));
+    }
+  });
 })();
 "#;
 

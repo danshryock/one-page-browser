@@ -20,6 +20,11 @@ path = "src/bin/macos_driver.rs"
 
 [dependencies]
 anyhow = "1"
+# Parses each fixture's `actions.json` (see `web-standards-tests/fixtures/`'s
+# layout) — the same data-driven-interaction format `browser-linux-gtk3`'s
+# in-process test (`crates/browser-linux-gtk3/tests/gtk_tests.rs`) already
+# reads.
+serde_json = "1"
 
 # `windows` (not `windows-core`/`windows-reactor`/`windows-webview`, which
 # `browser-windows-reactor` uses): this is a wholly separate process driving

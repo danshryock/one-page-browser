@@ -26,6 +26,19 @@ pub struct NewWindowInfo {
 /// well — kept as a byte-identical copy over there (two separate
 /// compilation units, same reasoning `FILL_LOGIN_SCRIPT` is already
 /// duplicated between this file and `macos.rs` rather than shared).
+///
+/// Also reports where a fixture's `data-test-target="<name>"` elements are
+/// on screen, via the *same* relayed `console.log` — `__test_target__ <name>
+/// <rect-json>` — once the page finishes loading. This exists for
+/// `web-standards-tests/`'s external drivers (`windows_driver.rs`/
+/// `macos_driver.rs`): a separate OS process driving the app via
+/// `SendInput`/`CGEvent` has no way to run arbitrary script against the
+/// page and get a structured answer back, but it already reads this same
+/// console-log relay off the app's stdout for the test's real assertion —
+/// so reusing it for "where do I click" too avoids inventing a second,
+/// bidirectional channel. A fixture's `actions.json` names which target to
+/// click; nothing here needs to know about `actions.json` itself, just
+/// which elements are marked as targets.
 const CONSOLE_CAPTURE_SCRIPT: &str = r#"
 (function () {
   var send = window.chrome && window.chrome.webview
@@ -37,6 +50,14 @@ const CONSOLE_CAPTURE_SCRIPT: &str = r#"
     original.apply(console, arguments);
     try { send(Array.prototype.map.call(arguments, String).join(' ')); } catch (e) {}
   };
+  window.addEventListener('load', function () {
+    var targets = document.querySelectorAll('[data-test-target]');
+    for (var i = 0; i < targets.length; i++) {
+      var el = targets[i];
+      var r = el.getBoundingClientRect();
+      console.log('__test_target__ ' + el.getAttribute('data-test-target') + ' ' + JSON.stringify({ x: r.x, y: r.y, width: r.width, height: r.height }));
+    }
+  });
 })();
 "#;
 
