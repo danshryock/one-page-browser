@@ -89,11 +89,12 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
-    NSApplicationActivationPolicy, NSBackingStoreType, NSBox, NSBoxType, NSButton, NSButtonType, NSColor,
-    NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSEventModifierFlags, NSMenuItem, NSMenuItemValidation,
-    NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSSecureTextField, NSTextAlignment, NSTextField,
-    NSTitlePosition, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowDelegate, NSWindowOrderingMode,
-    NSWindowStyleMask,
+    NSApplicationActivationPolicy, NSBackingStoreType, NSBezelStyle, NSBox, NSBoxType, NSButton, NSButtonType, NSColor,
+    NSControl, NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent,
+    NSEventModifierFlags, NSFont, NSMenuItem, NSMenuItemValidation, NSPasteboard, NSPasteboardTypeString,
+    NSPopUpButton, NSSecureTextField, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSTextView,
+    NSTitlePosition, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowDelegate,
+    NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
@@ -105,10 +106,47 @@ use browser_core::{
 };
 use render_engine::{RenderEngine, WKWebView, WKWebViewConfiguration, WebContext, WryEngine};
 
-const TOOLBAR_HEIGHT: f64 = 36.0;
-const BUTTON_WIDTH: f64 = 32.0;
+/// Doubles as the window's own title-bar band now that the toolbar lives
+/// there (`titlebarAppearsTransparent`/`FullSizeContentView`, see
+/// `build_window_and_app`) rather than in a separate row below a native
+/// opaque title bar — taller than a stock title bar (~28pt) is normal for
+/// that style of redesign, and gives the icon buttons below real room.
+const TOOLBAR_HEIGHT: f64 = 44.0;
+const BUTTON_WIDTH: f64 = 40.0;
 const BUTTON_MARGIN: f64 = 4.0;
+/// Horizontal space reserved at the toolbar's left edge so nothing is drawn
+/// under the traffic-light window buttons, which float over this same band
+/// now that the toolbar has moved into the title-bar area — 78px is the
+/// conventional reserve custom-title-bar Mac apps use (their standard
+/// horizontal extent, left-aligned, vertically centered in the title bar).
+const TRAFFIC_LIGHT_RESERVE: f64 = 78.0;
 const ROW_HEIGHT: f64 = 44.0;
+/// A switcher card's fixed size — the switcher moved from a plain vertical
+/// list of full-width button "rows" to a wrapping grid of colored cards
+/// (`rebuild_switcher_rows`/`build_switcher_card`), matching
+/// `browser-linux-gtk3`'s own switcher tiles (`build_open_tile`) per direct
+/// feedback: a bigger *frame* alone (this constant's predecessor,
+/// `SWITCHER_ROW_HEIGHT`) never actually grew the visible button, because
+/// nothing about a plain push-button row reads as "bigger" just from a
+/// taller, still-mostly-empty frame — a real card with its own background
+/// color and only two short lines of text does.
+const SWITCHER_TILE_WIDTH: f64 = 170.0;
+const SWITCHER_TILE_HEIGHT: f64 = 120.0;
+const SWITCHER_TILE_GAP: f64 = 12.0;
+/// A non-clickable `SwitcherRow::Header` band — shorter than a real card
+/// since it's just a label plus a thin divider line, not a tile.
+const SWITCHER_HEADER_HEIGHT: f64 = 28.0;
+/// Fixed tint per non-open card kind — mirrors gtk3's `.history-tile`/
+/// `.bookmark-tile`/`.similar-tile`/`.add-tile` CSS classes: an open page
+/// gets its own real per-page palette color (`SwitcherRow::Open::color`),
+/// everything else gets one of these fixed, muted tints instead, so a
+/// glance at color alone tells open pages apart from every other row kind
+/// (which text alone — the domain's "· history"/"· bookmark"/"· similar"
+/// suffix — already did, but not as immediately).
+const HISTORY_TILE_COLOR: &str = "#39424e";
+const BOOKMARK_TILE_COLOR: &str = "#463a56";
+const SIMILAR_TILE_COLOR: &str = "#33474b";
+const ADD_TILE_COLOR: &str = "#3a3a3c";
 const OVERLAY_MARGIN: f64 = 16.0;
 const OVERLAY_WIDTH: f64 = 480.0;
 const CLOSE_BUTTON_SIZE: f64 = 28.0;
@@ -214,6 +252,13 @@ struct AppState {
     /// which row it was (AppKit's `target`/`action` dispatch has no
     /// built-in "which item" beyond the sender itself).
     switcher_rows: RefCell<Vec<browser_chrome_core::SwitcherRow>>,
+    /// The row Up/Down arrow-key navigation has highlighted, if any — reset
+    /// to `None` whenever the switcher opens fresh or its query changes
+    /// (rows shift, so a stale index would land on the wrong row), skips
+    /// `SwitcherRow::Header` rows via `browser_chrome_core::next_activatable_row`,
+    /// and lets Enter (`address_bar_activated`) commit whichever row this
+    /// currently points at.
+    selected_switcher_index: RefCell<Option<usize>>,
 
     settings_view: Retained<NSView>,
     settings_chrome: OverlayChrome,
@@ -294,6 +339,10 @@ struct AppState {
     bookmarks_view: Retained<NSView>,
     bookmarks_chrome: OverlayChrome,
     bookmarks_rows_container: Retained<NSView>,
+    /// Real (if invisible) focusable text field, purely so this overlay has
+    /// something for Escape to work through — see `open_bookmarks`'s doc
+    /// comment.
+    bookmarks_focus_catcher: Retained<NSTextField>,
     /// Backs each row's `NSButton::setTag(idx)` the same way `passwords_rows`/
     /// `switcher_rows` do — `Bookmarks::all()`'s order (most-recently-added
     /// first), snapshotted fresh every time `rebuild_bookmarks_rows` runs.
@@ -333,7 +382,7 @@ impl AppState {
         ));
 
         let button_count = 9.0; // back, forward, reload, switcher, settings, profile, passwords, bookmark toggle, bookmarks
-        let title_chip_x = 3.0 * BUTTON_WIDTH + 4.0 * BUTTON_MARGIN;
+        let title_chip_x = TRAFFIC_LIGHT_RESERVE + 3.0 * BUTTON_WIDTH + 4.0 * BUTTON_MARGIN;
         let title_chip_end = content_size.width - (button_count - 3.0) * (BUTTON_WIDTH + BUTTON_MARGIN) - BUTTON_MARGIN;
         let title_chip_frame = NSRect::new(
             NSPoint::new(title_chip_x, BUTTON_MARGIN),
@@ -357,6 +406,13 @@ impl AppState {
 
         let content_height_below_toolbar = (content_size.height - TOOLBAR_HEIGHT).max(0.0);
         let content_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(content_size.width, content_height_below_toolbar));
+        // `content_view` itself — every page container and every overlay
+        // view below is a *subview* of this, so leaving its own frame fixed
+        // at its construction-time size (a real, confirmed gap: it was
+        // simply missing from this function) clipped all of them to that
+        // stale size on any resize, even though each child was correctly
+        // being resized to fill the new, bigger/smaller `content_frame`.
+        self.content_view.setFrame(content_frame);
         for container in self.containers.borrow().values() {
             container.setFrame(content_frame);
         }
@@ -373,6 +429,123 @@ impl AppState {
         }
         for chrome in [&self.switcher_chrome, &self.settings_chrome, &self.profile_chrome, &self.passwords_chrome, &self.bookmarks_chrome] {
             relayout_overlay_chrome(chrome, content_frame);
+        }
+        self.relayout_overlays(content_frame);
+    }
+
+    /// Repositions every fixed-position widget *inside* each overlay
+    /// (fields, checkboxes, buttons, row-list containers) against the
+    /// *current* `content_frame` — every one of these was previously only
+    /// ever positioned once, at construction time, using the window's
+    /// initial size. Confirmed directly as a real bug: resizing the window
+    /// left every overlay's own contents either too narrow (row-list
+    /// containers computed their row widths from a stale, un-resized
+    /// frame) or floating at the wrong height (fields anchored from the
+    /// top via `content_frame.size.height - ...` stayed at their original
+    /// y position, drifting away from where they should sit once the
+    /// window's height changed) — which is also almost certainly what
+    /// looked like "inconsistent" row vertical positioning: the top-anchor
+    /// math added earlier to `rebuild_switcher_rows`/`rebuild_bookmarks_rows`/
+    /// `rebuild_profile_rows`/`rebuild_passwords_rows`/`rebuild_keybindings_rows`
+    /// is only as correct as the container height it reads, and that height
+    /// was exactly the thing going stale here.
+    ///
+    /// Deliberately duplicates `build_window_and_app`'s construction-time
+    /// formulas rather than trying to share code with it — same reasoning
+    /// `relayout()` itself already follows for the toolbar buttons (this
+    /// file's own established pattern for "no autoresizing masks, no
+    /// shared layout closure, just recompute the same math again"; see this
+    /// module's doc comment on why manual, absolute positioning was the
+    /// deliberate choice here).
+    ///
+    /// Ends by re-running whichever overlay's own `rebuild_*_rows` is
+    /// currently open: resizing `switcher_rows_container` etc. above only
+    /// moves the *container*, not the row buttons already placed inside it
+    /// at their old width (those aren't autoresizing either), so the row
+    /// list needs a real rebuild to actually use the new width. Skipped for
+    /// whichever overlays aren't open, matching every rebuild function's
+    /// own "no visible rows to fix" reasoning.
+    fn relayout_overlays(&self, content_frame: NSRect) {
+        // ---- switcher ----
+        self.address_bar.setFrame(NSRect::new(
+            NSPoint::new(OVERLAY_MARGIN, content_frame.size.height - OVERLAY_MARGIN - ROW_HEIGHT),
+            NSSize::new(content_frame.size.width - 2.0 * OVERLAY_MARGIN - CLOSE_BUTTON_SIZE - HINT_WIDTH - 14.0, ROW_HEIGHT - BUTTON_MARGIN),
+        ));
+        self.switcher_rows_container.setFrame(NSRect::new(
+            NSPoint::new(OVERLAY_MARGIN, OVERLAY_MARGIN),
+            NSSize::new(content_frame.size.width - 2.0 * OVERLAY_MARGIN, content_frame.size.height - 2.0 * OVERLAY_MARGIN - ROW_HEIGHT),
+        ));
+
+        // ---- settings ----
+        self.start_page_field.setFrame(NSRect::new(
+            NSPoint::new(OVERLAY_MARGIN, content_frame.size.height - OVERLAY_MARGIN - ROW_HEIGHT),
+            NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN),
+        ));
+        self.unlimited_checkbox.setFrame(NSRect::new(
+            NSPoint::new(OVERLAY_MARGIN, content_frame.size.height - OVERLAY_MARGIN - 2.0 * ROW_HEIGHT),
+            NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN),
+        ));
+        self.limit_field.setFrame(NSRect::new(
+            NSPoint::new(OVERLAY_MARGIN, content_frame.size.height - OVERLAY_MARGIN - 3.0 * ROW_HEIGHT),
+            NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN),
+        ));
+        self.bitwarden_checkbox.setFrame(NSRect::new(
+            NSPoint::new(OVERLAY_MARGIN, content_frame.size.height - OVERLAY_MARGIN - 4.0 * ROW_HEIGHT),
+            NSSize::new(220.0, ROW_HEIGHT - BUTTON_MARGIN),
+        ));
+        self.bitwarden_url_field.setFrame(NSRect::new(
+            NSPoint::new(OVERLAY_MARGIN + 224.0, content_frame.size.height - OVERLAY_MARGIN - 4.0 * ROW_HEIGHT),
+            NSSize::new(OVERLAY_WIDTH - 224.0, ROW_HEIGHT - BUTTON_MARGIN),
+        ));
+        self.theme_popup.setFrame(NSRect::new(
+            NSPoint::new(OVERLAY_MARGIN, content_frame.size.height - OVERLAY_MARGIN - 5.0 * ROW_HEIGHT),
+            NSSize::new(160.0, ROW_HEIGHT - BUTTON_MARGIN),
+        ));
+        self.keybindings_rows_container.setFrame(NSRect::new(
+            NSPoint::new(OVERLAY_MARGIN, OVERLAY_MARGIN + ROW_HEIGHT),
+            NSSize::new(content_frame.size.width - 2.0 * OVERLAY_MARGIN, content_frame.size.height - 6.0 * ROW_HEIGHT - 2.0 * OVERLAY_MARGIN),
+        ));
+
+        // ---- profile ----
+        self.profile_rows_container.setFrame(NSRect::new(
+            NSPoint::new(OVERLAY_MARGIN, OVERLAY_MARGIN + 2.0 * ROW_HEIGHT),
+            NSSize::new(content_frame.size.width - 2.0 * OVERLAY_MARGIN, content_frame.size.height - 4.0 * ROW_HEIGHT),
+        ));
+
+        // ---- passwords ----
+        let row_y = |n: f64| content_frame.size.height - OVERLAY_MARGIN - n * ROW_HEIGHT;
+        self.passwords_unlock_label.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(1.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+        self.passwords_unlock_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(2.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+        self.passwords_unlock_button.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(3.0)), NSSize::new(120.0, ROW_HEIGHT - BUTTON_MARGIN)));
+        self.passwords_unlock_error_label.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(4.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+        self.passwords_site_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(1.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+        self.passwords_username_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(2.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+        self.passwords_password_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(3.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+        self.passwords_notes_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(4.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+        self.passwords_destination_popup.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(5.0)), NSSize::new(160.0, ROW_HEIGHT - BUTTON_MARGIN)));
+        self.passwords_submit_button.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN + 164.0, row_y(5.0)), NSSize::new(90.0, ROW_HEIGHT - BUTTON_MARGIN)));
+        self.passwords_cancel_edit_button.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN + 258.0, row_y(5.0)), NSSize::new(110.0, ROW_HEIGHT - BUTTON_MARGIN)));
+        self.passwords_error_label.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(6.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+        self.passwords_rows_container.setFrame(NSRect::new(
+            NSPoint::new(OVERLAY_MARGIN, OVERLAY_MARGIN + 2.0 * ROW_HEIGHT),
+            NSSize::new(content_frame.size.width - 2.0 * OVERLAY_MARGIN, (row_y(7.0) - OVERLAY_MARGIN - 2.0 * ROW_HEIGHT).max(0.0)),
+        ));
+        self.bitwarden_unlock_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, OVERLAY_MARGIN + ROW_HEIGHT), NSSize::new(260.0, ROW_HEIGHT - BUTTON_MARGIN)));
+        self.bitwarden_unlock_button.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN + 264.0, OVERLAY_MARGIN + ROW_HEIGHT), NSSize::new(140.0, ROW_HEIGHT - BUTTON_MARGIN)));
+
+        // ---- bookmarks ----
+        self.bookmarks_rows_container.setFrame(NSRect::new(
+            NSPoint::new(OVERLAY_MARGIN, OVERLAY_MARGIN + ROW_HEIGHT),
+            NSSize::new(content_frame.size.width - 2.0 * OVERLAY_MARGIN, content_frame.size.height - ROW_HEIGHT - 2.0 * OVERLAY_MARGIN),
+        ));
+
+        match self.overlay.get() {
+            Overlay::Switcher => self.rebuild_switcher_rows(),
+            Overlay::Settings => self.rebuild_keybindings_rows(),
+            Overlay::Profile => self.rebuild_profile_rows(),
+            Overlay::Passwords => self.rebuild_passwords_rows(),
+            Overlay::Bookmarks => self.rebuild_bookmarks_rows(),
+            Overlay::None => {}
         }
     }
 
@@ -423,10 +596,43 @@ impl AppState {
         self.address_bar.setStringValue(&NSString::from_str(""));
         self.address_bar.setPlaceholderString(Some(&NSString::from_str("Type to filter open pages\u{2026}")));
         self.overlay.set(Overlay::Switcher);
+        *self.selected_switcher_index.borrow_mut() = None;
         self.rebuild_switcher_rows();
         self.bring_overlay_to_front(&self.switcher_view);
         self.switcher_view.setHidden(false);
         self.window.makeFirstResponder(Some(&self.address_bar));
+    }
+
+    /// `address_bar`'s `NSControlTextEditingDelegate::controlTextDidChange:`
+    /// hook (see that impl below) — re-filters the switcher's rows on every
+    /// keystroke, not just when it first opens. Confirmed missing entirely:
+    /// `address_bar` never had a delegate set at all, so nothing was ever
+    /// notified of a text change and the switcher's rows only ever reflected
+    /// whatever the query was at the moment it opened.
+    fn address_bar_text_changed(self: &Rc<Self>) {
+        if self.is_switcher_open() {
+            *self.selected_switcher_index.borrow_mut() = None;
+            self.rebuild_switcher_rows();
+        }
+    }
+
+    /// Moves `selected_switcher_index` one activatable row up/down (skipping
+    /// `SwitcherRow::Header` rows, via `browser_chrome_core::next_activatable_row`)
+    /// and redraws so the new selection's "\u{25b8} " marker shows (see
+    /// `rebuild_switcher_rows`). Called from `control_textView_doCommandBySelector`
+    /// on `moveUp:`/`moveDown:` — bare (unmodified) arrow keys, like Escape,
+    /// are intercepted by the field editor before they'd otherwise reach
+    /// anything else, the same reason that override exists at all.
+    fn switcher_navigate(self: &Rc<Self>, direction: browser_chrome_core::SwitcherNavDirection) {
+        let next = {
+            let rows = self.switcher_rows.borrow();
+            let current = *self.selected_switcher_index.borrow();
+            browser_chrome_core::next_activatable_row(&rows, current, direction)
+        };
+        if next.is_some() {
+            *self.selected_switcher_index.borrow_mut() = next;
+            self.rebuild_switcher_rows();
+        }
     }
 
     /// Test-only: listens on a Unix domain socket at `socket_path` for
@@ -503,6 +709,71 @@ impl AppState {
                 let script = format!("document.querySelector('[data-test-target=\"{arg}\"]')?.click();");
                 self.with_active(|engine| engine.evaluate_script_for_test(&script));
             }
+            // Exercises the switcher's keyboard-only path (Up/Down arrow
+            // selection, then Enter to activate) the same way a real
+            // keyboard would, without needing OS-level synthetic input —
+            // added to reproduce/regression-test a real crash report
+            // (arrow-selecting a row, then Enter) that mouse-click-only
+            // testing never exercised.
+            "switcher_nav_down" => self.switcher_navigate(browser_chrome_core::SwitcherNavDirection::Down),
+            "switcher_nav_up" => self.switcher_navigate(browser_chrome_core::SwitcherNavDirection::Up),
+            "press_enter" => self.address_bar_activated(),
+            // Sets the address bar's text and re-filters, without
+            // activating anything — lets a test type a query to bring up
+            // history/bookmark rows before `switcher_nav_down`/`press_enter`,
+            // the same way `navigate` types+activates in one step but
+            // without immediately committing.
+            "type" => {
+                self.address_bar.setStringValue(&NSString::from_str(arg));
+                self.address_bar_text_changed();
+            }
+            "open_settings" => self.open_settings(),
+            "open_bookmarks" => self.open_bookmarks(),
+            "open_passwords" => self.open_passwords(),
+            "open_profile_picker" => self.open_profile_picker(),
+            // Diagnostic-only: reports the window's current first responder
+            // class name — used to check whether Escape (which every
+            // overlay's own text fields intercept via
+            // `control:textView:doCommandBySelector:`, see that impl's doc
+            // comment) actually has a delegated text field to go through
+            // for a given overlay, or falls through to the "Close Overlay"
+            // menu key equivalent instead (see `validate_menu_item`).
+            "whois_first_responder" => {
+                let name = self
+                    .window
+                    .firstResponder()
+                    .map(|r| r.class().name().to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "<none>".to_string());
+                println!("first_responder={name}");
+            }
+            // Diagnostic-only: mimics the exact nil-target responder-chain
+            // lookup `-[NSApplication sendEvent:]` performs for the "Close
+            // Overlay" menu item's key equivalent (`closeAnyOverlay:`),
+            // without needing a real synthetic Escape keypress (which would
+            // need the Accessibility/TCC permission this whole command
+            // channel exists to avoid) — reports whether that lookup
+            // actually finds `AppDelegate` from the current first responder.
+            "whois_target_for_close_overlay" => {
+                let target = unsafe { NSApplication::sharedApplication(self.mtm()).targetForAction(sel!(closeAnyOverlay:)) };
+                let name = target.map(|t| t.class().name().to_string_lossy().into_owned()).unwrap_or_else(|| "<none>".to_string());
+                println!("target_for_close_overlay={name}");
+            }
+            // Resizes the real window via `setFrame_display` (which fires
+            // the same `windowDidResize:` → `relayout()` path a real drag
+            // does) — added to reproduce/regression-test a real bug
+            // ("overlays don't shrink when the window resizes") without
+            // needing System Events/Accessibility automation, which itself
+            // needs a permission grant that hung non-interactively over SSH
+            // when tried directly.
+            "resize_window" => {
+                let mut parts = arg.split_whitespace();
+                let (Some(w), Some(h)) = (parts.next().and_then(|s| s.parse::<f64>().ok()), parts.next().and_then(|s| s.parse::<f64>().ok())) else {
+                    eprintln!("usage: resize_window <width> <height>");
+                    return;
+                };
+                let frame = self.window.frame();
+                self.window.setFrame_display(NSRect::new(frame.origin, NSSize::new(w, h)), true);
+            }
             other => eprintln!("unknown test command: {other:?}"),
         }
     }
@@ -574,6 +845,23 @@ impl AppState {
         self.rebuild_keybindings_rows();
         self.bring_overlay_to_front(&self.settings_view);
         self.settings_view.setHidden(false);
+        // Moves focus off the active page's `WKWebView` — unlike
+        // `open_switcher`, this was previously missing here (and in every
+        // other non-switcher overlay's open function), leaving the webview
+        // as first responder underneath the now-visible overlay. Suspected
+        // root cause of a real reported bug ("escape doesn't close overlays
+        // other than the switcher"): `targetForAction(closeAnyOverlay:)`
+        // (the same nil-target lookup the "Close Overlay" menu item's key
+        // equivalent uses) resolves correctly to `AppDelegate` regardless
+        // of first responder, confirmed directly via a diagnostic test
+        // command — so the responder-chain wiring itself isn't broken, but
+        // `WKWebView` is a plausible place for a real keypress to be
+        // intercepted before it ever reaches that lookup at all, unlike a
+        // plain `NSView`/`NSControl`. Not provable further without a real
+        // keyboard (no Accessibility/TCC permission for synthetic input —
+        // see `scripts/macos-mac/README.md`), so this is the same
+        // defensive fix regardless of the exact mechanism.
+        self.window.makeFirstResponder(Some(&self.start_page_field));
     }
 
     /// The settings toolbar button's target — see `toggle_switcher`.
@@ -649,6 +937,8 @@ impl AppState {
         self.rebuild_profile_rows();
         self.bring_overlay_to_front(&self.profile_view);
         self.profile_view.setHidden(false);
+        // See `open_settings`'s doc comment on the same call.
+        self.window.makeFirstResponder(Some(&self.new_profile_field));
     }
 
     /// The profile toolbar button's target — see `toggle_switcher`.
@@ -703,6 +993,24 @@ impl AppState {
         self.rebuild_passwords_view();
         self.bring_overlay_to_front(&self.passwords_view);
         self.passwords_view.setHidden(false);
+        // See `open_settings`'s doc comment on the same call — but,
+        // confirmed directly (real hardware, real Escape presses): a
+        // focused `NSButton` (this used to focus `passwords_chrome
+        // .close_button`) does *not* get the same treatment a focused
+        // `NSTextField` does. Only `NSTextField`/`NSTextView`-family
+        // responders auto-translate a bare Escape into `cancelOperation:`
+        // via `interpretKeyEvents:` (`NSStandardKeyBindingResponding`) —
+        // that's specifically a text-editing responder behavior, not
+        // something a plain `NSControl` gets for free, so a real text
+        // field is required here, not just "any focusable control." Picks
+        // whichever real, always-present field matches what's actually
+        // showing for the current `VaultState`.
+        let unlocked = matches!(&*self.passwords.borrow(), VaultState::Unlocked(_));
+        if unlocked {
+            self.window.makeFirstResponder(Some(&self.passwords_site_field));
+        } else {
+            self.window.makeFirstResponder(Some(&self.passwords_unlock_field));
+        }
     }
 
     /// The passwords toolbar button's target — see `toggle_switcher`.
@@ -864,8 +1172,11 @@ impl AppState {
 
         let mtm = self.mtm();
         let width = self.passwords_rows_container.frame().size.width;
+        let container_height = self.passwords_rows_container.frame().size.height;
         for (idx, (entry, _source)) in rows.iter().enumerate() {
-            let y = (rows.len() - 1 - idx) as f64 * ROW_HEIGHT;
+            // Top-anchored, not bottom — see `rebuild_bookmarks_rows`'s doc
+            // comment on the identical fix.
+            let y = container_height - (idx + 1) as f64 * ROW_HEIGHT;
 
             let label_text = format!("{} \u{2014} {}", entry.domain, entry.username);
             let label = unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str(&label_text), None, None, mtm) };
@@ -1091,6 +1402,11 @@ impl AppState {
         self.rebuild_bookmarks_rows();
         self.bring_overlay_to_front(&self.bookmarks_view);
         self.bookmarks_view.setHidden(false);
+        // See `open_passwords`'s doc comment: a focused `NSButton` doesn't
+        // get Escape for free the way a text field does, confirmed
+        // directly — this overlay has no other text field, hence
+        // `bookmarks_focus_catcher`.
+        self.window.makeFirstResponder(Some(&self.bookmarks_focus_catcher));
     }
 
     /// The bookmarks toolbar button's target — see `toggle_switcher`.
@@ -1111,9 +1427,16 @@ impl AppState {
         let mtm = self.mtm();
         let rows: Vec<Bookmark> = self.bookmarks.borrow().all().into_iter().cloned().collect();
         let width = self.bookmarks_rows_container.frame().size.width;
+        let container_height = self.bookmarks_rows_container.frame().size.height;
 
         for (idx, bookmark) in rows.iter().enumerate() {
-            let y = (rows.len() - 1 - idx) as f64 * ROW_HEIGHT;
+            // Anchored to the *top* of the container (row 0 highest), not
+            // the bottom — same fix, same reasoning, as
+            // `rebuild_switcher_rows`'s doc comment: this container is a
+            // fixed, generous height, so the old `(rows.len() - 1 - idx) *
+            // ROW_HEIGHT` scheme left a short row list hugging the bottom
+            // with empty space above it.
+            let y = container_height - (idx + 1) as f64 * ROW_HEIGHT;
 
             let label_text = if bookmark.title.is_empty() {
                 bookmark.url.clone()
@@ -1542,6 +1865,10 @@ impl AppState {
     /// on whether the switcher is open: it always is, by construction,
     /// whenever this widget is reachable at all.
     fn address_bar_activated(self: &Rc<Self>) {
+        if let Some(idx) = *self.selected_switcher_index.borrow() {
+            self.switcher_row_clicked(idx);
+            return;
+        }
         let text = self.address_bar.stringValue().to_string();
         if self.command_key_held() {
             self.force_new_page_from_search(&text);
@@ -1591,15 +1918,26 @@ impl AppState {
 
     // ---- rebuilding overlay row lists ------------------------------------
 
-    /// Rebuilds every switcher row from scratch — open pages matching the
+    /// Rebuilds every switcher card from scratch — open pages matching the
     /// search box's current text (or all of them, if empty —
-    /// `PageManager::matching_ids` already handles that), a trailing
-    /// "+ New Page" row, then, only once there's a query, matching history
-    /// entries not already open. Mirrors `browser-windows-reactor`'s
-    /// `switcher_overlay` closely; see this module's doc comment for why
-    /// it's a plain list here instead of a wrapping tile grid.
+    /// `PageManager::matching_ids` already handles that), a trailing "add
+    /// page" card, then, only once there's a query, matching history
+    /// entries not already open, each group preceded by a non-clickable
+    /// `SwitcherRow::Header` band (a heading label plus a thin divider
+    /// line — see `browser_chrome_core::build_switcher_rows`'s doc comment
+    /// for why headers are only inserted ahead of non-empty groups).
+    ///
+    /// Lays cards out in a wrapping grid (as many `SWITCHER_TILE_WIDTH`-wide
+    /// columns as fit `switcher_rows_container`'s current width, matching
+    /// `browser-linux-gtk3`'s `gtk::FlowBox`) rather than the single-column
+    /// list of full-width button rows this used to be — per direct
+    /// feedback, real hardware confirmed the row-list approach's buttons
+    /// never actually looked bigger no matter how tall the frame got, and
+    /// asked for something closer to gtk3's own card-based tiles instead.
+    /// A `Header` forces a fresh grid row (never shares a row with real
+    /// cards on either side) rather than being just another grid cell,
+    /// since it needs the container's full width for its divider line.
     fn rebuild_switcher_rows(&self) {
-        let mtm = self.mtm();
         let query = self.address_bar.stringValue().to_string();
         let bookmarks = self.bookmarks.borrow();
         let rows = browser_chrome_core::build_switcher_rows(&self.core.borrow(), &self.history, Some(&bookmarks), &query);
@@ -1607,31 +1945,170 @@ impl AppState {
 
         clear_subviews(&self.switcher_rows_container);
         let width = self.switcher_rows_container.frame().size.width;
+        let container_height = self.switcher_rows_container.frame().size.height;
+        let selected = *self.selected_switcher_index.borrow();
+
+        let columns = ((width + SWITCHER_TILE_GAP) / (SWITCHER_TILE_WIDTH + SWITCHER_TILE_GAP)).floor().max(1.0) as usize;
+        let mut col = 0usize;
+        let mut y_from_top = 0.0;
+
         for (idx, row) in rows.iter().enumerate() {
             use browser_chrome_core::SwitcherRow;
-            let (label, sub) = match row {
-                SwitcherRow::Open { title, domain, .. } => (title.clone(), domain.clone()),
-                SwitcherRow::Add => ("+ New Page".to_string(), String::new()),
-                // No per-variant visual styling here — this crate's switcher
-                // rows have never had any (even `Open`'s palette `color` is
-                // discarded above), so `History`/`Bookmark`/`Similar` all
-                // render identically: title + domain text, the domain
-                // already carrying a "· history"/"· bookmark"/"· similar"
-                // suffix from `build_switcher_rows` itself.
-                SwitcherRow::History { title, domain, .. }
-                | SwitcherRow::Bookmark { title, domain, .. }
-                | SwitcherRow::Similar { title, domain, .. } => (title.clone(), domain.clone()),
+
+            if let SwitcherRow::Header(label) = row {
+                // A header always starts its own grid row — finish
+                // whatever grid row was in progress first, same as a real
+                // line break would in a wrapping text layout.
+                if col != 0 {
+                    y_from_top += SWITCHER_TILE_HEIGHT + SWITCHER_TILE_GAP;
+                    col = 0;
+                }
+                let y = container_height - y_from_top - SWITCHER_HEADER_HEIGHT;
+                let divider = NSBox::initWithFrame(NSBox::alloc(self.mtm()), NSRect::new(NSPoint::new(0.0, y + 2.0), NSSize::new(width, 1.0)));
+                divider.setBoxType(NSBoxType::Custom);
+                divider.setTitlePosition(NSTitlePosition::NoTitle);
+                divider.setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.18));
+                self.switcher_rows_container.addSubview(&divider);
+
+                let heading = make_text_field(self.mtm(), label);
+                heading.setEditable(false);
+                heading.setBordered(false);
+                heading.setSelectable(false);
+                heading.setFrame(NSRect::new(NSPoint::new(0.0, y + 6.0), NSSize::new(width, SWITCHER_HEADER_HEIGHT - 8.0)));
+                self.switcher_rows_container.addSubview(&heading);
+
+                y_from_top += SWITCHER_HEADER_HEIGHT;
+                continue;
+            }
+
+            let (label, sub, color, is_open) = match row {
+                SwitcherRow::Open { title, domain, color, .. } => (title.clone(), domain.clone(), (*color).to_string(), true),
+                SwitcherRow::Add => ("+".to_string(), String::new(), ADD_TILE_COLOR.to_string(), false),
+                // `History`/`Bookmark`/`Similar` each get their own fixed
+                // tint (`build_switcher_card`'s doc comment) — the domain
+                // already carries a "· history"/"· bookmark"/"· similar"
+                // suffix from `build_switcher_rows` itself too, so the
+                // color is a second, faster-to-notice cue, not the only one.
+                SwitcherRow::History { title, domain, .. } => (title.clone(), domain.clone(), HISTORY_TILE_COLOR.to_string(), false),
+                SwitcherRow::Bookmark { title, domain, .. } => (title.clone(), domain.clone(), BOOKMARK_TILE_COLOR.to_string(), false),
+                SwitcherRow::Similar { title, domain, .. } => (title.clone(), domain.clone(), SIMILAR_TILE_COLOR.to_string(), false),
+                SwitcherRow::Header(_) => unreachable!("handled above"),
             };
-            let text = if sub.is_empty() { label } else { format!("{label}\n{sub}") };
-            let button = unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str(&text), None, None, mtm) };
-            button.setTag(idx as isize);
-            button.setFrame(NSRect::new(
-                NSPoint::new(0.0, (rows.len() - 1 - idx) as f64 * ROW_HEIGHT),
-                NSSize::new(width, ROW_HEIGHT - BUTTON_MARGIN),
-            ));
-            self.switcher_rows_container.addSubview(&button);
+
+            let x = col as f64 * (SWITCHER_TILE_WIDTH + SWITCHER_TILE_GAP);
+            let y = container_height - y_from_top - SWITCHER_TILE_HEIGHT;
+            let card = self.build_switcher_card(idx, &label, &sub, &color, is_open, selected == Some(idx));
+            card.setFrameOrigin(NSPoint::new(x, y));
+            self.switcher_rows_container.addSubview(&card);
+
+            col += 1;
+            if col >= columns {
+                col = 0;
+                y_from_top += SWITCHER_TILE_HEIGHT + SWITCHER_TILE_GAP;
+            }
         }
         *self.switcher_rows.borrow_mut() = rows;
+    }
+
+    /// Builds one switcher card — closer to `browser-linux-gtk3`'s switcher
+    /// tiles (`build_open_tile`/`build_search_result_tile`) than a plain
+    /// button row: a filled `NSBox` background (`color`, the page's real
+    /// per-page palette color for an open page, one of the fixed tints
+    /// above for everything else), bold-ish title + dimmer domain text, a
+    /// full-card invisible click-catcher button (nil-targeted, the same
+    /// `switcherRowClicked:` pattern every row kind already used as a plain
+    /// button), and — only for an already-open page — a small "×" close
+    /// button overlaid in the top-right corner (`switcherRowCloseClicked:`),
+    /// mirroring gtk3's `gtk::Overlay`-based close button. `selected` draws
+    /// a bright border instead of the old leading-text marker (`"▸ "`),
+    /// which doesn't fit a fixed-size tile the same way it fit a full-width
+    /// row.
+    fn build_switcher_card(&self, idx: usize, label: &str, sub: &str, color: &str, is_open: bool, selected: bool) -> Retained<NSView> {
+        let mtm = self.mtm();
+        let tile_size = NSSize::new(SWITCHER_TILE_WIDTH, SWITCHER_TILE_HEIGHT);
+        let card = NSView::initWithFrame(NSView::alloc(mtm), NSRect::new(NSPoint::default(), tile_size));
+
+        let background = NSBox::initWithFrame(NSBox::alloc(mtm), NSRect::new(NSPoint::default(), tile_size));
+        background.setBoxType(NSBoxType::Custom);
+        background.setTitlePosition(NSTitlePosition::NoTitle);
+        background.setCornerRadius(10.0);
+        if let Some(nscolor) = hex_color(color) {
+            background.setFillColor(&nscolor);
+        }
+        if selected {
+            background.setBorderWidth(3.0);
+            background.setBorderColor(&NSColor::whiteColor());
+        } else {
+            background.setBorderWidth(0.0);
+        }
+        card.addSubview(&background);
+
+        let title_label = make_text_field(mtm, label);
+        title_label.setEditable(false);
+        title_label.setBordered(false);
+        title_label.setSelectable(false);
+        title_label.setDrawsBackground(false);
+        title_label.setTextColor(Some(&NSColor::whiteColor()));
+
+        if sub.is_empty() {
+            // The "add page" card — a lone, large, centered "+" instead of
+            // a title/domain pair, matching gtk3's `build_add_tile`.
+            title_label.setAlignment(NSTextAlignment::Center);
+            title_label.setFont(Some(&NSFont::systemFontOfSize(28.0)));
+            title_label.setFrame(NSRect::new(NSPoint::new(0.0, SWITCHER_TILE_HEIGHT / 2.0 - 20.0), NSSize::new(SWITCHER_TILE_WIDTH, 40.0)));
+            card.addSubview(&title_label);
+        } else {
+            title_label.setFrame(NSRect::new(NSPoint::new(10.0, SWITCHER_TILE_HEIGHT - 38.0), NSSize::new(SWITCHER_TILE_WIDTH - 20.0, 20.0)));
+            card.addSubview(&title_label);
+
+            let domain_label = make_text_field(mtm, sub);
+            domain_label.setEditable(false);
+            domain_label.setBordered(false);
+            domain_label.setSelectable(false);
+            domain_label.setDrawsBackground(false);
+            domain_label.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.75)));
+            domain_label.setFrame(NSRect::new(NSPoint::new(10.0, SWITCHER_TILE_HEIGHT - 58.0), NSSize::new(SWITCHER_TILE_WIDTH - 20.0, 16.0)));
+            card.addSubview(&domain_label);
+        }
+
+        // `target: None`, `action: Some(sel!(switcherRowClicked:))` — same
+        // nil-targeted-action pattern every dynamically-created row in this
+        // crate uses, letting the responder chain find `AppDelegate` rather
+        // than this method needing its own reference to it. Covers the
+        // whole card (added before the close button below, so the close
+        // button — smaller, added last — stays on top and gets its own
+        // clicks instead of this one swallowing them).
+        let click_catcher =
+            unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str(""), None, Some(sel!(switcherRowClicked:)), mtm) };
+        click_catcher.setBordered(false);
+        click_catcher.setTag(idx as isize);
+        click_catcher.setFrame(NSRect::new(NSPoint::default(), tile_size));
+        card.addSubview(&click_catcher);
+
+        // Only an already-open page (`Open`) can be closed — `Add`/
+        // `History`/`Bookmark`/`Similar` cards represent something not
+        // currently open at all, so there's nothing there for a close
+        // button to act on. Matches `browser-linux-gtk3`'s switcher tiles.
+        if is_open {
+            let close = unsafe {
+                NSButton::buttonWithTitle_target_action(&NSString::from_str("\u{d7}"), None, Some(sel!(switcherRowCloseClicked:)), mtm)
+            };
+            close.setTag(idx as isize);
+            // `BezelStyle::Circular` — the semantic "small round icon
+            // button" style, not the default rounded push-button bezel
+            // (`buttonWithTitle_target_action`'s default): that one is
+            // sized/inset for normal button text and reads as empty at a
+            // 20×20 frame, the glyph clipped away by its own padding.
+            // Confirmed directly — this was a real rendering bug, not just
+            // a style preference.
+            close.setBezelStyle(NSBezelStyle::Circular);
+            close.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            close.setBezelColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 0.65)));
+            close.setFrame(NSRect::new(NSPoint::new(SWITCHER_TILE_WIDTH - 26.0, SWITCHER_TILE_HEIGHT - 26.0), NSSize::new(20.0, 20.0)));
+            card.addSubview(&close);
+        }
+
+        card
     }
 
     fn switcher_row_clicked(self: &Rc<Self>, idx: usize) {
@@ -1650,6 +2127,21 @@ impl AppState {
         }
     }
 
+    /// The switcher row's own "×" close button — added alongside the row
+    /// button itself only for `SwitcherRow::Open` rows (see
+    /// `rebuild_switcher_rows`), so `idx` is always safe to look up here.
+    /// Doesn't close the whole switcher overlay — closing a page while
+    /// still filtering/picking another one is the expected flow, matching
+    /// `browser-linux-gtk3`'s tile close button.
+    fn switcher_row_close_clicked(self: &Rc<Self>, idx: usize) {
+        let rows = self.switcher_rows.borrow();
+        let Some(browser_chrome_core::SwitcherRow::Open { id, .. }) = rows.get(idx) else { return };
+        let id = id.clone();
+        drop(rows);
+        self.close_page(&id);
+        self.rebuild_switcher_rows();
+    }
+
     /// Rebuilds the keybindings editor's rows — one per `Action::ALL`,
     /// showing its label, current chords as removable "×" buttons, and
     /// either an "Add binding" button or (while `listening_for ==
@@ -1661,8 +2153,11 @@ impl AppState {
         clear_subviews(&self.keybindings_rows_container);
         let listening_for = self.listening_for.get();
         let actions = Action::ALL;
+        let container_height = self.keybindings_rows_container.frame().size.height;
         for (row_idx, &action) in actions.iter().enumerate() {
-            let y = (actions.len() - 1 - row_idx) as f64 * ROW_HEIGHT;
+            // Top-anchored, not bottom — see `rebuild_bookmarks_rows`'s doc
+            // comment on the identical fix.
+            let y = container_height - (row_idx + 1) as f64 * ROW_HEIGHT;
             let label = unsafe {
                 NSButton::buttonWithTitle_target_action(&NSString::from_str(action.label()), None, None, mtm)
             };
@@ -1674,8 +2169,16 @@ impl AppState {
             let mut x = 210.0;
             let chords = self.keybindings.borrow().bindings_for(action).to_vec();
             for chord in &chords {
+                // `target: None` + a real `action` — nil-targeted, same as
+                // every other dynamically-created row button in this crate
+                // (see `rebuild_switcher_rows`'s doc comment for the
+                // pattern and why these three keybindings-row buttons in
+                // particular were confirmed *missing* their action
+                // entirely, despite already having a `.setTag()` and an
+                // already-implemented, already-wired-as-a-delegate-method
+                // selector sitting unused).
                 let remove = unsafe {
-                    NSButton::buttonWithTitle_target_action(&NSString::from_str(&format!("{chord} \u{d7}")), None, None, mtm)
+                    NSButton::buttonWithTitle_target_action(&NSString::from_str(&format!("{chord} \u{d7}")), None, Some(sel!(keybindingRemoveClicked:)), mtm)
                 };
                 remove.setTag(row_idx as isize);
                 remove.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(90.0, ROW_HEIGHT - BUTTON_MARGIN)));
@@ -1688,12 +2191,17 @@ impl AppState {
                 self.new_binding_field.setHidden(false);
                 self.keybindings_rows_container.addSubview(&self.new_binding_field);
                 x += 144.0;
-                let ok = unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str("OK"), None, None, mtm) };
+                // Same `keybindingCommit:` selector `new_binding_field`
+                // itself uses on Enter (see its `setAction` call below) —
+                // this button is just a mouse-click affordance for the
+                // same commit action, reading the same `sender_tag`-based
+                // `action_idx`.
+                let ok = unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str("OK"), None, Some(sel!(keybindingCommit:)), mtm) };
                 ok.setTag(row_idx as isize);
                 ok.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(40.0, ROW_HEIGHT - BUTTON_MARGIN)));
                 self.keybindings_rows_container.addSubview(&ok);
             } else {
-                let add = unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str("Add binding"), None, None, mtm) };
+                let add = unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str("Add binding"), None, Some(sel!(keybindingAddClicked:)), mtm) };
                 add.setTag(row_idx as isize);
                 add.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(100.0, ROW_HEIGHT - BUTTON_MARGIN)));
                 self.keybindings_rows_container.addSubview(&add);
@@ -1757,15 +2265,21 @@ impl AppState {
         let mtm = self.mtm();
         clear_subviews(&self.profile_rows_container);
         let width = self.profile_rows_container.frame().size.width;
+        let container_height = self.profile_rows_container.frame().size.height;
         let current_profile = self.profile.name.clone();
         let names = list_profile_names();
         for (idx, name) in names.iter().enumerate() {
             let is_current = *name == current_profile;
             let label = if is_current { format!("{name} (current)") } else { name.clone() };
-            let button = unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str(&label), None, None, mtm) };
+            // `target: None` + `Some(sel!(profileRowClicked:))` — same
+            // nil-targeted-action pattern as `rebuild_switcher_rows`; this
+            // row was confirmed to have the exact same missing-action bug.
+            let button = unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str(&label), None, Some(sel!(profileRowClicked:)), mtm) };
             button.setTag(idx as isize);
+            // Top-anchored, not bottom — see `rebuild_bookmarks_rows`'s doc
+            // comment on the identical fix.
             button.setFrame(NSRect::new(
-                NSPoint::new(0.0, (names.len() - 1 - idx) as f64 * ROW_HEIGHT),
+                NSPoint::new(0.0, container_height - (idx + 1) as f64 * ROW_HEIGHT),
                 NSSize::new(width, ROW_HEIGHT - BUTTON_MARGIN),
             ));
             self.profile_rows_container.addSubview(&button);
@@ -1803,8 +2317,36 @@ fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+/// Parses a `"#RRGGBB"` string — `browser_core::PALETTE`'s own format,
+/// already used as a literal CSS `background-color` on gtk3/reactor — into
+/// a real `NSColor`. Returns `None` on anything malformed rather than
+/// panicking: this only ever feeds a cosmetic row tint, never worth
+/// crashing over.
+fn hex_color(hex: &str) -> Option<Retained<NSColor>> {
+    let hex = hex.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(NSColor::colorWithSRGBRed_green_blue_alpha(r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0, 1.0))
+}
+
 fn clear_subviews(view: &NSView) {
-    for subview in view.subviews().iter() {
+    // Collected into an owned `Vec` *before* removing anything, not a
+    // single combined loop: `view.subviews()` is the view's own live
+    // array, and `removeFromSuperview()` mutates it — calling that from
+    // inside the same iteration that's still walking that array is a
+    // textbook "mutated while being enumerated" crash. Confirmed directly:
+    // a real click on the title chip (whose handler ends up calling this)
+    // crashed the app outright on real hardware. Fully draining the
+    // iterator into `subviews` first finishes enumerating the live array
+    // with no mutation in between; the removal loop below then only ever
+    // touches a plain Rust `Vec`, fully detached from AppKit's own
+    // enumeration state.
+    let subviews: Vec<_> = view.subviews().iter().collect();
+    for subview in subviews {
         subview.removeFromSuperview();
     }
 }
@@ -1937,6 +2479,15 @@ define_class!(
             if let Some(state) = self.ivars().state.borrow().as_ref() {
                 if let Some(idx) = sender_tag(sender) {
                     state.switcher_row_clicked(idx);
+                }
+            }
+        }
+
+        #[unsafe(method(switcherRowCloseClicked:))]
+        fn switcher_row_close_clicked(&self, sender: Option<&AnyObject>) {
+            if let Some(state) = self.ivars().state.borrow().as_ref() {
+                if let Some(idx) = sender_tag(sender) {
+                    state.switcher_row_close_clicked(idx);
                 }
             }
         }
@@ -2162,6 +2713,73 @@ define_class!(
         }
     }
 
+    // `address_bar`'s delegate (see its own `setDelegate` call) — live
+    // switcher filtering as the user types, not just a snapshot taken when
+    // it first opens. Confirmed missing entirely: no delegate was ever set
+    // on `address_bar` at all, so nothing was notified on keystrokes.
+    unsafe impl NSControlTextEditingDelegate for AppDelegate {
+        #[unsafe(method(controlTextDidChange:))]
+        fn control_text_did_change(&self, _notification: &NSNotification) {
+            if let Some(state) = self.ivars().state.borrow().as_ref() {
+                state.address_bar_text_changed();
+            }
+        }
+
+        // Escape, while `address_bar` has keyboard focus (always true while
+        // any overlay is open — `open_switcher`/etc. all call
+        // `makeFirstResponder`), never reached the "Close Overlay" menu
+        // item's key equivalent at all: unmodified keys with a built-in
+        // text-editing meaning are consumed by the field editor's own
+        // command dispatch (`cancelOperation:`, Escape's default binding)
+        // *before* `-[NSApplication sendEvent:]` gets to matching menu key
+        // equivalents, unlike modifier-having shortcuts (confirmed
+        // directly: every other keyboard shortcut in this app is a real
+        // modifier chord and none had this problem). Intercepting the
+        // command here and reporting it as handled (`true`) is the
+        // documented way to override what a field editor does with a
+        // specific command selector.
+        #[unsafe(method(control:textView:doCommandBySelector:))]
+        #[allow(non_snake_case)] // required name, from objc2-app-kit's own generated `NSControlTextEditingDelegate` trait
+        unsafe fn control_textView_doCommandBySelector(&self, _control: &NSControl, _text_view: &NSTextView, command_selector: objc2::runtime::Sel) -> bool {
+            if command_selector == sel!(cancelOperation:) {
+                if let Some(state) = self.ivars().state.borrow().as_ref() {
+                    state.close_all_overlays();
+                }
+                return true.into();
+            }
+            // Same interception reasoning as `cancelOperation:` above, just
+            // for the switcher's own arrow-key row navigation instead of
+            // Escape — bare Up/Down are field-editor commands
+            // (`moveUp:`/`moveDown:`, the text cursor's default single-line
+            // behavior) that would otherwise never reach anything else.
+            // Scoped to `is_switcher_open()` rather than applying to every
+            // delegated text field (this delegate is shared by ~11 of
+            // them): none of the others have rows to navigate, and at least
+            // one (`new_binding_field`) needs its own raw key handling
+            // undisturbed.
+            if command_selector == sel!(moveUp:) || command_selector == sel!(moveDown:) {
+                if let Some(state) = self.ivars().state.borrow().as_ref() {
+                    if state.is_switcher_open() {
+                        let direction = if command_selector == sel!(moveUp:) {
+                            browser_chrome_core::SwitcherNavDirection::Up
+                        } else {
+                            browser_chrome_core::SwitcherNavDirection::Down
+                        };
+                        state.switcher_navigate(direction);
+                        return true.into();
+                    }
+                }
+            }
+            false.into()
+        }
+    }
+
+    // `NSTextField::setDelegate` requires this exact protocol type — every
+    // one of its own methods is `#[optional]`, so this empty impl (plus
+    // the real `NSControlTextEditingDelegate` one above, which it extends)
+    // is all `address_bar.setDelegate` below needs.
+    unsafe impl NSTextFieldDelegate for AppDelegate {}
+
     // Gates the "Close Overlay" (Escape) menu item built in
     // `shortcuts::build_menu` — see its own comment for why: an enabled
     // menu item's key equivalent always fires and swallows the event, which
@@ -2244,6 +2862,23 @@ impl App {
 /// site doesn't repeat the same three-call dance.
 fn make_button(title: &str, target: &AnyObject, action: objc2::runtime::Sel, mtm: MainThreadMarker) -> Retained<NSButton> {
     unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str(title), Some(target), Some(action), mtm) }
+}
+
+/// The main toolbar's icon buttons (back/forward/reload, switcher,
+/// settings, profile, passwords, bookmark toggle, bookmarks) specifically —
+/// flat (no bezel/border, since a native push-button bezel would look wrong
+/// floating over the now-transparent title bar the toolbar lives in, see
+/// `build_window_and_app`) and a bigger explicit font than a normal push
+/// button's default, so each glyph gets real room instead of being sized
+/// for button text. Not used for anything else in the toolbar (the title
+/// chip's own invisible click-catcher already sets `setBordered(false)`
+/// itself) or for any other button in the app (overlay Cancel/Save/Close
+/// etc. keep the normal bordered look, which is correct for them).
+fn make_toolbar_button(title: &str, target: &AnyObject, action: objc2::runtime::Sel, mtm: MainThreadMarker) -> Retained<NSButton> {
+    let button = make_button(title, target, action, mtm);
+    button.setBordered(false);
+    button.setFont(Some(&NSFont::systemFontOfSize(20.0)));
+    button
 }
 
 /// Toggles the toolbar's title chip between its at-rest look (a subtle
@@ -2424,26 +3059,55 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
     let delegate = AppDelegate::new(mtm);
 
     let window_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1000.0, 700.0));
-    let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable | NSWindowStyleMask::Resizable;
+    let style = NSWindowStyleMask::Titled
+        | NSWindowStyleMask::Closable
+        | NSWindowStyleMask::Miniaturizable
+        | NSWindowStyleMask::Resizable
+        | NSWindowStyleMask::FullSizeContentView;
     let window = unsafe { NSWindow::initWithContentRect_styleMask_backing_defer(NSWindow::alloc(mtm), window_rect, style, NSBackingStoreType::Buffered, false) };
     window.setTitle(&NSString::from_str(APP_TITLE));
     window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+    // The toolbar (below) now occupies the title-bar band itself instead of
+    // sitting in its own row underneath a separate opaque one — moves the
+    // toolbar buttons "into the title area" per the redesign this was built
+    // for. `FullSizeContentView` (above) is what lets `content_root` extend
+    // up under the title bar at all; these two calls are what make that
+    // extension actually look right (no title text competing with the
+    // toolbar's own title chip, no opaque bar drawn over it).
+    window.setTitlebarAppearsTransparent(true);
+    window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+    // The real native title bar drags the window automatically; this
+    // hand-rolled one (`toolbar_view`, below) is a plain `NSView` sitting
+    // where the title bar visually is, which doesn't get that for free —
+    // confirmed directly: dragging broke the moment the toolbar moved into
+    // the title-bar band. `movableByWindowBackground` restores it: a
+    // `mouseDown` that no button/control in `toolbar_view` consumes climbs
+    // the responder chain (`NSView`'s default `mouseDown:` forwards to
+    // `nextResponder` unless overridden) until it reaches the window
+    // itself, which then starts a drag.
+    window.setMovableByWindowBackground(true);
 
     let content_root = window.contentView().ok_or_else(|| anyhow::anyhow!("NSWindow has no content view"))?;
 
     let toolbar_view = NSView::initWithFrame(NSView::alloc(mtm), NSRect::new(NSPoint::new(0.0, window_rect.size.height - TOOLBAR_HEIGHT), NSSize::new(window_rect.size.width, TOOLBAR_HEIGHT)));
     content_root.addSubview(&toolbar_view);
 
-    let back_button = make_button("\u{2190}", &delegate, sel!(goBack:), mtm);
-    back_button.setFrame(NSRect::new(NSPoint::new(BUTTON_MARGIN, BUTTON_MARGIN), NSSize::new(BUTTON_WIDTH, TOOLBAR_HEIGHT - 2.0 * BUTTON_MARGIN)));
+    let back_button = make_toolbar_button("\u{2190}", &delegate, sel!(goBack:), mtm);
+    back_button.setFrame(NSRect::new(NSPoint::new(TRAFFIC_LIGHT_RESERVE + BUTTON_MARGIN, BUTTON_MARGIN), NSSize::new(BUTTON_WIDTH, TOOLBAR_HEIGHT - 2.0 * BUTTON_MARGIN)));
     toolbar_view.addSubview(&back_button);
 
-    let forward_button = make_button("\u{2192}", &delegate, sel!(goForward:), mtm);
-    forward_button.setFrame(NSRect::new(NSPoint::new(2.0 * BUTTON_MARGIN + BUTTON_WIDTH, BUTTON_MARGIN), NSSize::new(BUTTON_WIDTH, TOOLBAR_HEIGHT - 2.0 * BUTTON_MARGIN)));
+    let forward_button = make_toolbar_button("\u{2192}", &delegate, sel!(goForward:), mtm);
+    forward_button.setFrame(NSRect::new(
+        NSPoint::new(TRAFFIC_LIGHT_RESERVE + 2.0 * BUTTON_MARGIN + BUTTON_WIDTH, BUTTON_MARGIN),
+        NSSize::new(BUTTON_WIDTH, TOOLBAR_HEIGHT - 2.0 * BUTTON_MARGIN),
+    ));
     toolbar_view.addSubview(&forward_button);
 
-    let reload_button = make_button("\u{21BB}", &delegate, sel!(reloadPage:), mtm);
-    reload_button.setFrame(NSRect::new(NSPoint::new(3.0 * BUTTON_MARGIN + 2.0 * BUTTON_WIDTH, BUTTON_MARGIN), NSSize::new(BUTTON_WIDTH, TOOLBAR_HEIGHT - 2.0 * BUTTON_MARGIN)));
+    let reload_button = make_toolbar_button("\u{21BB}", &delegate, sel!(reloadPage:), mtm);
+    reload_button.setFrame(NSRect::new(
+        NSPoint::new(TRAFFIC_LIGHT_RESERVE + 3.0 * BUTTON_MARGIN + 2.0 * BUTTON_WIDTH, BUTTON_MARGIN),
+        NSSize::new(BUTTON_WIDTH, TOOLBAR_HEIGHT - 2.0 * BUTTON_MARGIN),
+    ));
     toolbar_view.addSubview(&reload_button);
 
     // A clickable "title chip", not a text field — shows the active page's
@@ -2492,17 +3156,17 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
     title_chip_button.setBordered(false);
     toolbar_view.addSubview(&title_chip_button);
 
-    let switcher_button = make_button("\u{229e}", &delegate, sel!(toggleSwitcher:), mtm);
+    let switcher_button = make_toolbar_button("\u{229e}", &delegate, sel!(toggleSwitcher:), mtm);
     toolbar_view.addSubview(&switcher_button);
-    let settings_button = make_button("\u{2699}", &delegate, sel!(openSettingsAction:), mtm);
+    let settings_button = make_toolbar_button("\u{2699}", &delegate, sel!(openSettingsAction:), mtm);
     toolbar_view.addSubview(&settings_button);
-    let profile_button = make_button("\u{1f464}", &delegate, sel!(openProfilePickerAction:), mtm);
+    let profile_button = make_toolbar_button("\u{1f464}", &delegate, sel!(openProfilePickerAction:), mtm);
     toolbar_view.addSubview(&profile_button);
-    let passwords_button = make_button("\u{1f511}", &delegate, sel!(openPasswordsAction:), mtm);
+    let passwords_button = make_toolbar_button("\u{1f511}", &delegate, sel!(openPasswordsAction:), mtm);
     toolbar_view.addSubview(&passwords_button);
-    let bookmark_toggle_button = make_button("\u{2606}", &delegate, sel!(toggleBookmarkAction:), mtm);
+    let bookmark_toggle_button = make_toolbar_button("\u{2606}", &delegate, sel!(toggleBookmarkAction:), mtm);
     toolbar_view.addSubview(&bookmark_toggle_button);
-    let bookmarks_button = make_button("\u{1f516}", &delegate, sel!(openBookmarksAction:), mtm);
+    let bookmarks_button = make_toolbar_button("\u{1f516}", &delegate, sel!(openBookmarksAction:), mtm);
     toolbar_view.addSubview(&bookmarks_button);
 
     let content_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(window_rect.size.width, window_rect.size.height - TOOLBAR_HEIGHT));
@@ -2520,13 +3184,21 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
     // title chip's click, the URL editor for the active page — one widget
     // for both roles, same as before, just relocated out of the toolbar.
     let address_bar = make_text_field(mtm, "");
+    // Width stops short of the full content area — `make_overlay_chrome`'s
+    // `close_button`/`esc_hint` sit in the same top row, in the right-hand
+    // `OVERLAY_MARGIN + CLOSE_BUTTON_SIZE + HINT_WIDTH` strip, and this
+    // field previously spanned the *entire* width with no gap reserved for
+    // them at all — confirmed directly: the address bar's own frame really
+    // did extend underneath (behind, in the earlier-added/lower z-order
+    // sense) the overlay's close button and Esc hint the whole time.
     address_bar.setFrame(NSRect::new(
         NSPoint::new(OVERLAY_MARGIN, content_frame.size.height - OVERLAY_MARGIN - ROW_HEIGHT),
-        NSSize::new(content_frame.size.width - 2.0 * OVERLAY_MARGIN, ROW_HEIGHT - BUTTON_MARGIN),
+        NSSize::new(content_frame.size.width - 2.0 * OVERLAY_MARGIN - CLOSE_BUTTON_SIZE - HINT_WIDTH - 14.0, ROW_HEIGHT - BUTTON_MARGIN),
     ));
     unsafe {
         address_bar.setTarget(Some(&*delegate));
         address_bar.setAction(Some(sel!(addressBarActivated:)));
+        address_bar.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     }
     switcher_view.addSubview(&address_bar);
     let switcher_rows_container = NSView::initWithFrame(NSView::alloc(mtm), NSRect::new(NSPoint::new(OVERLAY_MARGIN, OVERLAY_MARGIN), NSSize::new(content_frame.size.width - 2.0 * OVERLAY_MARGIN, content_frame.size.height - 2.0 * OVERLAY_MARGIN - ROW_HEIGHT)));
@@ -2544,6 +3216,7 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
     settings_view.addSubview(&settings_chrome.backdrop);
     let start_page_field = make_text_field(mtm, &settings.start_page);
     start_page_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, content_frame.size.height - OVERLAY_MARGIN - ROW_HEIGHT), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+    unsafe { start_page_field.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
     settings_view.addSubview(&start_page_field);
 
     let unlimited_checkbox = make_button("Unlimited loaded pages", &delegate, sel!(toggleUnlimitedAction:), mtm);
@@ -2553,6 +3226,7 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
 
     let limit_field = make_text_field(mtm, "");
     limit_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, content_frame.size.height - OVERLAY_MARGIN - 3.0 * ROW_HEIGHT), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+    unsafe { limit_field.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
     settings_view.addSubview(&limit_field);
 
     // No live-toggle action needed (unlike `unlimited_checkbox`, which
@@ -2566,6 +3240,7 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
     let bitwarden_url_field = make_text_field(mtm, "");
     bitwarden_url_field.setPlaceholderString(Some(&NSString::from_str("http://127.0.0.1:8087")));
     bitwarden_url_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN + 224.0, content_frame.size.height - OVERLAY_MARGIN - 4.0 * ROW_HEIGHT), NSSize::new(OVERLAY_WIDTH - 224.0, ROW_HEIGHT - BUTTON_MARGIN)));
+    unsafe { bitwarden_url_field.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
     settings_view.addSubview(&bitwarden_url_field);
 
     // Reuses the exact widget/pattern `passwords_destination_popup` already
@@ -2588,6 +3263,7 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
     unsafe {
         new_binding_field.setTarget(Some(&*delegate));
         new_binding_field.setAction(Some(sel!(keybindingCommit:)));
+        new_binding_field.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     }
     new_binding_field.setHidden(true);
 
@@ -2613,6 +3289,7 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
     let new_profile_field = make_text_field(mtm, "");
     new_profile_field.setPlaceholderString(Some(&NSString::from_str("New profile name\u{2026}")));
     new_profile_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, OVERLAY_MARGIN + ROW_HEIGHT), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+    unsafe { new_profile_field.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
     profile_view.addSubview(&new_profile_field);
     let profile_cancel = make_button("Cancel", &delegate, sel!(closeAnyOverlay:), mtm);
     profile_cancel.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, OVERLAY_MARGIN), NSSize::new(90.0, ROW_HEIGHT - BUTTON_MARGIN)));
@@ -2656,6 +3333,7 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
     unsafe {
         passwords_unlock_field.setTarget(Some(&*delegate));
         passwords_unlock_field.setAction(Some(sel!(unlockVaultAction:)));
+        passwords_unlock_field.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     }
     passwords_unlock_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(2.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
     passwords_view.addSubview(&passwords_unlock_field);
@@ -2671,22 +3349,26 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
     let passwords_site_field = make_text_field(mtm, "");
     passwords_site_field.setPlaceholderString(Some(&NSString::from_str("Site (e.g. https://example.com)")));
     passwords_site_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(1.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+    unsafe { passwords_site_field.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
     passwords_view.addSubview(&passwords_site_field);
     let passwords_username_field = make_text_field(mtm, "");
     passwords_username_field.setPlaceholderString(Some(&NSString::from_str("Username")));
     passwords_username_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(2.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+    unsafe { passwords_username_field.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
     passwords_view.addSubview(&passwords_username_field);
     let passwords_password_field = NSSecureTextField::new(mtm);
     passwords_password_field.setPlaceholderString(Some(&NSString::from_str("Password")));
     unsafe {
         passwords_password_field.setTarget(Some(&*delegate));
         passwords_password_field.setAction(Some(sel!(submitLoginAction:)));
+        passwords_password_field.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     }
     passwords_password_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(3.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
     passwords_view.addSubview(&passwords_password_field);
     let passwords_notes_field = make_text_field(mtm, "");
     passwords_notes_field.setPlaceholderString(Some(&NSString::from_str("Notes (optional)")));
     passwords_notes_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, row_y(4.0)), NSSize::new(OVERLAY_WIDTH, ROW_HEIGHT - BUTTON_MARGIN)));
+    unsafe { passwords_notes_field.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
     passwords_view.addSubview(&passwords_notes_field);
 
     // Read via `titleOfSelectedItem()` only when the submit button is
@@ -2726,6 +3408,7 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
     unsafe {
         bitwarden_unlock_field.setTarget(Some(&*delegate));
         bitwarden_unlock_field.setAction(Some(sel!(unlockBitwardenAction:)));
+        bitwarden_unlock_field.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     }
     bitwarden_unlock_field.setFrame(NSRect::new(NSPoint::new(OVERLAY_MARGIN, OVERLAY_MARGIN + ROW_HEIGHT), NSSize::new(260.0, ROW_HEIGHT - BUTTON_MARGIN)));
     bitwarden_unlock_field.setHidden(true);
@@ -2756,6 +3439,20 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
     bookmarks_view.addSubview(&bookmarks_close_button);
     bookmarks_view.addSubview(&bookmarks_chrome.close_button);
     bookmarks_view.addSubview(&bookmarks_chrome.esc_hint);
+    // A real, editable (if invisible) text field purely so this overlay has
+    // *something* to focus that Escape actually works on — see
+    // `open_bookmarks`'s doc comment: this overlay has no other text field,
+    // and a focused `NSButton` (unlike `NSTextField`) doesn't auto-translate
+    // Escape into `cancelOperation:` at all, confirmed directly. 1×1 and
+    // undecorated so it's not visible or in the way; still real enough to
+    // get a field editor and this delegate's `control:textView:
+    // doCommandBySelector:` override.
+    let bookmarks_focus_catcher = make_text_field(mtm, "");
+    bookmarks_focus_catcher.setBordered(false);
+    bookmarks_focus_catcher.setDrawsBackground(false);
+    bookmarks_focus_catcher.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)));
+    unsafe { bookmarks_focus_catcher.setDelegate(Some(ProtocolObject::from_ref(&*delegate))) };
+    bookmarks_view.addSubview(&bookmarks_focus_catcher);
 
     let initial_vault_state = if profile.has_vault_passphrase() { VaultState::Locked } else { VaultState::NotSetUp };
 
@@ -2796,6 +3493,7 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
         switcher_chrome,
         switcher_rows_container,
         switcher_rows: RefCell::new(Vec::new()),
+        selected_switcher_index: RefCell::new(None),
         settings_view,
         settings_chrome,
         start_page_field,
@@ -2834,6 +3532,7 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
         bookmarks_view,
         bookmarks_chrome,
         bookmarks_rows_container,
+        bookmarks_focus_catcher,
         bookmarks_rows: RefCell::new(Vec::new()),
         settings: RefCell::new(settings),
         bitwarden_checkbox,

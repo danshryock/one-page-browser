@@ -60,6 +60,13 @@ pub enum SwitcherRow {
     /// — see `HistoryBackend::search_similar`'s doc comment for exactly
     /// what "similar" means here.
     Similar { url: String, title: String, domain: String },
+    /// A non-activatable section label ("Open Pages", "History", ...) —
+    /// `activate_row` always returns `None` for one of these, and every
+    /// frontend renders it as a divider/heading instead of a normal row.
+    /// Inserted once per non-empty group, immediately before that group's
+    /// first real row (never for an empty group — no "History" heading
+    /// with nothing under it).
+    Header(&'static str),
 }
 
 /// What activating a row (clicking it, or a single unambiguous match from a
@@ -90,6 +97,7 @@ pub fn build_switcher_rows<E: RenderEngine, H: HistoryBackend>(
 ) -> Vec<SwitcherRow> {
     let open_matches = core.matching_ids(query);
     let mut rows: Vec<SwitcherRow> = Vec::new();
+    let mut open_rows: Vec<SwitcherRow> = Vec::new();
     for page in core.pages() {
         if !open_matches.contains(&page.id) {
             continue;
@@ -99,7 +107,14 @@ pub fn build_switcher_rows<E: RenderEngine, H: HistoryBackend>(
         let url = page.current_url();
         let domain = domain_of(&url);
         let domain = if page.loaded { domain } else { format!("{domain} \u{b7} unloaded") };
-        rows.push(SwitcherRow::Open { id: page.id.clone(), title, domain, color: page.color });
+        open_rows.push(SwitcherRow::Open { id: page.id.clone(), title, domain, color: page.color });
+    }
+    // No header before an empty group, `Open` included — matches every
+    // other group below (a "History" heading over zero history rows would
+    // be exactly as pointless).
+    if !open_rows.is_empty() {
+        rows.push(SwitcherRow::Header("Open Pages"));
+        rows.extend(open_rows);
     }
     rows.push(SwitcherRow::Add);
 
@@ -113,27 +128,37 @@ pub fn build_switcher_rows<E: RenderEngine, H: HistoryBackend>(
         eprintln!("history search failed: {err}");
         Vec::new()
     });
+    let mut history_rows: Vec<SwitcherRow> = Vec::new();
     for entry in history_matches {
         if shown_urls.contains(&entry.url) {
             continue;
         }
         shown_urls.push(entry.url.clone());
         let title = if entry.title.is_empty() { "New Page".to_string() } else { entry.title };
-        rows.push(SwitcherRow::History { url: entry.url, title, domain: format!("{} \u{b7} history", entry.domain) });
+        history_rows.push(SwitcherRow::History { url: entry.url, title, domain: format!("{} \u{b7} history", entry.domain) });
+    }
+    if !history_rows.is_empty() {
+        rows.push(SwitcherRow::Header("History"));
+        rows.extend(history_rows);
     }
 
     if let Some(bookmarks) = bookmarks {
+        let mut bookmark_rows: Vec<SwitcherRow> = Vec::new();
         for bookmark in bookmarks.search(query).into_iter().take(8) {
             if shown_urls.contains(&bookmark.url) {
                 continue;
             }
             shown_urls.push(bookmark.url.clone());
             let title = if bookmark.title.is_empty() { "New Page".to_string() } else { bookmark.title.clone() };
-            rows.push(SwitcherRow::Bookmark {
+            bookmark_rows.push(SwitcherRow::Bookmark {
                 url: bookmark.url.clone(),
                 title,
                 domain: format!("{} \u{b7} bookmark", bookmark.domain),
             });
+        }
+        if !bookmark_rows.is_empty() {
+            rows.push(SwitcherRow::Header("Bookmarks"));
+            rows.extend(bookmark_rows);
         }
     }
 
@@ -141,13 +166,18 @@ pub fn build_switcher_rows<E: RenderEngine, H: HistoryBackend>(
         eprintln!("history similarity search failed: {err}");
         Vec::new()
     });
+    let mut similar_rows: Vec<SwitcherRow> = Vec::new();
     for entry in similar_matches {
         if shown_urls.contains(&entry.url) {
             continue;
         }
         shown_urls.push(entry.url.clone());
         let title = if entry.title.is_empty() { "New Page".to_string() } else { entry.title };
-        rows.push(SwitcherRow::Similar { url: entry.url, title, domain: format!("{} \u{b7} similar", entry.domain) });
+        similar_rows.push(SwitcherRow::Similar { url: entry.url, title, domain: format!("{} \u{b7} similar", entry.domain) });
+    }
+    if !similar_rows.is_empty() {
+        rows.push(SwitcherRow::Header("Similar"));
+        rows.extend(similar_rows);
     }
 
     rows
@@ -165,6 +195,33 @@ pub fn activate_row(rows: &[SwitcherRow], idx: usize, start_page: &str) -> Optio
         SwitcherRow::Add => Some(SwitcherActivation::OpenNewPage(start_page.to_string())),
         SwitcherRow::History { url, .. } | SwitcherRow::Bookmark { url, .. } | SwitcherRow::Similar { url, .. } => {
             Some(SwitcherActivation::OpenNewPage(url.clone()))
+        }
+        SwitcherRow::Header(_) => None,
+    }
+}
+
+/// The nearest activatable row to `from` in `direction` (skipping any
+/// `Header` rows in between) — the shared model for arrow-key navigation,
+/// so each frontend's Up/Down handling is just "call this, then select
+/// whatever it returns" rather than re-deriving the skip-headers logic
+/// itself. `from: None` starts from the first (Down) or last (Up)
+/// activatable row — the natural "nothing selected yet" case.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SwitcherNavDirection {
+    Up,
+    Down,
+}
+
+pub fn next_activatable_row(rows: &[SwitcherRow], from: Option<usize>, direction: SwitcherNavDirection) -> Option<usize> {
+    let is_activatable = |row: &SwitcherRow| !matches!(row, SwitcherRow::Header(_));
+    match direction {
+        SwitcherNavDirection::Down => {
+            let start = from.map(|i| i + 1).unwrap_or(0);
+            (start..rows.len()).find(|&i| is_activatable(&rows[i]))
+        }
+        SwitcherNavDirection::Up => {
+            let start = from.unwrap_or(rows.len());
+            (0..start).rev().find(|&i| is_activatable(&rows[i]))
         }
     }
 }
@@ -193,8 +250,9 @@ mod tests {
         let history = MemoryHistoryStore::default();
 
         let rows = build_switcher_rows(&mgr, &history, None, "");
-        assert_eq!(rows.len(), 3); // 2 open pages + Add
-        assert!(matches!(rows[2], SwitcherRow::Add));
+        assert_eq!(rows.len(), 4); // Header + 2 open pages + Add
+        assert!(matches!(rows[0], SwitcherRow::Header("Open Pages")));
+        assert!(matches!(rows[3], SwitcherRow::Add));
     }
 
     #[test]
@@ -205,11 +263,13 @@ mod tests {
         history.record_visit("https://rust-lang.org/learn", "Learn Rust").unwrap();
 
         let rows = build_switcher_rows(&mgr, &history, None, "rust");
-        // The open "example.com" page shouldn't match "rust" at all, so
-        // just Add + the one history entry.
-        assert_eq!(rows.len(), 2);
+        // The open "example.com" page shouldn't match "rust" at all (no
+        // "Open Pages" header at all, then), so: Add, then a "History"
+        // header, then the one history entry.
+        assert_eq!(rows.len(), 3);
         assert!(matches!(rows[0], SwitcherRow::Add));
-        assert!(matches!(&rows[1], SwitcherRow::History { url, .. } if url == "https://rust-lang.org/learn"));
+        assert!(matches!(rows[1], SwitcherRow::Header("History")));
+        assert!(matches!(&rows[2], SwitcherRow::History { url, .. } if url == "https://rust-lang.org/learn"));
     }
 
     #[test]
@@ -220,11 +280,12 @@ mod tests {
         history.record_visit("https://rust-lang.org/learn", "Learn Rust").unwrap();
 
         let rows = build_switcher_rows(&mgr, &history, None, "rust");
-        // Open page matches "rust" in its URL, so: Open row + Add — no
-        // second History row for the same URL.
-        assert_eq!(rows.len(), 2);
-        assert!(matches!(rows[0], SwitcherRow::Open { .. }));
-        assert!(matches!(rows[1], SwitcherRow::Add));
+        // Open page matches "rust" in its URL, so: an "Open Pages" header,
+        // the Open row, then Add — no second History row for the same URL.
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(rows[0], SwitcherRow::Header("Open Pages")));
+        assert!(matches!(rows[1], SwitcherRow::Open { .. }));
+        assert!(matches!(rows[2], SwitcherRow::Add));
     }
 
     #[test]
@@ -234,7 +295,7 @@ mod tests {
         let history = MemoryHistoryStore::default();
 
         let rows = build_switcher_rows(&mgr, &history, None, "");
-        let SwitcherRow::Open { color, .. } = &rows[0] else { panic!("expected an Open row") };
+        let SwitcherRow::Open { color, .. } = &rows[1] else { panic!("expected an Open row") };
         assert!(!color.is_empty());
     }
 
@@ -297,7 +358,8 @@ mod tests {
         let history = MemoryHistoryStore::default();
         let rows = build_switcher_rows(&mgr, &history, None, "");
 
-        assert_eq!(activate_row(&rows, 0, "https://start.example"), Some(SwitcherActivation::SwitchTo("0".to_string())));
+        // rows[0] is the "Open Pages" header now, not the row itself.
+        assert_eq!(activate_row(&rows, 1, "https://start.example"), Some(SwitcherActivation::SwitchTo("0".to_string())));
     }
 
     #[test]
@@ -345,5 +407,46 @@ mod tests {
         let history = MemoryHistoryStore::default();
         let rows = build_switcher_rows(&mgr, &history, None, "");
         assert_eq!(activate_row(&rows, 99, "https://start.example"), None);
+    }
+
+    #[test]
+    fn activate_header_row_is_none() {
+        let mut mgr = PageManager::<MockEngine>::new(None);
+        insert_page(&mut mgr, "https://example.com");
+        let history = MemoryHistoryStore::default();
+        let rows = build_switcher_rows(&mgr, &history, None, "");
+        assert!(matches!(rows[0], SwitcherRow::Header("Open Pages")));
+        assert_eq!(activate_row(&rows, 0, "https://start.example"), None);
+    }
+
+    #[test]
+    fn no_header_for_an_empty_group() {
+        // No open pages, no query: just Add — no "Open Pages" header with
+        // nothing under it, no "History"/"Bookmarks" headers either since
+        // there's no query to search with.
+        let mgr = PageManager::<MockEngine>::new(None);
+        let history = MemoryHistoryStore::default();
+        let rows = build_switcher_rows(&mgr, &history, None, "");
+        assert!(!rows.iter().any(|r| matches!(r, SwitcherRow::Header(_))));
+    }
+
+    #[test]
+    fn next_activatable_row_skips_headers_in_both_directions() {
+        let mut mgr = PageManager::<MockEngine>::new(None);
+        insert_page(&mut mgr, "https://example.com");
+        let history = MemoryHistoryStore::default();
+        let rows = build_switcher_rows(&mgr, &history, None, "");
+        // Header("Open Pages"), Open, Add.
+        assert!(matches!(rows[0], SwitcherRow::Header(_)));
+
+        // Starting from nothing, Down lands on the first real row (index 1,
+        // skipping the header at 0), not the header itself.
+        assert_eq!(next_activatable_row(&rows, None, SwitcherNavDirection::Down), Some(1));
+        // From the last row, Up walks back to index 1 too — never landing
+        // on index 0's header.
+        assert_eq!(next_activatable_row(&rows, Some(2), SwitcherNavDirection::Up), Some(1));
+        // From row 1, Up has nowhere activatable left (row 0 is a header) —
+        // stays put by returning None, same as running off either end.
+        assert_eq!(next_activatable_row(&rows, Some(1), SwitcherNavDirection::Up), None);
     }
 }

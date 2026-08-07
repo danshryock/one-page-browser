@@ -1464,17 +1464,31 @@ fn tile_key(tile: &browser_chrome_core::SwitcherRow) -> String {
         // match stays exhaustive if that changes.
         SwitcherRow::Bookmark { url, .. } => format!("bookmark:{url}"),
         SwitcherRow::Similar { url, .. } => format!("similar:{url}"),
+        SwitcherRow::Header(label) => format!("header:{label}"),
     }
 }
 
 fn tile_element(tile: &browser_chrome_core::SwitcherRow) -> Element {
     use browser_chrome_core::SwitcherRow;
+    // `Header` gets a distinct, non-tile shape (a small labeled divider,
+    // not a 150x110 tile) — `on_selection_changed` already no-ops on it via
+    // `browser_chrome_core::activate_row`, so it's inert even though
+    // `grid_view` doesn't have a "non-selectable item" concept to mark it
+    // with directly.
+    if let SwitcherRow::Header(label) = tile {
+        return text_block(label.to_string())
+            .bold()
+            .width(150.0)
+            .padding(Thickness { top: 10.0, right: 0.0, bottom: 4.0, left: 0.0 })
+            .into();
+    }
     let (title, domain) = match tile {
         SwitcherRow::Open { title, domain, .. } => (title.clone(), domain.clone()),
         SwitcherRow::Add => ("+".to_string(), String::new()),
         SwitcherRow::History { title, domain, .. }
         | SwitcherRow::Bookmark { title, domain, .. }
         | SwitcherRow::Similar { title, domain, .. } => (title.clone(), domain.clone()),
+        SwitcherRow::Header(_) => unreachable!(),
     };
     vstack((
         Element::from(text_block(title).bold()),

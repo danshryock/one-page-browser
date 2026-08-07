@@ -255,8 +255,26 @@ impl RenderEngine for WryEngine {
         Ok(())
     }
 
+    /// Deliberately bypasses `wry::WebView::url()` (which calls this crate's
+    /// own pinned `url_from_webview`, `wkwebview/mod.rs`) — that helper does
+    /// `webview.URL().unwrap()`, and `WKWebView.URL` is genuinely `nil`
+    /// (Apple's own documented behavior) until a navigation actually starts,
+    /// which a webview freshly (re)created by `ensure_engine_loaded` for a
+    /// previously-unloaded page hasn't necessarily done yet by the time
+    /// something reads its URL in the same call stack — confirmed directly,
+    /// not theoretical: reproduced a real crash this way (switching to an
+    /// evicted page via the switcher's keyboard path, which reads the newly
+    /// active page's URL from inside `close_all_overlays` right after
+    /// `ensure_engine_loaded` recreates its engine). `objc2_web_kit`'s own
+    /// binding already types `URL()` as `Option`, so going straight through
+    /// it sidesteps wry's `unwrap` entirely instead of needing to patch (or
+    /// fork further) the pinned git dependency.
     fn current_url(&self) -> anyhow::Result<String> {
-        Ok(self.webview.url()?)
+        let url = unsafe { self.raw_webview().URL() }.and_then(|u| u.absoluteString());
+        match url {
+            Some(url) => Ok(url.to_string()),
+            None => Err(anyhow::anyhow!("webview has no URL yet (no navigation started)")),
+        }
     }
 
     fn go_back(&self) -> anyhow::Result<()> {

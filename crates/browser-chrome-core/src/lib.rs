@@ -30,4 +30,4 @@ mod restore;
 mod switcher;
 
 pub use restore::{resolve_restore_plan, RestorePlan};
-pub use switcher::{activate_row, build_switcher_rows, SwitcherActivation, SwitcherRow};
+pub use switcher::{activate_row, build_switcher_rows, next_activatable_row, SwitcherActivation, SwitcherNavDirection, SwitcherRow};

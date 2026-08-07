@@ -2165,6 +2165,7 @@ impl AppState {
                 browser_chrome_core::SwitcherRow::Similar { title, domain, .. } => {
                     self.build_search_result_tile(idx, "similar-tile", title, domain)
                 }
+                browser_chrome_core::SwitcherRow::Header(label) => self.build_header_tile(label),
             };
             flow_child.set_widget_name(&idx.to_string());
             flow_child.show_all();
@@ -2267,6 +2268,32 @@ impl AppState {
 
         let flow_child = gtk::FlowBoxChild::new();
         flow_child.add(&tile_overlay);
+        flow_child
+    }
+
+    /// Builds a non-interactive section-heading row ("Open Pages",
+    /// "History", "Bookmarks", "Similar" — see `SwitcherRow::Header`). Uses
+    /// the same `FlowBoxChild` wrapper as every real tile so it still takes
+    /// up a grid cell of its own (which is what forces a line break ahead
+    /// of it, reading as a section divider), but with `can_focus` off so
+    /// the flowbox's native arrow-key navigation skips over it — the gtk3
+    /// equivalent of `next_activatable_row` skipping headers on the other
+    /// front ends — and no click handler at all (`activate_switcher_row`
+    /// already no-ops for header rows via `browser_chrome_core::activate_row`,
+    /// but there's no `connect_clicked` here to trigger it in the first
+    /// place). `FlowBox` has no notion of a child spanning the full row
+    /// width, so this reads as a small labeled divider rather than a true
+    /// full-width heading — the closest available with this widget.
+    fn build_header_tile(&self, label: &str) -> gtk::FlowBoxChild {
+        let heading = gtk::Label::new(Some(label));
+        heading.style_context().add_class("switcher-heading");
+        heading.set_halign(gtk::Align::Start);
+        heading.set_margin_top(6);
+        heading.set_margin_bottom(2);
+
+        let flow_child = gtk::FlowBoxChild::new();
+        flow_child.add(&heading);
+        flow_child.set_can_focus(false);
         flow_child
     }
 
@@ -2760,6 +2787,9 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
               .switcher-hint { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
               .switcher-profile-label { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
               .page-tile-unloaded { opacity: 0.5; } \
+              .switcher-heading { color: rgba(255, 255, 255, 0.7); font-weight: 700; font-size: 12px; \
+                letter-spacing: 0.04em; border-bottom: 1px solid rgba(255, 255, 255, 0.18); \
+                padding-bottom: 4px; min-width: 150px; } \
               .settings-box { padding: 16px; } \
               .settings-title { color: #ffffff; font-weight: 600; font-size: 14px; } \
               .settings-box label:not(.settings-title) { color: rgba(255, 255, 255, 0.92); } \
