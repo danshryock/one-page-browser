@@ -35,6 +35,31 @@ rustflags = ["-C", "target-feature=+crt-static"]
 # can't do). Use .cargo/build-macos-appkit.sh instead (see README.md's
 # "browser-macos-appkit: building" section).
 
+# `wry`'s own build.rs decides whether to register a WKUIDelegate method
+# that doesn't exist before macOS 12 by running `#[cfg(target_os =
+# "macos")] util::operating_system_version()` — i.e. it inspects the *build
+# machine's* OS version, not the deployment/runtime target. That's a
+# correct-enough heuristic for a native build (you're building for the
+# machine you're on), but always wrong for cross-compiling from Linux: the
+# check never even runs (no macOS host to run it on), so it always assumes
+# "new enough" and registers the method regardless of the real target OS —
+# confirmed directly: it panicked at startup on a real 2014 MacBook running
+# Big Sur ("failed overriding protocol method -[WKUIDelegate webView:
+# requestMediaCapturePermissionForOrigin:...]: method not found") even
+# after pinning render-engine's wry dependency to the specific upstream
+# commit (tauri-apps/wry#1781) that's supposed to guard exactly this.
+# Forcing the same `--cfg` flag here, unconditionally, sidesteps wry's
+# broken build-machine-based detection entirely: it costs the optional
+# custom getUserMedia-permission delegate on every macOS build (cross-
+# compiled or native, old target OS or new) in exchange for correctness
+# everywhere — a fine trade, since nothing in this codebase implements or
+# relies on that delegate actually being registered.
+[target.x86_64-apple-darwin]
+rustflags = ["--cfg", "macos_12_unavailable"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg", "macos_12_unavailable"]
+
 # browser-core pulls in libsql, whose libsql-ffi dependency compiles a
 # bundled sqlite3.c via cc-rs for *every* target it's built for, including
 # x86_64-pc-windows-msvc. cargo-xwin sets CC/AR for that target to the bare

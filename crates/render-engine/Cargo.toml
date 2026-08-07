@@ -9,7 +9,19 @@ anyhow = "1"
 
 # Only linux.rs and macos.rs use wry.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-wry = "0.55"
+# Pinned to a specific git commit, not a crates.io version: this includes
+# tauri-apps/wry#1781 (merged 2026-07-30), which fixes a real startup panic
+# on macOS 11 Big Sur — WKUIDelegate's `requestMediaCapturePermissionFor
+# Origin:initiatedByFrame:type:decisionHandler:` doesn't exist there (added
+# in a later macOS), and wry 0.56.0 (the latest published release as of
+# this writing) unconditionally overrides it anyway, which objc2's
+# `define_class!` runtime protocol-conformance check rejects outright
+# ("failed overriding protocol method ... method not found") — confirmed
+# directly on a real 2014 MacBook running Big Sur via scripts/macos-mac/,
+# not just read about. The fix itself isn't in any published release yet
+# (0.56.1 doesn't exist on crates.io at time of writing). Swap this back to
+# a plain version requirement once it is.
+wry = { git = "https://github.com/tauri-apps/wry", rev = "aff28ef5a48e717e1b14b716e452124663cc4df1" }
 # For `fill_login`'s JSON-escaping of untrusted username/password strings
 # before interpolating them into injected JS — JSON string syntax is a
 # subset of JS string syntax, so this is the correct way to do it, not

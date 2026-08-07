@@ -1032,6 +1032,49 @@ the real VM against both cases directly: a plain `target="_blank"` link correctl
 real Chrome), and the same link with `rel="opener"` correctly gets a real one, `window.opener !== null`,
 confirmed via `execute_script`.
 
+- Real macOS hardware testing (`scripts/macos-mac/`), against a real 2014 Intel MacBook running Big Sur —
+  browser-macos-appkit's first-ever run on anything but a cross-compile or a fresh GitHub Actions runner.
+  Getting the SSH-driven pipeline working surfaced a chain of genuinely separate blockers, each looking like the
+  next one's cause until proven otherwise:
+  - `wry` (pinned to a specific upstream commit — see `render-engine/Cargo.toml`) crashed the app outright on
+    launch: a `WKUIDelegate` override for a getUserMedia-permission method that doesn't exist before macOS 12
+    panics `objc2`'s runtime protocol-conformance check on Big Sur. The upstream fix (merged, not yet in a
+    published release) only detects this by checking the *build machine's* OS version, which never fires when
+    cross-compiling from Linux — worked around with a forced `--cfg` in `.cargo/config.toml` instead.
+  - `NSApplication::activate()` (used unconditionally) doesn't exist before macOS 14 Sonoma either — an
+    uncatchable Objective-C exception, `abort()`. Switched to the deprecated-but-universal
+    `activateIgnoringOtherApps:`.
+  - The `CGEvent`-based synthetic-input driver (the original design) needs Accessibility/Input Monitoring TCC
+    permission, which turned out to be un-grantable non-interactively over SSH at all — not just unconfigured.
+    A dedicated, persistent code-signing identity was built and trusted specifically to stop TCC grants from
+    being invalidated by every rebuild (see `scripts/macos-mac/README.md`'s "Known limitations" for the full
+    keychain saga: importing a private key, then trusting it, then *using* it to sign all separately required
+    live GUI-session interaction, confirmed by hitting the identical `errSecInternalComponent` failure again
+    immediately after an interactive "Always Allow" click) — and was abandoned once that was conclusively
+    proven a dead end, not just inconvenient.
+  - Replaced the whole approach: `AppState::start_test_command_listener` (`browser-macos-appkit/src/lib.rs`)
+    listens on a local Unix socket for simple test commands and calls the same internal methods a real
+    keypress/click would reach — no `CGEvent`, no TCC dependency at all. This is also what finally let
+    `.github/workflows/macos.yml`'s `web-standards-macos` job run the driver for real instead of compile-check
+    only, since GitHub's ephemeral runners have the exact same TCC problem real SSH access does.
+  - Along the way to a passing run: `sender_tag` (dispatching toolbar-button *and* menu-key-equivalent actions)
+    only ever handled `NSButton` senders, silently no-opping every keyboard shortcut in the app (menu key
+    equivalents send an `NSMenuItem`) — confirmed with real, physical Cmd+T/Ctrl+T keypresses, not just the
+    synthetic driver, so this was a real user-facing bug, not a test artifact. And `browser_core::profile::
+    resolve_url_argument` (shared by every front end's `main.rs`) didn't know to skip `--test-command-socket`'s
+    value, mistaking the socket path for a bare positional URL and silently routing to the external-link
+    chooser instead of a normal launch.
+  - Finally, `file://` URLs never actually loaded on macOS at all: wry's `navigate_to_url` uses a plain
+    `loadRequest:` for every scheme, but WKWebView only reliably loads local content via
+    `loadFileURL:allowingReadAccessToURL:` — navigation silently never committed, so wry's own internal
+    pending-script queue (which only flushes once a navigation commits) never ran anything either. Fixed the
+    same way as the equivalent GTK-side wry bug from earlier in this same effort: serve fixtures over a local
+    `http://127.0.0.1` server instead (`FixtureServer` in `macos_driver.rs`, mirroring
+    `browser-linux-gtk3/tests/gtk_tests.rs`'s).
+  Both opener-verification fixtures now pass for real, both on CI's native runners and over SSH against the
+  actual laptop — the first real-hardware-verified behavior this front end has ever had beyond a launch
+  screenshot.
+
 ## Backlog (not yet started, roughly in the order raised)
 
 - `browser-macos-appkit`: a wrapping tile grid (`NSCollectionView`) instead of the current plain-list

@@ -14,3 +14,8 @@ anyhow = "1"
 objc2 = "0.6.4"
 objc2-app-kit = "0.3.2"
 objc2-foundation = "0.3.2"
+# For `start_test_command_listener`'s `NSTimer` block callback — already a
+# transitive dependency (via wry/objc2-web-kit), pinned to the same 0.6.x
+# `objc2` crate family directly here so it's guaranteed to be the exact
+# version `objc2-foundation`'s own `NSTimer` bindings expect.
+block2 = "0.6"

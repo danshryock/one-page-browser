@@ -90,11 +90,12 @@ use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMark
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
     NSApplicationActivationPolicy, NSBackingStoreType, NSBox, NSBoxType, NSButton, NSButtonType, NSColor,
-    NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSEventModifierFlags, NSMenuItemValidation, NSPasteboard,
-    NSPasteboardTypeString, NSPopUpButton, NSSecureTextField, NSTextAlignment, NSTextField, NSTitlePosition,
-    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowDelegate, NSWindowOrderingMode, NSWindowStyleMask,
+    NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSEventModifierFlags, NSMenuItem, NSMenuItemValidation,
+    NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSSecureTextField, NSTextAlignment, NSTextField,
+    NSTitlePosition, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowDelegate, NSWindowOrderingMode,
+    NSWindowStyleMask,
 };
-use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
 use browser_core::{
     decide_vault_unlock_action, domain_of, launch_new_encrypted_profile_process, launch_new_profile_process,
@@ -426,6 +427,84 @@ impl AppState {
         self.bring_overlay_to_front(&self.switcher_view);
         self.switcher_view.setHidden(false);
         self.window.makeFirstResponder(Some(&self.address_bar));
+    }
+
+    /// Test-only: listens on a Unix domain socket at `socket_path` for
+    /// newline-delimited commands from `web-standards-tests/src/bin/
+    /// macos_driver.rs`, calling the same internal methods a real user's
+    /// keyboard/mouse input would eventually reach — added after direct,
+    /// real-hardware testing (a real 2014 MacBook, see `scripts/macos-mac/`)
+    /// showed the OS-level `CGEvent`-based driver approach requires
+    /// Accessibility/Input Monitoring TCC permission that cannot be granted
+    /// non-interactively over SSH (every private-key/keychain operation
+    /// needed to set up a *stable* signing identity — the only way to keep
+    /// a TCC grant from being invalidated by every rebuild — turned out to
+    /// require a live GUI session too, confirmed directly, not assumed).
+    /// This sidesteps the whole problem: no synthetic OS input, no TCC
+    /// dependency, works identically on every macOS version. Only active
+    /// when a caller explicitly opts in (`--test-command-socket`, see
+    /// `main.rs`) — never touched by a normal launch.
+    ///
+    /// Runs the socket-accepting/line-reading loop on a background thread
+    /// (blocking I/O is fine there) and marshals each command onto the main
+    /// thread via a repeating `NSTimer` draining an `mpsc` channel — `Rc`-
+    /// based `AppState` can only ever be touched from the main thread, the
+    /// same constraint every other cross-thread callback in this file
+    /// already works around.
+    fn start_test_command_listener(self: &Rc<Self>, socket_path: &str) {
+        let _ = std::fs::remove_file(socket_path);
+        let listener = match std::os::unix::net::UnixListener::bind(socket_path) {
+            Ok(listener) => listener,
+            Err(err) => {
+                eprintln!("failed to bind test command socket at {socket_path:?}: {err}");
+                return;
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stream).lines().map_while(Result::ok) {
+                    if tx.send(line).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        let weak_self = Rc::downgrade(self);
+        let timer_block = block2::RcBlock::new(move |_timer: std::ptr::NonNull<NSTimer>| {
+            while let Ok(line) = rx.try_recv() {
+                if let Some(state) = weak_self.upgrade() {
+                    state.handle_test_command(&line);
+                }
+            }
+        });
+        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.02, true, &timer_block) };
+    }
+
+    /// One command per line: `open_switcher` (no argument), `navigate
+    /// <url>`, or `click_js <data-test-target name>` — deliberately not
+    /// JSON (nothing here needs nested structure, and this is test-only
+    /// surface area, not a real protocol). `navigate` reuses
+    /// `address_bar_activated` itself — the same method a real Enter
+    /// keypress in the address bar reaches — rather than calling
+    /// `add_page` directly, so this exercises the real "type a URL, hit
+    /// Enter" user path, not a shortcut around it.
+    fn handle_test_command(self: &Rc<Self>, line: &str) {
+        let (command, arg) = line.split_once(' ').unwrap_or((line, ""));
+        match command {
+            "open_switcher" => self.open_switcher(),
+            "navigate" => {
+                self.address_bar.setStringValue(&NSString::from_str(arg));
+                self.address_bar_activated();
+            }
+            "click_js" => {
+                let script = format!("document.querySelector('[data-test-target=\"{arg}\"]')?.click();");
+                self.with_active(|engine| engine.evaluate_script_for_test(&script));
+            }
+            other => eprintln!("unknown test command: {other:?}"),
+        }
     }
 
     /// `EditUrl` (⌘L): opens the switcher preloaded with the active page's
@@ -2106,10 +2185,25 @@ define_class!(
 /// created) back out as a `usize` index — AppKit's `target`/`action`
 /// dispatch hands back only the sender itself, so this is how a shared
 /// handler method learns *which* row fired it.
+// `dispatchAction:` is wired as both a toolbar button's action (a real
+// `NSButton`) and, since `shortcuts.rs`'s `build_menu`, a menu item's key
+// equivalent (an `NSMenuItem` — a sibling class under `NSObject`, not an
+// `NSButton` subclass, so a downcast to one never matches the other).
+// Confirmed missing the `NSMenuItem` case directly on real hardware: every
+// keyboard shortcut in this app (Cmd+T included) silently did nothing —
+// `sender_tag` returned `None` for a menu-triggered call, and
+// `dispatch_action` just returns early on that, with no error or visible
+// symptom beyond "the shortcut doesn't work." Toolbar buttons never
+// exposed this since they're always real `NSButton`s.
 fn sender_tag(sender: Option<&AnyObject>) -> Option<usize> {
     let sender = sender?;
-    let button: &NSButton = sender.downcast_ref()?;
-    usize::try_from(button.tag()).ok()
+    if let Some(button) = sender.downcast_ref::<NSButton>() {
+        return usize::try_from(button.tag()).ok();
+    }
+    if let Some(item) = sender.downcast_ref::<NSMenuItem>() {
+        return usize::try_from(item.tag()).ok();
+    }
+    None
 }
 
 impl AppDelegate {
@@ -2134,6 +2228,15 @@ impl App {
     /// `AppDelegate::window_will_close`, the only quit path this wires up).
     pub fn run(&self) {
         NSApplication::sharedApplication(self.mtm).run();
+    }
+
+    /// See `AppState::start_test_command_listener`'s doc comment for the
+    /// full rationale — exposed here since `App` (not `AppState` directly)
+    /// is what `main.rs` gets back from `build_window_and_app`.
+    pub fn start_test_command_listener(&self, socket_path: &str) {
+        if let Some(state) = self._delegate.ivars().state.borrow().clone() {
+            state.start_test_command_listener(socket_path);
+        }
     }
 }
 
@@ -2762,7 +2865,18 @@ pub fn build_window_and_app(profile: Profile, setup_passphrase: bool) -> anyhow:
     app.setMainMenu(Some(&menu));
 
     window.makeKeyAndOrderFront(None);
-    app.activate();
+    // `activate()` (the modern, parameterless replacement) doesn't exist
+    // before macOS 14 Sonoma — confirmed directly on a real 2014 MacBook
+    // running Big Sur: "-[NSApplication activate]: unrecognized selector",
+    // an uncatchable Objective-C exception that aborts the whole process
+    // (see this crate's `render-engine`/wry WKUIDelegate compatibility
+    // notes in .cargo/config.toml for the same class of "worked on this
+    // dev machine's assumptions, crashed on real older hardware" bug in
+    // this same area). `activateIgnoringOtherApps:` is deprecated in favor
+    // of it, not removed — still the right call on every macOS version
+    // this app might actually run on.
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
 
     Ok(App { mtm, _delegate: delegate })
 }
@@ -2816,7 +2930,18 @@ pub fn run_chooser(url: String, default_profile: String) -> anyhow::Result<()> {
     content.addSubview(&open);
 
     window.makeKeyAndOrderFront(None);
-    app.activate();
+    // `activate()` (the modern, parameterless replacement) doesn't exist
+    // before macOS 14 Sonoma — confirmed directly on a real 2014 MacBook
+    // running Big Sur: "-[NSApplication activate]: unrecognized selector",
+    // an uncatchable Objective-C exception that aborts the whole process
+    // (see this crate's `render-engine`/wry WKUIDelegate compatibility
+    // notes in .cargo/config.toml for the same class of "worked on this
+    // dev machine's assumptions, crashed on real older hardware" bug in
+    // this same area). `activateIgnoringOtherApps:` is deprecated in favor
+    // of it, not removed — still the right call on every macOS version
+    // this app might actually run on.
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
     app.run();
     Ok(())
 }

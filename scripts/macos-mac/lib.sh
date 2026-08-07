@@ -74,6 +74,18 @@ mac_run() {
 # "worked yesterday, silently refused to launch today" flakiness if it ever
 # does. `xattr -d` on a file with no such attribute exits non-zero, hence
 # the `|| true`.
+#
+# Skips the deploy+resign entirely when the remote file's content already
+# matches — confirmed the hard way: a manually-granted Accessibility/Input
+# Monitoring TCC permission for one of these binaries stopped working again
+# after the very next `build-and-test.sh` run, even though nothing had
+# actually changed. `codesign --force` unconditionally on every deploy was
+# re-signing the binary every time regardless, and TCC ties its grant to
+# the binary's current signature/identity — re-signing (even to a signature
+# that ad-hoc-hashes out the same way) was enough to make it look like "a
+# different app" and drop the grant. Only touching the file when its content
+# genuinely changed avoids invalidating a permission someone just granted by
+# hand.
 mac_deploy_file() {
     local src="$1"
     local name
@@ -83,6 +95,13 @@ mac_deploy_file() {
         return 1
     fi
     mac_run "mkdir -p '$MAC_REMOTE_DIR'"
+    local local_hash remote_hash
+    local_hash=$(shasum -a 256 "$src" | awk '{print $1}')
+    remote_hash=$(mac_run "shasum -a 256 '$MAC_REMOTE_DIR/$name' 2>/dev/null" | awk '{print $1}')
+    if [ -n "$remote_hash" ] && [ "$local_hash" = "$remote_hash" ]; then
+        echo "unchanged, skipping deploy: $name"
+        return 0
+    fi
     local opts
     read -r -a opts <<< "$(mac_ssh_opts)"
     scp -q "${opts[@]}" "$src" "$(mac_target):$MAC_REMOTE_DIR/$name"

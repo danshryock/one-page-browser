@@ -191,6 +191,16 @@ impl WryEngine {
         self.webview.evaluate_script(&script)?;
         Ok(())
     }
+
+    /// Test-only escape hatch for running arbitrary script against the
+    /// active page — see `browser-macos-appkit`'s `_for_test`-suffixed
+    /// accessor convention (`browser-linux-gtk3`'s own
+    /// `evaluate_script_on_active_page_for_test` established the same
+    /// naming pattern first).
+    pub fn evaluate_script_for_test(&self, script: &str) -> anyhow::Result<()> {
+        self.webview.evaluate_script(script)?;
+        Ok(())
+    }
 }
 
 /// Finds the password field (preferring `autocomplete="current-password"`,

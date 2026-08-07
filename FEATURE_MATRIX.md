@@ -30,7 +30,7 @@ Implementation legend: ✅ Full · 🔶 Partial (works, with a real named gap) �
 
 | Feature area | `browser-linux-gtk3` | `browser-macos-appkit` | `browser-windows-reactor` |
 | --- | --- | --- | --- |
-| Core browsing & navigation | ✅ real tests | ✅ untested | 🔶 VM-verified nav, no unified bar |
+| Core browsing & navigation | ✅ real tests | 🔶 untested, except opener/popup (CI + real HW) | 🔶 VM-verified nav, no unified bar |
 | Multi-page / tabs & switcher | ✅ real tests | 🔶 untested (list, not tile grid) | 🔶 VM-verified (real grid control) |
 | Session & webview-data persistence | ✅ real tests | ✅ untested (eager restore) | ✅ compile-only (eager restore) |
 | Bookmarks | ✅ real tests | ✅ untested | ❌ |
@@ -49,12 +49,13 @@ Implementation legend: ✅ Full · 🔶 Partial (works, with a real named gap) �
 nearly everything (headless GUI tests via `xwfb-run`/`cage`). `browser-macos-appkit` is functionally the
 closest *second*, with real feature parity across most areas — reader mode, screenshot, search-engine
 management, and audio tracking are its main gaps — but almost none of that parity is covered by automated
-tests, only compile/link checks and a shallow CI launch-and-screenshot smoke test. Opener/popup behavior
-(`web-standards-tests/`) has a real, click-driven test *written*, but CI can only compile-check it — GitHub's
-macOS runners are fully ephemeral with no persistent GUI session, and the driver's synthetic clicks need a
-one-time Accessibility permission grant that can't be scripted around (confirmed via three separate direct-
-TCC.db-write attempts, all failing despite SIP being disabled there). Real click-driven verification is meant
-to run against a real Mac over SSH instead (`scripts/macos-mac/`), not yet exercised. `browser-windows-reactor`
+tests, only compile/link checks and a shallow CI launch-and-screenshot smoke test, plus one real exception:
+opener/popup behavior (`web-standards-tests/`) is genuinely verified, both in CI (real macOS runners) and
+against a real 2014 Intel Mac running Big Sur over SSH (`scripts/macos-mac/`). Getting there took ruling out
+CGEvent-based synthetic input entirely — TCC/Accessibility permission can't be granted non-interactively on
+either an ephemeral CI runner or (confirmed directly, not assumed) over SSH on real hardware, even with a
+dedicated signing identity — in favor of `AppState::start_test_command_listener`, a local Unix-socket command
+channel the driver talks to directly, bypassing OS-level input and TCC entirely. `browser-windows-reactor`
 has the smallest feature set (no bookmarks, password manager, encrypted history/profiles, theme, reader
 mode, screenshot, or search-engine management) but has been interactively verified running in a real local
 VM for a surprising amount of its scope — more real-world-proven behavior than its thin CI/unit-test

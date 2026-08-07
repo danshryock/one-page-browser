@@ -9,6 +9,13 @@ fn main() -> anyhow::Result<()> {
     // user's data forward from a previous `APP_ID` otherwise.
     browser_core::init_app_id(args.clone());
     let (url, profile_name) = resolve_args(args.clone());
+    // `--test-command-socket <path>`: only ever passed by
+    // `web-standards-tests/src/bin/macos_driver.rs` — see
+    // `AppState::start_test_command_listener`'s doc comment for why this
+    // exists at all (a real OS-input-driven driver needs Accessibility TCC
+    // permission that can't be granted non-interactively, confirmed
+    // directly against real hardware). Absent on every normal launch.
+    let test_command_socket = args.iter().position(|a| a == "--test-command-socket").and_then(|i| args.get(i + 1)).cloned();
     let setup_passphrase = browser_core::resolve_passphrase_setup_requested(args);
 
     match url {
@@ -20,6 +27,9 @@ fn main() -> anyhow::Result<()> {
         None => {
             let profile = Profile::new(profile_name);
             let app = build_window_and_app(profile, setup_passphrase)?;
+            if let Some(socket_path) = test_command_socket {
+                app.start_test_command_listener(&socket_path);
+            }
             app.run();
             Ok(())
         }
