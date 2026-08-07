@@ -132,7 +132,19 @@ mod macos_impl {
 
         let mut child = Command::new(app_exe).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
         let result = drive_and_capture(&mut child, &index_url, &steps, &expected);
-        let _ = child.kill();
+        // Checked *before* killing it: if the app already exited on its own
+        // (crashed, or otherwise) `try_wait` reports that real exit
+        // status — `ExitStatus`'s own `Display` includes signal info on
+        // Unix (e.g. "signal: 11 (SIGSEGV)"), which is exactly the
+        // diagnostic a silent "child stdout ended" error can't provide on
+        // its own.
+        match child.try_wait() {
+            Ok(Some(status)) => eprintln!("[driver] app process had already exited: {status}"),
+            Ok(None) => {
+                let _ = child.kill();
+            }
+            Err(err) => eprintln!("[driver] error checking app process status: {err}"),
+        }
         let _ = child.wait();
         let actual = result?;
 
