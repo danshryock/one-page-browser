@@ -132,3 +132,57 @@ jobs:
           name: browser-macos-appkit-screenshot-${{ matrix.arch }}
           path: browser-macos-appkit-screenshot-${{ matrix.arch }}.png
           if-no-files-found: ignore
+
+  web-standards-macos:
+    name: web-standards-tests (native macOS, ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+          - arch: x64
+            os: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build browser-macos-appkit + web-standards-driver-macos
+        run: |
+          cargo build --target ${{ matrix.target }} -p browser-macos-appkit --verbose
+          cargo build --target ${{ matrix.target }} -p web-standards-tests --bin web-standards-driver-macos --verbose
+
+      # Native execution, no cross-compile-and-hope and (unlike
+      # scripts/macos-mac/, the Linux-dev-machine -> real-laptop pipeline —
+      # see its own README.md) no SSH round-trip either: this runner already
+      # has a real, logged-in console/WindowServer session, which is what
+      # both the app's own window and the driver's synthetic `CGEvent`
+      # clicks need to work at all. This is the same actions.json/
+      # __test_target__-driven suite `browser-linux-gtk3`'s in-process test
+      # and `windows_driver.rs` both run — see `web-standards-tests/`'s own
+      # doc comments for the full design.
+      - name: Run web-standards-driver-macos
+        run: |
+          set -euo pipefail
+          app="target/${{ matrix.target }}/debug/browser-macos-appkit"
+          driver="target/${{ matrix.target }}/debug/web-standards-driver-macos"
+          for bin in "$app" "$driver"; do
+            if [ ! -x "$bin" ]; then
+              echo "$bin not found after build" >&2
+              exit 1
+            fi
+          done
+          "$driver" "$app" web-standards-tests/fixtures 2>&1 | tee web-standards-macos-${{ matrix.arch }}.log
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-standards-macos-log-${{ matrix.arch }}
+          path: web-standards-macos-${{ matrix.arch }}.log
+          if-no-files-found: ignore

@@ -21,3 +21,10 @@
 # mirror of Apple SDK content, not project source. See that section for
 # provenance/licensing notes before assuming this is redistributable.
 /.macos-sdk
+
+# Defense-in-depth for scripts/macos-mac/ (see its README.md): the SSH key
+# it uses lives in ~/.ssh outside this repo by default and is never meant to
+# be committed, but this keeps it that way even if a .ssh directory ever
+# ends up inside the repo tree (e.g. someone points MAC_SSH_KEY at a
+# repo-local path for convenience).
+.ssh/
