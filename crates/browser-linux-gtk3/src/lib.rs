@@ -65,14 +65,20 @@ pub struct AppState {
     /// unlike the separate, never-reloaded base provider set up once in
     /// `build_window_and_app`.
     theme_provider: gtk::CssProvider,
-    /// The profile picker overlay's root widget — same in-window-overlay
-    /// pattern as `switcher_panel`.
-    profile_panel: gtk::Widget,
-    /// Rebuilt from `browser_core::list_profile_names()` each time the
-    /// picker opens — holds one row per existing profile.
-    profile_list_box: gtk::Box,
-    new_profile_entry: gtk::Entry,
-    new_profile_encrypted_check: gtk::CheckButton,
+    /// Anchored to the toolbar avatar button (`set_relative_to`, at
+    /// construction) — `show_profile_menu` is what actually pops it up,
+    /// after giving it a freshly built webview child (see
+    /// `profile_menu_engine`). Dismiss-on-click-outside/Escape is
+    /// `gtk::Popover`'s own native behavior, not something wired up here.
+    profile_menu_popover: gtk::Popover,
+    /// The profile-menu popover's webview, if it's currently open — built
+    /// fresh on each `show_profile_menu` call and dropped (destroying the
+    /// real webview widget) when the popover closes, rather than kept alive
+    /// across opens: this is small and infrequent enough that reload-on-
+    /// reopen is simpler than the switcher's own persistent-singleton
+    /// approach, and guarantees the profile list/current profile it shows
+    /// is never stale.
+    profile_menu_engine: RefCell<Option<WryEngine>>,
     keybindings: RefCell<Keybindings>,
     /// The toolbar star-toggle button, so its icon can be refreshed whenever
     /// the active page changes or a bookmark is added/removed for it.
@@ -723,7 +729,6 @@ impl AppState {
     /// defensively closes the others rather than ever showing more than one
     /// at once.
     fn open_switcher_common(self: &Rc<Self>) {
-        self.close_profile_picker();
         self.close_passwords();
         self.stack.set_sensitive(false);
         // Shown *before* rebuilding: `rebuild_switcher_grid` skips its work
@@ -813,112 +818,48 @@ impl AppState {
         let _ = self.theme_provider.load_from_data(theme_css(theme).as_bytes());
     }
 
-    /// Shows the profile picker, rebuilt from `list_profile_names()` each
-    /// time (so a profile created in an earlier visit to this picker shows
-    /// up) — see `open_switcher`'s doc comment for why it closes the other
-    /// overlays first.
-    pub fn open_profile_picker(self: &Rc<Self>) {
-        self.close_switcher();
-        self.close_passwords();
-        self.new_profile_entry.set_text("");
-        self.new_profile_encrypted_check.set_active(false);
-        self.rebuild_profile_list();
-        self.stack.set_sensitive(false);
-        self.profile_panel.show();
-    }
-
-    /// Hides the profile picker. Always use this (rather than hiding
-    /// `profile_panel` directly) so the stack never gets left insensitive.
-    pub fn close_profile_picker(&self) {
-        self.profile_panel.hide();
-        self.stack.set_sensitive(true);
-    }
-
-    /// Whether the profile picker is currently shown — test/inspection
-    /// helper.
-    pub fn is_profile_picker_open(&self) -> bool {
-        self.profile_panel.is_visible()
-    }
-
-    /// The profile toolbar button's target — see `toggle_settings`.
-    pub fn toggle_profile_picker(self: &Rc<Self>) {
-        if self.is_profile_picker_open() {
-            self.close_profile_picker();
-        } else {
-            self.open_profile_picker();
-        }
-    }
-
-    /// Rebuilds the profile picker's list of rows from scratch. The current
-    /// profile is marked and, unlike every other row, clicking it just
-    /// closes the picker instead of launching a duplicate process of the
-    /// profile already running.
-    fn rebuild_profile_list(self: &Rc<Self>) {
-        for child in self.profile_list_box.children() {
-            self.profile_list_box.remove(&child);
+    /// Builds a fresh webview showing the profile-menu popover's content
+    /// (see `profile_menu_engine`'s own doc comment for why fresh, not
+    /// persistent) and pops it up anchored to the avatar button. No
+    /// separate open/close/toggle trio the way the old in-window overlays
+    /// needed — `gtk::Popover` already handles showing and click-outside/
+    /// Escape dismissal itself; `profile_menu_popover.connect_closed` (see
+    /// `build_window_and_app_with_history`) is what drops the engine once
+    /// it's actually dismissed.
+    pub fn show_profile_menu(self: &Rc<Self>) {
+        for child in self.profile_menu_popover.children() {
+            self.profile_menu_popover.remove(&child);
         }
 
-        for name in list_profile_names() {
-            let is_current = name == self.profile.name;
-            let label_text = if is_current { format!("{name} (current)") } else { name.clone() };
-            let row = gtk::Button::with_label(&label_text);
-            row.style_context().add_class("flat");
-            if is_current {
-                row.style_context().add_class("current-profile-row");
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let url = format!("http://127.0.0.1:{}/profile-menu/index.html?rpc_port={}", self.asset_port.get(), self.rpc_port.get());
+        let app_weak = Rc::downgrade(self);
+        let engine = WryEngine::new(
+            &container,
+            &url,
+            &mut self.web_context.borrow_mut(),
+            |_title| {},
+            |_playing| {},
+            |_info, _opener| None,
+            move |message| {
+                eprintln!("console.log: {message}");
+                if let Some(app) = app_weak.upgrade() {
+                    app.console_messages.borrow_mut().push(message);
+                }
+            },
+        );
+        let engine = match engine {
+            Ok(engine) => engine,
+            Err(err) => {
+                eprintln!("failed to build the profile menu popover: {err}");
+                return;
             }
-
-            let app_clone = Rc::clone(self);
-            let name_clone = name.clone();
-            row.connect_clicked(move |_| {
-                if is_current {
-                    app_clone.close_profile_picker();
-                    return;
-                }
-                if let Err(err) = browser_core::launch_new_profile_process(&name_clone) {
-                    eprintln!("failed to launch a new process for profile {name_clone:?}: {err}");
-                }
-                app_clone.close_profile_picker();
-            });
-
-            self.profile_list_box.pack_start(&row, false, false, 0);
-        }
-        self.profile_list_box.show_all();
-    }
-
-    /// Reads the new-profile field and launches a new process for it — the
-    /// profile picker's "Create & Open" action. The new process creates the
-    /// profile's directory lazily on first `Settings`/`HistoryStore` access;
-    /// nothing needs pre-creating here. If `new_profile_encrypted_check` is
-    /// checked, the new process is launched with `--setup-passphrase`
-    /// instead, and will prompt for a passphrase itself rather than opening
-    /// straight to the browser window — see `resolve_passphrase_setup_requested`'s
-    /// doc comment for why the passphrase can't just be collected here and
-    /// handed to the new process directly.
-    pub fn create_and_open_profile(&self) {
-        let name = self.new_profile_entry.text().to_string();
-        let name = name.trim();
-        if name.is_empty() {
-            return;
-        }
-        let result = if self.new_profile_encrypted_check.is_active() {
-            browser_core::launch_new_encrypted_profile_process(name)
-        } else {
-            browser_core::launch_new_profile_process(name)
         };
-        if let Err(err) = result {
-            eprintln!("failed to launch a new process for profile {name:?}: {err}");
-        }
-        self.close_profile_picker();
-    }
 
-    /// Launches a new, independent private/incognito/guest window — the
-    /// profile picker's "New Private Window" action. See
-    /// `Profile::ephemeral`'s doc comment for exactly what "private" means.
-    pub fn open_new_private_window(&self) {
-        if let Err(err) = browser_core::launch_new_ephemeral_process() {
-            eprintln!("failed to launch a new private window: {err}");
-        }
-        self.close_profile_picker();
+        self.profile_menu_popover.add(&container);
+        container.show_all();
+        *self.profile_menu_engine.borrow_mut() = Some(engine);
+        self.profile_menu_popover.popup();
     }
 
 
@@ -949,7 +890,6 @@ impl AppState {
     /// that prompt (see `rebuild_passwords_panel`).
     pub fn open_passwords(self: &Rc<Self>) {
         self.close_switcher();
-        self.close_profile_picker();
 
         if !matches!(*self.passwords.borrow(), VaultState::Unlocked(_)) {
             match decide_vault_unlock_action(&self.profile, self.session_passphrase.borrow().as_deref()) {
@@ -1063,6 +1003,12 @@ impl AppState {
     /// inspection helper.
     pub fn is_passwords_open(&self) -> bool {
         self.passwords_panel.is_visible()
+    }
+
+    /// Whether the profile-menu popover is currently shown — test/
+    /// inspection helper.
+    pub fn is_profile_menu_open(&self) -> bool {
+        self.profile_menu_popover.is_visible()
     }
 
     /// The passwords toolbar button's target — see `toggle_settings`.
@@ -1326,7 +1272,7 @@ impl AppState {
             Action::GoBack => self.with_active(|p| p.go_back()),
             Action::GoForward => self.with_active(|p| p.go_forward()),
             Action::OpenSettings => self.open_or_focus_internal_page(browser_chrome_core::internal_pages::PROFILE),
-            Action::OpenProfilePicker => self.open_profile_picker(),
+            Action::OpenProfilePicker => self.show_profile_menu(),
             Action::ToggleBookmark => self.toggle_bookmark_for_active(),
             // The dedicated bookmarks overlay is retired — browsing
             // bookmarks lives in the switcher's own Bookmarks tab now.
@@ -2142,6 +2088,9 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         Some("avatar-default-symbolic"),
         gtk::IconSize::Button,
     )));
+    // Anchored here once; `AppState::show_profile_menu` gives it a fresh
+    // webview child on each open (see that method's own doc comment).
+    let profile_menu_popover = gtk::Popover::new(Some(&profile_button));
     // Starts unbookmarked/non-starred — `refresh_bookmark_toggle_button`
     // (called once below, after `app` exists, and on every active-page
     // change afterward) corrects this immediately if the start page already
@@ -2286,49 +2235,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     let (switcher_overlay, scrim, switcher_close_button) = build_overlay_chrome(&grid_content, &scrim_css);
     switcher_overlay.add_overlay(&profile_label);
 
-    // --- Profile picker overlay: same in-window-overlay pattern again.
-    // Lists existing profiles (from `list_profile_names()`, rebuilt each
-    // time it opens) plus a field to create a new one — picking any profile
-    // other than the current one launches a new, independent process
-    // scoped to it (`launch_new_profile_process`) rather than switching this
-    // window in place.
-    let profile_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    profile_box.set_halign(gtk::Align::Fill);
-    profile_box.set_valign(gtk::Align::Start);
-    profile_box.style_context().add_class("settings-box");
-    profile_box.set_margin(24);
-
-    let profile_title = gtk::Label::new(Some("Profiles"));
-    profile_title.style_context().add_class("settings-title");
-    profile_title.set_halign(gtk::Align::Start);
-    profile_box.pack_start(&profile_title, false, false, 0);
-
-    let profile_list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    profile_box.pack_start(&profile_list_box, false, false, 0);
-
-    let new_profile_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let new_profile_entry = gtk::Entry::new();
-    new_profile_entry.set_placeholder_text(Some("New profile name\u{2026}"));
-    new_profile_entry.set_hexpand(true);
-    let create_profile_button = gtk::Button::with_label("Create & Open");
-    new_profile_row.pack_start(&new_profile_entry, true, true, 0);
-    new_profile_row.pack_start(&create_profile_button, false, false, 0);
-    profile_box.pack_start(&new_profile_row, false, false, 0);
-
-    let new_profile_encrypted_check = gtk::CheckButton::new();
-    new_profile_encrypted_check.set_label("Encrypt with a passphrase");
-    profile_box.pack_start(&new_profile_encrypted_check, false, false, 0);
-
-    let profile_buttons_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    profile_buttons_row.set_halign(gtk::Align::End);
-    let new_private_window_button = gtk::Button::with_label("New Private Window");
-    let profile_cancel_button = gtk::Button::with_label("Cancel");
-    profile_buttons_row.pack_start(&new_private_window_button, false, false, 0);
-    profile_buttons_row.pack_start(&profile_cancel_button, false, false, 0);
-    profile_box.pack_start(&profile_buttons_row, false, false, 0);
-
-    let (profile_overlay, profile_scrim, profile_close_button) = build_overlay_chrome(&profile_box, &scrim_css);
-
     // --- Password manager overlay: same shape again. One row per
     // credential, rebuilt from `PasswordStore::list()` each time the
     // overlay opens and after every add/update/delete — plus an inline
@@ -2383,13 +2289,11 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     let root_overlay = gtk::Overlay::new();
     root_overlay.add(&stack);
     root_overlay.add_overlay(&switcher_overlay);
-    root_overlay.add_overlay(&profile_overlay);
     root_overlay.add_overlay(&passwords_overlay);
 
     window.add(&root_overlay);
     window.show_all();
     switcher_overlay.hide();
-    profile_overlay.hide();
     passwords_overlay.hide();
 
     let settings = Settings::load(&profile);
@@ -2427,10 +2331,8 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         switcher_panel: switcher_overlay.clone().upcast::<gtk::Widget>(),
         flowbox: flowbox.clone(),
         theme_provider: theme_provider.clone(),
-        profile_panel: profile_overlay.clone().upcast::<gtk::Widget>(),
-        profile_list_box: profile_list_box.clone(),
-        new_profile_entry: new_profile_entry.clone(),
-        new_profile_encrypted_check: new_profile_encrypted_check.clone(),
+        profile_menu_popover: profile_menu_popover.clone(),
+        profile_menu_engine: RefCell::new(None),
         keybindings: RefCell::new(Keybindings::load(&profile)),
         bookmark_toggle_button: bookmark_toggle_button.clone(),
         bookmarks: RefCell::new(bookmarks),
@@ -2656,44 +2558,13 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     {
         let app = Rc::clone(&app);
         profile_button.connect_clicked(move |_| {
-            app.toggle_profile_picker();
+            app.show_profile_menu();
         });
     }
     {
         let app = Rc::clone(&app);
-        profile_scrim.connect_button_press_event(move |_, _| {
-            app.close_profile_picker();
-            gtk::glib::Propagation::Stop
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        profile_close_button.connect_clicked(move |_| {
-            app.close_profile_picker();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        profile_cancel_button.connect_clicked(move |_| {
-            app.close_profile_picker();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        create_profile_button.connect_clicked(move |_| {
-            app.create_and_open_profile();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        new_private_window_button.connect_clicked(move |_| {
-            app.open_new_private_window();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        new_profile_entry.connect_activate(move |_| {
-            app.create_and_open_profile();
+        profile_menu_popover.connect_closed(move |_| {
+            *app.profile_menu_engine.borrow_mut() = None;
         });
     }
     {
@@ -2757,9 +2628,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
             let is_escape = event.keyval() == gtk::gdk::keys::Key::from_name("Escape");
             if is_escape && app.is_switcher_open() {
                 app.close_switcher();
-                return gtk::glib::Propagation::Stop;
-            } else if is_escape && app.is_profile_picker_open() {
-                app.close_profile_picker();
                 return gtk::glib::Propagation::Stop;
             } else if is_escape && app.is_passwords_open() {
                 app.close_passwords();

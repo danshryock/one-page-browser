@@ -841,10 +841,12 @@ fn every_overlay_toggle_button_closes_on_a_second_click() {
         app.toggle_switcher();
         assert!(!app.is_switcher_open(), "second toggle_switcher should close the switcher");
 
-        app.toggle_profile_picker();
-        assert!(app.is_profile_picker_open(), "first toggle_profile_picker should open the profile picker");
-        app.toggle_profile_picker();
-        assert!(!app.is_profile_picker_open(), "second toggle_profile_picker should close the profile picker");
+        // The profile-menu popover is real webview-backed content now (see
+        // AppState::show_profile_menu) — a full end-to-end check of that
+        // (real profile.info data reaching it) lives in its own test below;
+        // this just confirms the trigger actually shows it.
+        app.show_profile_menu();
+        assert!(app.is_profile_menu_open(), "show_profile_menu should show the profile menu popover");
 
         // A fresh test profile never has a vault passphrase set up, so
         // toggle_passwords still shows (just) the unlock/setup prompt here —
@@ -1979,6 +1981,33 @@ fn internal_pages_are_excluded_from_history_and_shown_as_browser_urls_when_editi
         let messages = app.console_messages_for_test();
         let last = messages.iter().rev().find(|m| m.starts_with("switcher_loaded")).expect("already asserted present above").clone();
         assert_eq!(parse_metric(&last, "history"), Some(0), "no internal page should ever be recorded in history, got {last:?}");
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+/// End-to-end proof of the newest piece of native/web integration: a real
+/// `WryEngine` embedded inside a `gtk::Popover` (see
+/// `AppState::show_profile_menu`), not just a page in the normal stack.
+/// Asserts the popover's own webview actually loads and fetches real
+/// `profile.info` data over RPC — the same real-webview-tests-real-data
+/// pattern as `browser_profile_page_shows_real_settings`, applied to a
+/// popover instead of a full page for the first time.
+#[test]
+fn profile_menu_popover_shows_real_profile_info() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("profile-menu-popover");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        app.add_page(&fixture_url("page_a.html")).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().is_some()));
+
+        app.show_profile_menu();
+        assert!(app.is_profile_menu_open());
+        assert!(
+            wait_until(|| app.console_messages_for_test().iter().any(|m| *m == format!("profile_menu_loaded name={}", profile.name))),
+            "expected the profile menu popover's real webview to load and report the real profile name, got {:?}",
+            app.console_messages_for_test()
+        );
 
         cleanup_test_profile(&profile);
     });

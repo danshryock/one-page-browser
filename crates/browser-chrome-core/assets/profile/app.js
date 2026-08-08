@@ -1,16 +1,11 @@
-// Real profile/settings page logic. Sibling internal pages (passwords) are
-// reached via a plain same-origin relative link carrying this page's own
-// `?rpc_port=` forward — no host-side navigation interception needed for
-// page-to-page links, only for the very first `browser://...` entry point
-// (see internal_pages::resolve on the host side).
+// Real profile/settings page logic. The profile-menu dropdown's Settings/
+// Passwords items (shared with assets/profile-menu/ — see profile_menu.js)
+// navigate via navigation.open_settings/.open_passwords RPC calls, not a
+// same-page link — see that file's own doc comment for why.
 
 let settings = null;
 let profileInfo = null;
 let activeSection = "general";
-
-function passwordsPageUrl() {
-  return `../passwords/index.html?rpc_port=${RPC_PORT}`;
-}
 
 async function loadProfileInfo() {
   profileInfo = await rpcCall("profile.info", {});
@@ -23,26 +18,7 @@ function renderMenu(open) {
     root.innerHTML = "";
     return;
   }
-  const others = profileInfo.other_profiles
-    .map((name) => `<button class="menuitem" data-switch-profile="${escapeHtml(name)}">${escapeHtml(name)}</button>`)
-    .join("");
-  root.innerHTML = `
-    <div class="scrim" id="menu-scrim"></div>
-    <div class="menu">
-      <div style="display:flex;align-items:center;gap:10px;padding:8px 10px 10px">
-        <div class="avbtn" style="width:34px;height:34px;background:var(--accent)">${escapeHtml(profileInfo.initial)}</div>
-        <div style="font-weight:700">${escapeHtml(profileInfo.name)}</div>
-      </div>
-      <button class="menuitem" data-action="settings">Settings</button>
-      <a class="menuitem" href="${passwordsPageUrl()}">Passwords</a>
-      <div class="menudiv"></div>
-      <div class="menuhead">Switch profile</div>
-      <button class="menuitem" data-action="incognito">Incognito</button>
-      <button class="menuitem" data-action="guest">Guest</button>
-      ${others}
-      <div class="menudiv"></div>
-      <button class="menuitem" data-action="add-profile" style="color:var(--accent)">Add profile</button>
-    </div>`;
+  root.innerHTML = `<div class="scrim" id="menu-scrim"></div><div class="menu">${profileMenuHtml(profileInfo)}</div>`;
 }
 
 document.getElementById("avatar-btn").addEventListener("click", () => {
@@ -53,31 +29,9 @@ document.getElementById("avatar-btn").addEventListener("click", () => {
 document.getElementById("menu-root").addEventListener("click", (event) => {
   if (event.target.id === "menu-scrim") {
     renderMenu(false);
-    return;
-  }
-  const switchBtn = event.target.closest("[data-switch-profile]");
-  if (switchBtn) {
-    rpcCall("profile.switch", { name: switchBtn.dataset.switchProfile }).catch((err) => console.error(err));
-    renderMenu(false);
-    return;
-  }
-  const actionEl = event.target.closest("[data-action]");
-  if (!actionEl) return;
-  const action = actionEl.dataset.action;
-  if (action === "settings") {
-    renderMenu(false);
-  } else if (action === "incognito" || action === "guest") {
-    rpcCall("profile.new_ephemeral", {}).catch((err) => console.error(err));
-    renderMenu(false);
-  } else if (action === "add-profile") {
-    const name = window.prompt("New profile name:");
-    if (name) {
-      const encrypted = window.confirm("Encrypt this profile with a passphrase?");
-      rpcCall("profile.create", { name, encrypted }).catch((err) => console.error(err));
-    }
-    renderMenu(false);
   }
 });
+wireProfileMenu(document.getElementById("menu-root"), () => renderMenu(false));
 
 // ---- General section ----
 function renderGeneral() {

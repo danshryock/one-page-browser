@@ -1,0 +1,13 @@
+/* This whole page *is* the dropdown's content (shown inside a native
+   gtk::Popover, which already draws its own shadow/arrow/border) — unlike
+   shared.css's `.menu` (a floating overlay positioned within a full page),
+   here it just fills the page naturally. */
+
+body {
+  width: 240px;
+  background: #fff;
+}
+
+#menu-root {
+  padding: 6px;
+}

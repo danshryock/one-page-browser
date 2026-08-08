@@ -1,0 +1,23 @@
+<!doctype html>
+<!--
+  The profile-avatar dropdown's content, standalone — this is what the
+  native toolbar's avatar button shows inside a gtk::Popover (a small
+  webview, built fresh on each open). Shares its markup/behavior with the
+  in-page dropdown on assets/profile/index.html via profile_menu.js — see
+  that file's own doc comment for why Settings/Passwords route through RPC
+  navigation calls instead of a same-page link.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Profile menu</title>
+  <link rel="stylesheet" href="../shared.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="menu-root"></div>
+  <script src="../rpc.js"></script>
+  <script src="../profile_menu.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
