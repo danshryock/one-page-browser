@@ -592,15 +592,33 @@ impl AppState {
     /// the one place both are available together. Best-effort: logs rather
     /// than propagating, matching this codebase's existing error-handling
     /// style throughout (a failed history write shouldn't interrupt browsing).
+    ///
+    /// Skips the browser's own internal pages (`browser://switcher`, etc. —
+    /// see `browser_chrome_core::internal_pages`): they're host UI a user
+    /// navigated to, not a page they *browsed to*, so recording a visit for
+    /// them would pollute history (and the switcher's own history column)
+    /// with the browser's own chrome.
     fn record_visit(&self, id: &str) {
         let core = self.core.borrow();
         let Some(page) = core.page(id) else { return };
         let url = page.current_url();
         let title = page.title.borrow().clone();
         drop(core);
+        if browser_chrome_core::internal_pages::is_internal_url(&url, self.asset_port.get()) {
+            return;
+        }
         if let Err(err) = self.history.record_visit(&url, &title) {
             eprintln!("failed to record history visit: {err}");
         }
+    }
+
+    /// `url`'s address-bar-facing display form: `browser://switcher` (etc.)
+    /// instead of the raw loopback URL it's actually served from, for any of
+    /// the browser's own internal pages — see `browser_chrome_core::
+    /// internal_pages::display_url`. Passed through unchanged for an
+    /// ordinary page's URL.
+    fn display_url_for(&self, url: &str) -> String {
+        browser_chrome_core::internal_pages::display_url(url, self.asset_port.get()).map(str::to_string).unwrap_or_else(|| url.to_string())
     }
 
     /// Updates page `id`'s tracked audio-playing state and refreshes the
@@ -782,7 +800,7 @@ impl AppState {
     /// current URL instead of starting from a blank filter.
     pub fn open_switcher_editing_url(self: &Rc<Self>) {
         let current_url = self.core.borrow().active().map(|p| p.current_url()).unwrap_or_default();
-        self.address_bar.set_text(&current_url);
+        self.address_bar.set_text(&self.display_url_for(&current_url));
         self.address_bar.set_placeholder_text(None);
         self.open_switcher_common();
         self.address_bar.select_region(0, -1);
@@ -800,7 +818,8 @@ impl AppState {
         self.stack.set_sensitive(true);
         self.address_bar.set_placeholder_text(None);
         if let Some(page) = self.core.borrow().active() {
-            self.address_bar.set_text(&page.current_url());
+            let url = page.current_url();
+            self.address_bar.set_text(&self.display_url_for(&url));
         }
     }
 

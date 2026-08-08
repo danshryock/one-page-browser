@@ -2256,3 +2256,44 @@ fn browser_passwords_page_shows_the_real_locked_state() {
         cleanup_test_profile(&profile);
     });
 }
+
+/// Internal pages (`browser://...`) are host UI, not something the user
+/// "browsed to" — they must never show up in history, and the address bar
+/// must show `browser://switcher` (etc.), not the raw loopback URL it's
+/// actually served from, once pulled up to edit.
+#[test]
+fn internal_pages_are_excluded_from_history_and_shown_as_browser_urls_when_editing() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("internal-pages-display");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        // Visit every internal page — each has a real <title>, so if they
+        // weren't excluded, each would record a history visit.
+        app.add_page(browser_chrome_core::internal_pages::PROFILE).expect("add_page should succeed");
+        assert!(wait_until(|| app.console_messages_for_test().iter().any(|m| m.starts_with("profile_section_rendered"))));
+        app.add_page(browser_chrome_core::internal_pages::PASSWORDS).expect("add_page should succeed");
+        assert!(wait_until(|| app.console_messages_for_test().iter().any(|m| m.starts_with("passwords_loaded"))));
+
+        // The address bar, pulled up to edit the *current* page (passwords)
+        // right now: should show the browser:// form, not the loopback URL.
+        app.open_switcher_editing_url();
+        assert_eq!(app.address_bar_text(), browser_chrome_core::internal_pages::PASSWORDS);
+        app.close_switcher();
+        assert_eq!(app.address_bar_text(), browser_chrome_core::internal_pages::PASSWORDS, "closing without a selection should restore the same browser:// display form");
+
+        // The switcher page itself is the third internal page visited here —
+        // its own `switcher.history` RPC call is the real, end-to-end check
+        // that none of the three (including itself) got recorded.
+        app.add_page(browser_chrome_core::internal_pages::SWITCHER).expect("add_page should succeed");
+        assert!(
+            wait_until(|| app.console_messages_for_test().iter().any(|m| m.starts_with("switcher_loaded"))),
+            "expected the switcher page to report switcher_loaded, got {:?}",
+            app.console_messages_for_test()
+        );
+        let messages = app.console_messages_for_test();
+        let last = messages.iter().rev().find(|m| m.starts_with("switcher_loaded")).expect("already asserted present above").clone();
+        assert_eq!(parse_metric(&last, "history"), Some(0), "no internal page should ever be recorded in history, got {last:?}");
+
+        cleanup_test_profile(&profile);
+    });
+}
