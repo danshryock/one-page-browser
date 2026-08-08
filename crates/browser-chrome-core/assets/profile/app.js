@@ -1,0 +1,305 @@
+// Real profile/settings page logic. Sibling internal pages (passwords) are
+// reached via a plain same-origin relative link carrying this page's own
+// `?rpc_port=` forward — no host-side navigation interception needed for
+// page-to-page links, only for the very first `browser://...` entry point
+// (see internal_pages::resolve on the host side).
+
+let settings = null;
+let profileInfo = null;
+let activeSection = "general";
+
+function passwordsPageUrl() {
+  return `../passwords/index.html?rpc_port=${RPC_PORT}`;
+}
+
+async function loadProfileInfo() {
+  profileInfo = await rpcCall("profile.info", {});
+  document.getElementById("avatar-btn").textContent = profileInfo.initial;
+}
+
+function renderMenu(open) {
+  const root = document.getElementById("menu-root");
+  if (!open || !profileInfo) {
+    root.innerHTML = "";
+    return;
+  }
+  const others = profileInfo.other_profiles
+    .map((name) => `<button class="menuitem" data-switch-profile="${escapeHtml(name)}">${escapeHtml(name)}</button>`)
+    .join("");
+  root.innerHTML = `
+    <div class="scrim" id="menu-scrim"></div>
+    <div class="menu">
+      <div style="display:flex;align-items:center;gap:10px;padding:8px 10px 10px">
+        <div class="avbtn" style="width:34px;height:34px;background:var(--accent)">${escapeHtml(profileInfo.initial)}</div>
+        <div style="font-weight:700">${escapeHtml(profileInfo.name)}</div>
+      </div>
+      <button class="menuitem" data-action="settings">Settings</button>
+      <a class="menuitem" href="${passwordsPageUrl()}">Passwords</a>
+      <div class="menudiv"></div>
+      <div class="menuhead">Switch profile</div>
+      <button class="menuitem" data-action="incognito">Incognito</button>
+      <button class="menuitem" data-action="guest">Guest</button>
+      ${others}
+      <div class="menudiv"></div>
+      <button class="menuitem" data-action="add-profile" style="color:var(--accent)">Add profile</button>
+    </div>`;
+}
+
+document.getElementById("avatar-btn").addEventListener("click", () => {
+  const isOpen = document.getElementById("menu-root").children.length > 0;
+  renderMenu(!isOpen);
+});
+
+document.getElementById("menu-root").addEventListener("click", (event) => {
+  if (event.target.id === "menu-scrim") {
+    renderMenu(false);
+    return;
+  }
+  const switchBtn = event.target.closest("[data-switch-profile]");
+  if (switchBtn) {
+    rpcCall("profile.switch", { name: switchBtn.dataset.switchProfile }).catch((err) => console.error(err));
+    renderMenu(false);
+    return;
+  }
+  const actionEl = event.target.closest("[data-action]");
+  if (!actionEl) return;
+  const action = actionEl.dataset.action;
+  if (action === "settings") {
+    renderMenu(false);
+  } else if (action === "incognito" || action === "guest") {
+    rpcCall("profile.new_ephemeral", {}).catch((err) => console.error(err));
+    renderMenu(false);
+  } else if (action === "add-profile") {
+    const name = window.prompt("New profile name:");
+    if (name) {
+      const encrypted = window.confirm("Encrypt this profile with a passphrase?");
+      rpcCall("profile.create", { name, encrypted }).catch((err) => console.error(err));
+    }
+    renderMenu(false);
+  }
+});
+
+// ---- General section ----
+function renderGeneral() {
+  const isDark = settings.theme === "Dark";
+  return `
+    <div class="section">
+      <div class="sidehead section-title">General</div>
+      <div class="field-row">
+        <div class="field-label">
+          <div class="row-title">Start page</div>
+          <div class="field-sub">Opened for a brand new page</div>
+        </div>
+        <input type="text" id="start-page-input" value="${escapeHtml(settings.start_page)}">
+        <button class="btn btn-primary" id="save-start-page">Save</button>
+      </div>
+      <div class="field-row">
+        <div class="field-label">
+          <div class="row-title">Loaded pages limit</div>
+          <div class="field-sub">How many pages may stay loaded at once — blank for unlimited</div>
+        </div>
+        <input type="number" id="max-loaded-input" min="1" value="${settings.max_loaded_pages == null ? "" : settings.max_loaded_pages}" style="width:80px">
+        <button class="btn btn-primary" id="save-max-loaded">Save</button>
+      </div>
+      <div class="field-row">
+        <div class="field-label">
+          <div class="row-title">Dark theme</div>
+        </div>
+        <div class="toggle ${isDark ? "on" : ""}" id="theme-toggle"><div class="toggle-knob"></div></div>
+      </div>
+    </div>`;
+}
+
+function wireGeneral() {
+  document.getElementById("save-start-page").addEventListener("click", async () => {
+    const start_page = document.getElementById("start-page-input").value.trim();
+    await rpcCall("profile.settings.update_general", { start_page });
+    await reloadSettings();
+  });
+  document.getElementById("save-max-loaded").addEventListener("click", async () => {
+    const raw = document.getElementById("max-loaded-input").value.trim();
+    await rpcCall("profile.settings.update_general", { max_loaded_pages: raw === "" ? null : Number(raw) });
+    await reloadSettings();
+  });
+  document.getElementById("theme-toggle").addEventListener("click", async () => {
+    const next = settings.theme === "Dark" ? "Light" : "Dark";
+    await rpcCall("profile.settings.update_general", { theme: next });
+    await reloadSettings();
+  });
+}
+
+// ---- Privacy & Security section (no backing settings yet) ----
+function renderPrivacy() {
+  return `
+    <div class="section">
+      <div class="sidehead section-title">Privacy &amp; Security</div>
+      <div class="placeholder">Privacy &amp; Security settings aren't implemented yet.</div>
+    </div>`;
+}
+
+// ---- Password Managers section ----
+function renderPasswordManagers(managers) {
+  const rows = managers
+    .map((m) => {
+      if (m.builtin) {
+        return `
+          <div class="listrow">
+            <div class="swatch" style="background:var(--accent);width:14px;height:14px;border-radius:4px"></div>
+            <div style="flex:1;min-width:0"><div class="row-title">${escapeHtml(m.label)}</div><div class="row-sub">${escapeHtml(m.detail)}</div></div>
+            <div class="toggle on"><div class="toggle-knob"></div></div>
+          </div>`;
+      }
+      const actionLabel = m.connected ? "Disconnect" : "Connect";
+      return `
+        <div class="listrow">
+          <div class="swatch" style="background:var(--accent-bitwarden);width:14px;height:14px;border-radius:4px"></div>
+          <div style="flex:1;min-width:0"><div class="row-title">${escapeHtml(m.label)}</div><div class="row-sub">${escapeHtml(m.detail)}</div></div>
+          <button class="btn" data-bitwarden-action="${m.connected ? "disconnect" : "connect"}">${actionLabel}</button>
+        </div>`;
+    })
+    .join("");
+  return `
+    <div class="section">
+      <div class="sidehead section-title">Password managers</div>
+      ${rows}
+      <div class="add-row" id="bitwarden-connect-form" style="display:none">
+        <input type="text" id="bitwarden-url-input" placeholder="http://127.0.0.1:8087" style="width:240px">
+        <button class="btn btn-primary" id="bitwarden-connect-submit">Connect</button>
+      </div>
+    </div>`;
+}
+
+function wirePasswordManagers() {
+  const content = document.getElementById("content");
+  content.addEventListener("click", async (event) => {
+    const actionBtn = event.target.closest("[data-bitwarden-action]");
+    if (!actionBtn) return;
+    if (actionBtn.dataset.bitwardenAction === "disconnect") {
+      await rpcCall("profile.password_managers.disconnect_bitwarden", {});
+      await renderSection();
+    } else {
+      document.getElementById("bitwarden-connect-form").style.display = "flex";
+    }
+  });
+  const submit = document.getElementById("bitwarden-connect-submit");
+  if (submit) {
+    submit.addEventListener("click", async () => {
+      const server_url = document.getElementById("bitwarden-url-input").value.trim();
+      if (!server_url) return;
+      await rpcCall("profile.password_managers.connect_bitwarden", { server_url });
+      await renderSection();
+    });
+  }
+}
+
+// ---- Search Engines section ----
+function renderSearchEngines() {
+  const rows = settings.search_engines
+    .map(
+      (eng) => `
+      <div class="listrow">
+        <div style="width:8px;height:8px;border-radius:50%;background:${eng.name === settings.default_search_engine ? "var(--accent)" : "transparent"};border:1.5px solid rgba(0,0,0,.2)"></div>
+        <div style="flex:1;min-width:0"><div class="row-title">${escapeHtml(eng.name)}</div><div class="row-sub">${escapeHtml(eng.query_url_template)}</div></div>
+        <button class="btn" data-set-default="${escapeHtml(eng.name)}">Set default</button>
+        <button class="iconbtn" data-remove-engine="${escapeHtml(eng.name)}">✕</button>
+      </div>`
+    )
+    .join("");
+  return `
+    <div class="section">
+      <div class="sidehead section-title">Search engines</div>
+      ${rows}
+      <div class="add-row" style="display:flex;gap:8px">
+        <input type="text" id="new-engine-name" placeholder="Name" style="width:120px">
+        <input type="text" id="new-engine-url" placeholder="https://example.com/search?q={query}" style="flex:1">
+        <button class="btn btn-dashed" id="add-engine-btn">+ Add search engine</button>
+      </div>
+    </div>`;
+}
+
+function wireSearchEngines() {
+  const content = document.getElementById("content");
+  content.addEventListener("click", async (event) => {
+    const setDefaultBtn = event.target.closest("[data-set-default]");
+    const removeBtn = event.target.closest("[data-remove-engine]");
+    if (setDefaultBtn) {
+      await rpcCall("profile.search_engines.set_default", { name: setDefaultBtn.dataset.setDefault });
+      await reloadSettings();
+    } else if (removeBtn) {
+      await rpcCall("profile.search_engines.remove", { name: removeBtn.dataset.removeEngine });
+      await reloadSettings();
+    }
+  });
+  const addBtn = document.getElementById("add-engine-btn");
+  if (addBtn) {
+    addBtn.addEventListener("click", async () => {
+      const name = document.getElementById("new-engine-name").value.trim();
+      const query_url_template = document.getElementById("new-engine-url").value.trim();
+      if (!name || !query_url_template) return;
+      await rpcCall("profile.search_engines.add", { name, query_url_template });
+      await reloadSettings();
+    });
+  }
+}
+
+// ---- Keyboard Shortcuts section (read-only) ----
+function renderShortcuts(bindings) {
+  const rows = bindings
+    .map(
+      (b) => `
+      <div class="listrow">
+        <span style="flex:1">${escapeHtml(b.label)}</span>
+        <div style="display:flex;gap:4px">
+          ${b.chords.map((chord) => `<span class="row-sub" style="background:var(--hover);padding:2px 6px;border-radius:5px">${escapeHtml(chord)}</span>`).join("") || '<span class="row-sub">unbound</span>'}
+        </div>
+      </div>`
+    )
+    .join("");
+  return `
+    <div class="section">
+      <div class="sidehead section-title">Keyboard shortcuts</div>
+      ${rows}
+    </div>`;
+}
+
+async function reloadSettings() {
+  settings = await rpcCall("profile.settings.get", {});
+  await renderSection();
+}
+
+async function renderSection() {
+  const content = document.getElementById("content");
+  if (activeSection === "general") {
+    content.innerHTML = renderGeneral();
+    wireGeneral();
+  } else if (activeSection === "privacy") {
+    content.innerHTML = renderPrivacy();
+  } else if (activeSection === "password-managers") {
+    const { managers } = await rpcCall("profile.password_managers.list", {});
+    content.innerHTML = renderPasswordManagers(managers);
+    wirePasswordManagers();
+  } else if (activeSection === "search-engines") {
+    content.innerHTML = renderSearchEngines();
+    wireSearchEngines();
+  } else if (activeSection === "shortcuts") {
+    const { bindings } = await rpcCall("profile.keybindings.list", {});
+    content.innerHTML = renderShortcuts(bindings);
+  }
+  console.log(`profile_section_rendered section=${activeSection}`);
+}
+
+document.getElementById("sidebar").addEventListener("click", (event) => {
+  const btn = event.target.closest(".sidebtn");
+  if (!btn) return;
+  activeSection = btn.dataset.section;
+  document.querySelectorAll(".sidebtn").forEach((b) => b.classList.toggle("active", b === btn));
+  renderSection().catch((err) => console.error(err));
+});
+
+async function init() {
+  settings = await rpcCall("profile.settings.get", {});
+  await loadProfileInfo();
+  await renderSection();
+}
+
+init().catch((err) => console.error(err));

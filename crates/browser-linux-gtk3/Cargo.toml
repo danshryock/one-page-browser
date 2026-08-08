@@ -12,6 +12,13 @@ anyhow = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+# `internal_rpc.rs`'s RPC handler registry (backing the switcher/profile/
+# passwords pages — see browser_chrome_core::internal_pages) builds
+# `serde_json::Value` request/response bodies and names `rpc_protocol::
+# RpcError` directly, the same types `browser-chrome-core`'s own
+# `WebviewRpcServer` already uses internally.
+serde_json = "1"
+rpc-protocol = { path = "../rpc-protocol" }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 gtk-test = "0.18"
@@ -22,9 +29,3 @@ enigo = "0.0.14"
 # Test-only: a fake local server standing in for `bw serve`, same use as in
 # browser-core's own bitwarden.rs tests.
 tiny_http = "0.12"
-serde_json = "1"
-# Test-only: naming `RpcError` for the trivial ping/echo handlers the new
-# `webview_rpc` round-trip test registers — `browser-chrome-core` already
-# depends on this for real (`WebviewRpcServer`'s own implementation), this
-# just makes its `RpcError` type nameable here too.
-rpc-protocol = { path = "../rpc-protocol" }

@@ -2150,3 +2150,109 @@ fn embedded_assets_load_and_run_in_a_real_webview() {
         cleanup_test_profile(&profile);
     });
 }
+
+/// Pulls `key=value` (an integer) out of a `key1=v1 key2=v2 ...`-shaped
+/// console.log message — used by the `browser://...` tests below so they
+/// assert real counts without requiring an exact string match (see
+/// `browser_switcher_page_shows_real_open_pages_bookmarks_and_history`'s own
+/// comment for why an exact `pages=` count would be flaky).
+fn parse_metric(message: &str, key: &str) -> Option<i64> {
+    message.split(' ').find_map(|token| token.strip_prefix(&format!("{key}=")).and_then(|v| v.parse().ok()))
+}
+
+/// End-to-end proof that `browser://switcher` (see `internal_pages::
+/// resolve`, hooked into `add_page`) is a real, working page: seeds real
+/// open pages, a real bookmark, and real history visits through this exact
+/// `AppState`, navigates to it, and asserts its own `console.log` (emitted
+/// by `assets/switcher/app.js` after it fetches everything over
+/// `WebviewRpcServer`) reflects the seeded data — not a fixture, and not
+/// just "the page loaded."
+#[test]
+fn browser_switcher_page_shows_real_open_pages_bookmarks_and_history() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("browser-switcher");
+        let url_a = fixture_url("page_a.html");
+        let url_b = fixture_url("page_b.html");
+
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        app.add_page(&url_a).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())));
+        let id_a = app.page_ids()[0].clone();
+        assert!(wait_until(|| app.page_title(&id_a).as_deref() == Some("Page A")), "page A's title should arrive, recording a history visit");
+        app.toggle_bookmark_for_active();
+        assert!(app.is_active_bookmarked());
+
+        app.add_page(&url_b).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url_b.as_str())));
+        let id_b = app.page_ids().into_iter().find(|id| app.page_url(id).as_deref() == Some(url_b.as_str())).expect("page B should be tracked");
+        assert!(wait_until(|| app.page_title(&id_b).as_deref() == Some("Page B")), "page B's title should arrive, recording a second history visit");
+
+        app.add_page(browser_chrome_core::internal_pages::SWITCHER).expect("add_page should succeed");
+
+        assert!(
+            wait_until(|| app.console_messages_for_test().iter().any(|m| m.starts_with("switcher_loaded"))),
+            "expected the switcher page to report switcher_loaded, got {:?}",
+            app.console_messages_for_test()
+        );
+        let messages = app.console_messages_for_test();
+        let last = messages.iter().rev().find(|m| m.starts_with("switcher_loaded")).expect("already asserted present above").clone();
+        // `>=`, not `==`, for open pages: the switcher page is a real page
+        // too (tracked by the same `PageManager` it's querying), so it may
+        // or may not have finished registering itself by the moment its own
+        // first fetch runs — this only asserts what must always be true.
+        assert!(parse_metric(&last, "pages").unwrap_or(0) >= 2, "expected at least the two real open pages, got {last:?}");
+        assert_eq!(parse_metric(&last, "bookmarks"), Some(1), "expected the one real bookmark, got {last:?}");
+        assert!(parse_metric(&last, "history").unwrap_or(0) >= 2, "expected at least the two real history visits, got {last:?}");
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+/// End-to-end proof that `browser://profile` renders real `Settings` data
+/// (fetched via `profile.settings.get`), not placeholder content.
+#[test]
+fn browser_profile_page_shows_real_settings() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("browser-profile");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        app.add_page(browser_chrome_core::internal_pages::PROFILE).expect("add_page should succeed");
+        assert!(
+            wait_until(|| app.console_messages_for_test().iter().any(|m| m == "profile_section_rendered section=general")),
+            "expected the profile page's General section to render, got {:?}",
+            app.console_messages_for_test()
+        );
+
+        // A real round trip, not just a page load: the General section's
+        // start-page field should reflect this profile's actual (default)
+        // `Settings::start_page` — a fixture/mock would have no way to know
+        // this value.
+        assert!(
+            wait_until_script_equals(&app, "document.getElementById('start-page-input').value", browser_core::HOME_URL),
+            "expected the start-page field to reflect this profile's real Settings::start_page"
+        );
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+/// End-to-end proof that `browser://passwords` honestly reports a fresh
+/// profile's real vault state (never set up) rather than silently showing
+/// an empty-but-unlocked list.
+#[test]
+fn browser_passwords_page_shows_the_real_locked_state() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("browser-passwords");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        app.add_page(browser_chrome_core::internal_pages::PASSWORDS).expect("add_page should succeed");
+        assert!(
+            wait_until(|| app.console_messages_for_test().iter().any(|m| m == "passwords_loaded locked=true entries=0")),
+            "expected the passwords page to honestly report the real (never set up) vault state, got {:?}",
+            app.console_messages_for_test()
+        );
+
+        cleanup_test_profile(&profile);
+    });
+}

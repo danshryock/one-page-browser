@@ -20,6 +20,12 @@ use browser_core::{
 use gtk::prelude::*;
 use render_engine::{NewWindowInfo, RenderEngine, WebContext, WebKitWebView, WryEngine};
 
+/// The RPC handler registry backing the switcher/profile/passwords pages
+/// (`browser_chrome_core::internal_pages`) — this file's first submodule
+/// split (everything else still lives in this one file), scoped narrowly to
+/// keep that JSON glue out of the GTK-widget-construction code below.
+mod internal_rpc;
+
 /// The password vault's session state — UI-level bookkeeping distinct from
 /// `PasswordStore`/`PasswordBackend` (the storage/abstraction layer, in
 /// `browser-core`): this enum only tracks what this specific running window
@@ -226,6 +232,24 @@ pub struct AppState {
     /// just-loaded, complete session on disk with a partial one-page
     /// version before the loop even finishes registering the rest.
     restoring: Cell<bool>,
+    /// Serves the compiled-in `browser-chrome-core/assets/` pages (the
+    /// switcher/profile/passwords pages, plus the pre-existing embedded-
+    /// assets proof-of-concept) over loopback HTTP — see
+    /// `browser_chrome_core::internal_pages`. `Option` because the server
+    /// can only be started once this `AppState` already exists as an `Rc`
+    /// (its RPC-server sibling's handlers need `Rc::clone(&app)`), so it's
+    /// backfilled right after construction, not built inline in this
+    /// struct literal.
+    embedded_asset_server: RefCell<Option<browser_chrome_core::EmbeddedAssetServer>>,
+    /// Serves `/rpc/<method>` calls the switcher/profile/passwords pages
+    /// make back into this same `AppState` — see `internal_rpc.rs`.
+    webview_rpc_server: RefCell<Option<browser_chrome_core::WebviewRpcServer>>,
+    /// Cached ports of the two servers above, read by `add_page`'s
+    /// `browser://...` resolution (`browser_chrome_core::internal_pages::
+    /// resolve`) without borrowing either `RefCell`. `0` until the servers
+    /// are actually started, immediately after construction.
+    asset_port: Cell<u16>,
+    rpc_port: Cell<u16>,
 }
 
 impl AppState {
@@ -293,6 +317,18 @@ impl AppState {
     }
 
     pub fn add_page(self: &Rc<Self>, url: &str) -> anyhow::Result<()> {
+        // `resolve_address_input` already passes a `browser://...` URL
+        // through unchanged (it contains `"://"`); this is the actual
+        // resolution step, turning it into the real loopback URL the
+        // embedded-asset server serves it from — the one choke point every
+        // navigation (address bar, switcher, history, session restore)
+        // already goes through. Falls back to the literal `browser://...`
+        // string (which no real `RenderEngine` can load) only if it isn't
+        // one of the known internal pages, or the asset/RPC servers never
+        // started.
+        let resolved = browser_chrome_core::internal_pages::resolve(url, self.asset_port.get(), self.rpc_port.get());
+        let url = resolved.as_deref().unwrap_or(url);
+
         let id = self.core.borrow_mut().allocate_id();
 
         let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -3519,8 +3555,32 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         history,
         profile,
         restoring: Cell::new(false),
+        embedded_asset_server: RefCell::new(None),
+        webview_rpc_server: RefCell::new(None),
+        asset_port: Cell::new(0),
+        rpc_port: Cell::new(0),
     });
     app.apply_theme();
+
+    // Started here (rather than inline in the struct literal above) since
+    // the RPC server's handlers need `Rc::clone(&app)`, same as every GTK
+    // signal handler wired below — `app` has to exist as an `Rc` first. See
+    // `internal_pages::resolve` (called from `add_page`) for how a
+    // `browser://...` URL turns into a real request to these two servers.
+    match browser_chrome_core::EmbeddedAssetServer::start(browser_chrome_core::embedded_assets(), "index.html") {
+        Ok(server) => {
+            app.asset_port.set(server.port());
+            *app.embedded_asset_server.borrow_mut() = Some(server);
+        }
+        Err(err) => eprintln!("failed to start the embedded asset server: {err}"),
+    }
+    match browser_chrome_core::WebviewRpcServer::start(internal_rpc::build_handlers(&app)) {
+        Ok(server) => {
+            app.rpc_port.set(server.port());
+            *app.webview_rpc_server.borrow_mut() = Some(server);
+        }
+        Err(err) => eprintln!("failed to start the internal webview RPC server: {err}"),
+    }
 
     {
         // Only filters the grid while the switcher is actually open — the

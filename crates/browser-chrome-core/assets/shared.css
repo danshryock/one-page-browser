@@ -1,0 +1,358 @@
+/* Shared tokens + component classes for the switcher/profile/passwords
+   pages — pulled from the Claude Design mockups (options 3b/3c/3d of
+   "Browser Concepts.dc.html") these pages implement, kept in one file so
+   the three look like one coherent app instead of three reimplementations. */
+
+:root {
+  --accent: oklch(58% 0.12 260);
+  --accent-bitwarden: oklch(50% 0.14 290);
+  --text: #1a1a1a;
+  --text-dim: rgba(0, 0, 0, 0.45);
+  --text-faint: rgba(0, 0, 0, 0.4);
+  --border: rgba(0, 0, 0, 0.06);
+  --border-strong: rgba(0, 0, 0, 0.08);
+  --hover: rgba(0, 0, 0, 0.04);
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --mono: ui-monospace, Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font);
+  color: var(--text);
+  background: #fff;
+  font-size: 13px;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.page {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* Tab bar (switcher's All/Open Pages/Bookmarks/History) */
+.tabbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 10px;
+  flex-shrink: 0;
+  background: #f5f4f3;
+  border-bottom: 1px solid var(--border);
+}
+
+.tabbtn {
+  padding: 6px 12px;
+  border-radius: 7px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.tabbtn:hover {
+  background: var(--hover);
+}
+
+.tabbtn.active {
+  background: #fff;
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: 0 0 0 1px var(--border-strong);
+}
+
+/* Column layout (switcher) */
+.columns {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+.column {
+  flex: 1;
+  overflow: auto;
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+
+.column:last-child {
+  border-right: none;
+}
+
+.colhead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px;
+  flex-shrink: 0;
+}
+
+.sidehead {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+
+/* List rows (used everywhere: switcher columns, bookmarks, history,
+   passwords, settings) */
+.listrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.listrow:hover {
+  background: var(--hover);
+}
+
+.row-title {
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row-sub {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+
+.iconbtn {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.iconbtn:hover {
+  background: var(--hover);
+}
+
+.empty-state {
+  padding: 24px 14px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+}
+
+/* Avatar / profile menu */
+.avbtn {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-weight: 700;
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.menu {
+  position: absolute;
+  top: 52px;
+  right: 24px;
+  width: 240px;
+  background: #fff;
+  border-radius: 10px;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.22), 0 0 0 1px rgba(0, 0, 0, 0.06);
+  z-index: 5;
+  overflow: hidden;
+  padding: 6px;
+}
+
+.menuitem {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 7px;
+  font-size: 13px;
+  text-align: left;
+  text-decoration: none;
+  color: inherit;
+}
+
+.menuitem:hover {
+  background: var(--hover);
+}
+
+.menudiv {
+  height: 1px;
+  background: var(--border);
+  margin: 6px 4px;
+}
+
+.menuhead {
+  padding: 6px 10px 2px;
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+
+/* Settings sidebar (profile page) */
+.settings-layout {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+.sidebar {
+  width: 200px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  padding: 12px 8px;
+  overflow: auto;
+}
+
+.sidebtn {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 7px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.sidebtn:hover {
+  background: var(--hover);
+}
+
+.sidebtn.active {
+  background: var(--hover);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.settings-content {
+  flex: 1;
+  overflow: auto;
+}
+
+/* Toggle switch */
+.toggle {
+  width: 32px;
+  height: 18px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.15);
+  position: relative;
+  flex-shrink: 0;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.toggle.on {
+  background: var(--accent);
+}
+
+.toggle-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  transition: left 0.15s;
+}
+
+.toggle.on .toggle-knob {
+  left: 16px;
+}
+
+/* Buttons */
+.btn {
+  padding: 6px 12px;
+  border-radius: 7px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.btn:hover {
+  background: var(--hover);
+}
+
+.btn-dashed {
+  border: 1px dashed rgba(0, 0, 0, 0.2);
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.btn-primary:hover {
+  filter: brightness(1.05);
+}
+
+input[type="text"],
+input[type="password"],
+input[type="number"] {
+  font-family: inherit;
+  font-size: 12.5px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+}
+
+/* Tag pill (password source, "Browser"/"Bitwarden") */
+.tag {
+  color: #fff;
+  font-size: 9.5px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  letter-spacing: 0.02em;
+}
+
+.dots {
+  font-size: 12px;
+  color: var(--text-dim);
+  letter-spacing: 1px;
+}
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 4;
+}

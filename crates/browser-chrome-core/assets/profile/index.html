@@ -1,0 +1,38 @@
+<!doctype html>
+<!--
+  Real profile/settings page — design 3c of the Claude Design "Browser
+  Concepts" project: a sidebar of settings sections plus a profile-switcher
+  menu. Served by EmbeddedAssetServer; data comes from the real Settings/
+  Profile/Keybindings/BitwardenBackend over WebviewRpcServer — see
+  internal_rpc.rs on the host side.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Profile</title>
+  <link rel="stylesheet" href="../shared.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="page">
+    <div class="topbar">
+      <span class="page-heading">Profile</span>
+      <span style="flex:1"></span>
+      <button class="avbtn" id="avatar-btn" style="background:var(--accent)">?</button>
+    </div>
+    <div id="menu-root"></div>
+    <div class="settings-layout">
+      <div class="sidebar" id="sidebar">
+        <button class="sidebtn active" data-section="general">General</button>
+        <button class="sidebtn" data-section="privacy">Privacy &amp; Security</button>
+        <button class="sidebtn" data-section="password-managers">Password Managers</button>
+        <button class="sidebtn" data-section="search-engines">Search Engines</button>
+        <button class="sidebtn" data-section="shortcuts">Keyboard Shortcuts</button>
+      </div>
+      <div class="settings-content" id="content"></div>
+    </div>
+  </div>
+  <script src="../rpc.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

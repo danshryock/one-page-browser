@@ -1,0 +1,33 @@
+/* Passwords-page-specific styles — layout/color tokens live in shared.css. */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  padding: 18px 24px 6px;
+  flex-shrink: 0;
+}
+
+.page-heading {
+  font-weight: 700;
+  font-size: 15px;
+}
+
+.filter-row {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 8px 24px 14px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.filter-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+#content .listrow {
+  padding-left: 24px;
+}

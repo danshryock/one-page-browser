@@ -1,0 +1,17 @@
+/* Switcher-page-specific styles — layout/color tokens live in
+   shared.css. Only one density (list) is implemented for this pass; the
+   mockup's cards/compact/grid toggle is a later, purely-visual addition. */
+
+#search {
+  height: 30px;
+}
+
+.column[data-column="open"] .swatch,
+.column[data-column="bookmarks"] .swatch,
+.column[data-column="history"] .swatch {
+  background: var(--row-color, #999);
+}
+
+.close-page-btn {
+  margin-left: auto;
+}

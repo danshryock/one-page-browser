@@ -1,0 +1,30 @@
+<!doctype html>
+<!--
+  Real passwords page — design 3d of the Claude Design "Browser Concepts"
+  project: a standalone list of saved logins from every connected manager,
+  tagged by source. Served by EmbeddedAssetServer; data comes from the real
+  PasswordStore/BitwardenBackend over WebviewRpcServer (passwords.list
+  never includes plaintext — passwords.reveal fetches one on demand) — see
+  internal_rpc.rs on the host side.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Passwords</title>
+  <link rel="stylesheet" href="../shared.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="page">
+    <div class="topbar">
+      <span class="page-heading">Passwords</span>
+      <span style="flex:1"></span>
+      <input type="text" id="search" placeholder="Search passwords" style="width:200px">
+    </div>
+    <div class="filter-row" id="filter-row"></div>
+    <div id="content"></div>
+  </div>
+  <script src="../rpc.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

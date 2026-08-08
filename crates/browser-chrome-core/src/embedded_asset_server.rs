@@ -64,8 +64,14 @@ impl Drop for EmbeddedAssetServer {
 }
 
 fn handle_request(request: tiny_http::Request, assets: &ZipAssets, index: &str) {
+    // `request.url()` is the raw request-target, query string and all (e.g.
+    // `switcher/index.html?rpc_port=1234`) — stripped here since a zip entry
+    // is never named with one. A served page passing its own config via
+    // `?rpc_port=...` (see `internal_pages::resolve`) is what first needed
+    // this; nothing before it ever requested a path with a query string.
     let requested = request.url().trim_start_matches('/');
-    let path = if requested.is_empty() { index } else { requested };
+    let path_only = requested.split('?').next().unwrap_or(requested);
+    let path = if path_only.is_empty() { index } else { path_only };
 
     match assets.read(path) {
         Ok(bytes) => {

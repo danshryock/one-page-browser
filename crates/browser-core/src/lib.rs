@@ -48,6 +48,46 @@ pub fn domain_of(url: &str) -> String {
     without_scheme.split('/').next().unwrap_or(without_scheme).to_string()
 }
 
+/// Deterministically picks one of `PageManager`'s own swatch colors for
+/// something that isn't a live `Page` (a bookmark, a history entry, a saved
+/// login) — those don't carry a `color` field of their own, unlike `Page`
+/// (which gets one by insertion order, see `PageManager::insert`). Same
+/// `seed` (e.g. a URL or site) always picks the same color, so a given
+/// bookmark/history entry/login looks the same color across repeated
+/// fetches instead of shuffling every time its list is rebuilt.
+pub fn palette_color_for(seed: &str) -> &'static str {
+    let hash = seed.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+    PALETTE[(hash as usize) % PALETTE.len()]
+}
+
+#[cfg(test)]
+mod palette_color_tests {
+    use super::palette_color_for;
+
+    #[test]
+    fn same_seed_always_picks_the_same_color() {
+        let a = palette_color_for("https://example.com/one");
+        let b = palette_color_for("https://example.com/one");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn different_seeds_can_pick_different_colors() {
+        let colors: std::collections::HashSet<&str> =
+            ["https://a.example", "https://b.example", "https://c.example", "https://d.example", "https://e.example"]
+                .iter()
+                .map(|s| palette_color_for(s))
+                .collect();
+        assert!(colors.len() > 1, "a handful of distinct seeds should not all collide onto the same color");
+    }
+
+    #[test]
+    fn result_is_always_a_real_palette_entry() {
+        let color = palette_color_for("anything");
+        assert!(color.starts_with('#'));
+    }
+}
+
 /// Turns whatever the user typed into an address bar (the toolbar one, or
 /// the switcher's search box) into a URL to actually navigate to:
 /// - Already looks like a URL → passed through unchanged.

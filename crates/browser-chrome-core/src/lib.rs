@@ -49,6 +49,7 @@
 
 mod embedded_asset_server;
 mod embedded_assets;
+pub mod internal_pages;
 mod restore;
 mod switcher;
 mod test_commands;
