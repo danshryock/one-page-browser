@@ -1,0 +1,21 @@
+<!doctype html>
+<!--
+  Example page proving the embedded-asset mechanism (`build.rs` zips this
+  whole directory into the compiled executable at build time — see that
+  file's doc comment) end-to-end: HTML, CSS, and JS served from the
+  unextracted, in-memory archive by `EmbeddedAssetServer`, not from any
+  file on disk. Not real production UI yet — see `browser_chrome_core::
+  embedded_asset_server`'s own doc comment for the roadmap item this is a
+  first proof for.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>embedded assets example</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <p id="message">loading…</p>
+  <script src="app.js"></script>
+</body>
+</html>

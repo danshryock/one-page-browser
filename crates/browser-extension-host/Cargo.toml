@@ -1,0 +1,86 @@
+[package]
+name = "browser-extension-host"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+rpc-protocol = { path = "../rpc-protocol" }
+zip-assets = { path = "../zip-assets" }
+anyhow = "1"
+serde_json = "1"
+# `deno_runtime` (not bare `deno_core`) — needed specifically for its
+# `PermissionsContainer`/`MainWorker`, which is what actually gives an
+# embedded extension real, per-capability sandboxing (fs/net/env/subprocess/
+# ffi, each independently grantable) rather than just a bare V8 isolate with
+# no security model of its own. Confirmed to build and *run* — natively,
+# and cross-compiled via `cargo zigbuild`/`cargo xwin` — by this crate's own
+# earlier build-viability spike (see git history / ROADMAP.md).
+#
+# Real, honest cost: this alone resolves to roughly 800 transitive crates
+# (confirmed via `cargo generate-lockfile`) — a genuine, substantial
+# departure from this workspace's otherwise minimal-dependency norm
+# elsewhere (see e.g. `browser-core/Cargo.toml`'s own comments). Accepted
+# deliberately for what this specific crate needs (a real, maintained,
+# capability-based JS sandbox), not something to hold every other crate in
+# this workspace to.
+# `"transpile"` — deno_runtime's own bootstrap ships some built-in
+# extensions with real TypeScript source internally (confirmed directly: a
+# bare `MainWorker::bootstrap_from_options` panicked at startup with
+# "Uncaught SyntaxError: Unexpected token ':'" inside `ext:deno_bundle_runtime/
+# bundle.ts`, before this crate's own script ever ran) — this feature wires
+# up `WorkerOptions`'s internal `extension_transpiler` to handle that using
+# `deno_ast` (already a direct dependency here for `ZipModuleLoader`'s own
+# transpiling), which is otherwise left `None`.
+deno_runtime = { version = "0.265.0", features = ["transpile"] }
+deno_permissions = "0.116.0"
+# `deno_runtime` itself depends on `deno_core` with `default-features =
+# false` and doesn't re-enable `deno_core`'s own default `v8` feature (it
+# supports both a V8 and a QuickJS backend, so picking one is left to the
+# embedder) — confirmed directly by hitting `deno_v8`'s own `compile_error!
+# ("either feature v8 or quickjs must be enabled")` without this. Depending
+# on `deno_core` directly here, with that feature on, is what actually
+# selects V8 for the whole build via Cargo's feature unification.
+deno_core = { version = "0.410.0", default-features = false, features = ["v8", "v8_use_custom_libcxx", "reactor-tokio"] }
+# For transpiling `.ts` extension source to JS before handing it to V8 —
+# the standard, documented mechanism for this (not hand-rolled), used by
+# `ZipModuleLoader`.
+deno_ast = { version = "0.53.3", features = ["transpiling"] }
+# `MainWorker`'s real filesystem backend (permission checks happen
+# separately, via `PermissionsContainer` — this is the thing those checks
+# gate access *to*, not a second permission layer).
+deno_fs = "0.167.0"
+# Only for `ByonmInNpmPackageChecker`/`ByonmNpmResolver<RealSys>` — this
+# crate has no npm/Node-compatibility story at all (extensions are plain
+# TS/JS loaded from a zip, not npm packages), but `WorkerServiceOptions`'s
+# generic type parameters still need *some* concrete types satisfying its
+# trait bounds even when `node_services: None` means they're never actually
+# exercised at runtime — these are the standard "no real npm resolution"
+# stand-ins `deno_runtime` itself expects embedders to reach for.
+deno_resolver = "0.88.0"
+sys_traits = "0.1.28"
+# For `JsErrorBox`, the error type `deno_core::ModuleLoader`'s methods use
+# (`deno_core::ModuleLoaderError` is a type alias for it, not re-exported
+# under its own name).
+deno_error = "0.7.1"
+# For `BlobStore::default_arc()` — `WorkerServiceOptions.blob_store` has no
+# `Default` impl of its own (it's a bare `Arc<dyn BlobStoreTrait>`), so a
+# concrete no-op-is-fine implementation has to come from somewhere; this is
+# the standard one `deno_runtime` itself is built against.
+deno_web = "0.288.0"
+# For `StdioPipe::file` — see `main.rs`'s own doc comment for why the
+# worker's stdout gets redirected to a pipe this process reads itself,
+# instead of trying to expose a custom op to extension JS (a real Deno
+# security boundary blocks that, deliberately).
+deno_io = "0.167.0"
+# `MainWorker`'s async API (`execute_main_module`/`run_event_loop`) requires
+# a tokio runtime — unavoidable given `deno_core`'s own `reactor-tokio`
+# feature above. Scoped to this one crate; nothing else in this workspace's
+# otherwise-synchronous codebase needs or gets tokio via this.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+# For building fixture extension zips directly in `tests/permissions.rs`,
+# same crate/feature set as `zip-assets`'/`browser-chrome-core`'s own use
+# of it.
+zip = { version = "8", default-features = false, features = ["deflate"] }

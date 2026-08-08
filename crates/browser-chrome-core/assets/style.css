@@ -1,0 +1,7 @@
+/* Example stylesheet, served from the embedded zip — see index.html's own
+   comment. Sets a distinctive, easy-to-assert-on color so a real webview
+   test can confirm the CSS itself (not just the HTML/JS) actually loaded
+   from the archive. */
+#message {
+  color: rgb(18, 52, 86);
+}

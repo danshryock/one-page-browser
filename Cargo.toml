@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/zip-assets",
+    "crates/rpc-protocol",
+    "crates/browser-extension-host",
     "crates/render-engine",
     "crates/browser-core",
     "crates/browser-chrome-core",

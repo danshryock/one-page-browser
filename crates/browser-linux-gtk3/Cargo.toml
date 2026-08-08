@@ -23,3 +23,8 @@ enigo = "0.0.14"
 # browser-core's own bitwarden.rs tests.
 tiny_http = "0.12"
 serde_json = "1"
+# Test-only: naming `RpcError` for the trivial ping/echo handlers the new
+# `webview_rpc` round-trip test registers — `browser-chrome-core` already
+# depends on this for real (`WebviewRpcServer`'s own implementation), this
+# just makes its `RpcError` type nameable here too.
+rpc-protocol = { path = "../rpc-protocol" }

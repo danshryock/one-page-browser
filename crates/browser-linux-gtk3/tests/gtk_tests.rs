@@ -42,11 +42,13 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use browser_chrome_core::{embedded_assets, EmbeddedAssetServer, RpcBody, RpcHandler, WebviewRpcServer};
 use browser_core::{Action, HistoryStore, PasswordBackend, Profile};
 use enigo::MouseControllable;
 use browser_linux_gtk3::{build_window_and_app, build_window_and_app_with_history, AppState};
 use gtk::prelude::*;
 use render_engine::{RenderEngine, WebContext, WebKitWebView, WryEngine};
+use std::collections::HashMap;
 
 type Job = Box<dyn FnOnce() + Send>;
 
@@ -1984,5 +1986,167 @@ fn webview_data_does_not_persist_for_an_ephemeral_profile() {
             !wait_until_script_equals(&app, "localStorage.getItem('persist_test')", "hello"),
             "an ephemeral profile's webview data shouldn't survive into a second instance"
         );
+    });
+}
+
+/// Serves one fixed HTML string for every request — unlike `FixtureServer`
+/// above (which serves static files off disk), this exists for a page whose
+/// *content* has to be generated per-test (here: embedding
+/// `WebviewRpcServer`'s own ephemeral port, which isn't known until the
+/// server's already running). Same shutdown-on-drop shape as every other
+/// `tiny_http`-backed test server in this file.
+struct DynamicPageServer {
+    server: std::sync::Arc<tiny_http::Server>,
+    join: Option<std::thread::JoinHandle<()>>,
+    base_url: String,
+}
+
+impl Drop for DynamicPageServer {
+    fn drop(&mut self) {
+        self.server.unblock();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn spawn_dynamic_page_server(html: String) -> DynamicPageServer {
+    let server = std::sync::Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("binding a loopback page server should succeed"));
+    let addr = server.server_addr().to_ip().expect("this test server always binds an IP socket, not a unix one");
+    let base_url = format!("http://{addr}/");
+    let server_for_thread = std::sync::Arc::clone(&server);
+    let join = std::thread::spawn(move || {
+        while let Ok(request) = server_for_thread.recv() {
+            let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).expect("static content-type header should be valid");
+            let response = tiny_http::Response::from_string(html.clone()).with_status_code(200).with_header(header);
+            let _ = request.respond(response);
+        }
+    });
+    DynamicPageServer { server, join: Some(join), base_url }
+}
+
+/// Real, end-to-end proof of `browser_chrome_core::WebviewRpcServer`'s
+/// transport (see that module's own doc comment for the design): a real
+/// WebKitGTK page, served over `http://127.0.0.1` on a *different*
+/// loopback port than the RPC server (a real cross-origin situation, not a
+/// contrived one — nothing guarantees the two ever share a port), performs
+/// two real `fetch()` calls — a JSON round trip and a raw, unencoded binary
+/// round trip — against it. `WebviewRpcServer`'s own tests
+/// (`browser-chrome-core/tests/webview_rpc.rs`) already prove the HTTP
+/// layer works and that a CORS preflight gets answered; this is the piece
+/// only a real webview can prove: that `fetch()` from real page JS actually
+/// gets past that preflight and completes, on this app's real
+/// `add_page`/console-capture path, not a synthetic harness.
+#[test]
+fn webview_rpc_json_and_binary_round_trip_over_a_real_fetch() {
+    run_on_gtk_thread(|| {
+        let mut handlers: HashMap<String, RpcHandler> = HashMap::new();
+        handlers.insert(
+            "ping".to_string(),
+            Box::new(|body: RpcBody| -> Result<RpcBody, rpc_protocol::RpcError> {
+                match body {
+                    RpcBody::Json(value) => Ok(RpcBody::Json(value)),
+                    RpcBody::Binary(_) => Err(rpc_protocol::RpcError { code: -32602, message: "ping expects a JSON body".to_string(), data: None }),
+                }
+            }),
+        );
+        handlers.insert(
+            "echo_binary".to_string(),
+            Box::new(|body: RpcBody| -> Result<RpcBody, rpc_protocol::RpcError> {
+                match body {
+                    RpcBody::Binary(bytes) => Ok(RpcBody::Binary(bytes)),
+                    RpcBody::Json(_) => Err(rpc_protocol::RpcError { code: -32602, message: "echo_binary expects a binary body".to_string(), data: None }),
+                }
+            }),
+        );
+        let rpc_server = WebviewRpcServer::start(handlers).expect("starting the webview RPC server should succeed");
+        let rpc_port = rpc_server.port();
+
+        let page_html = format!(
+            r#"<!doctype html>
+<html><head><title>webview rpc test</title></head>
+<body>
+<script>
+(async () => {{
+  try {{
+    const pingRes = await fetch('http://127.0.0.1:{rpc_port}/rpc/ping', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{hello: 'world'}})
+    }});
+    const pingJson = await pingRes.json();
+    console.log('ping_result=' + JSON.stringify(pingJson));
+  }} catch (e) {{
+    console.log('ping_error=' + e);
+  }}
+  try {{
+    const binRes = await fetch('http://127.0.0.1:{rpc_port}/rpc/echo_binary', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/octet-stream'}},
+      body: new Uint8Array([0, 1, 2, 255, 254])
+    }});
+    const buf = await binRes.arrayBuffer();
+    console.log('binary_result=' + Array.from(new Uint8Array(buf)).join(','));
+  }} catch (e) {{
+    console.log('binary_error=' + e);
+  }}
+}})();
+</script>
+</body></html>"#
+        );
+        let page_server = spawn_dynamic_page_server(page_html);
+
+        let profile = test_profile("webview-rpc");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        app.add_page(&page_server.base_url).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(page_server.base_url.as_str())), "the fixture page should load");
+
+        assert!(
+            wait_until(|| app.console_messages_for_test().iter().any(|m| m == "ping_result={\"hello\":\"world\"}")),
+            "expected a ping_result console message proving the JSON round trip, got {:?}",
+            app.console_messages_for_test()
+        );
+        assert!(
+            wait_until(|| app.console_messages_for_test().iter().any(|m| m == "binary_result=0,1,2,255,254")),
+            "expected a binary_result console message proving the unencoded binary round trip, got {:?}",
+            app.console_messages_for_test()
+        );
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+/// Real, end-to-end proof of `browser_chrome_core::EmbeddedAssetServer`
+/// serving the browser's own compiled-in `assets/` (see that crate's
+/// `build.rs`/`embedded_assets.rs`) to a real WebKitGTK page — not just
+/// that the HTTP layer works (`browser-chrome-core/tests/
+/// embedded_asset_server.rs` already proves that), but that a real webview
+/// actually loads and runs HTML, CSS, *and* JS pulled straight out of the
+/// unextracted, in-memory archive, on this app's real `add_page`/
+/// console-capture path. The page's own title and its script's
+/// `getComputedStyle`-read CSS color are both asserted, so this fails if
+/// either the HTML or the CSS silently didn't load, not just the JS.
+#[test]
+fn embedded_assets_load_and_run_in_a_real_webview() {
+    run_on_gtk_thread(|| {
+        let server = EmbeddedAssetServer::start(embedded_assets(), "index.html").expect("starting the embedded asset server should succeed");
+        let url = format!("http://127.0.0.1:{}/", server.port());
+
+        let profile = test_profile("embedded-assets");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+
+        app.add_page(&url).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(url.as_str())), "the embedded page should load");
+        let id = app.page_ids()[0].clone();
+        assert!(wait_until(|| app.page_title(&id).as_deref() == Some("embedded assets example")), "the page title should reflect the embedded HTML");
+
+        assert!(
+            wait_until(|| app.console_messages_for_test().iter().any(|m| m == "embedded_assets_loaded color=rgb(18, 52, 86)")),
+            "expected the embedded_assets_loaded console message proving HTML+CSS+JS all loaded from the embedded zip, got {:?}",
+            app.console_messages_for_test()
+        );
+
+        cleanup_test_profile(&profile);
     });
 }

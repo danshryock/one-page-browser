@@ -1,0 +1,16 @@
+[package]
+name = "zip-assets"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+# `default-features = false` + just `deflate`: this only ever needs to read
+# entries out of zips this project itself produces (via `zip::write`'s own
+# writer, see `browser-chrome-core/build.rs`) or a well-formed extension
+# package — no encryption (`aes-crypto`), no bzip2/lzma/xz/zstd/ppmd, none
+# of which a plain DEFLATE-compressed zip needs. Keeps the dependency
+# footprint down, matching this workspace's established minimal-deps
+# philosophy (see e.g. `browser-core/Cargo.toml`'s own comments).
+zip = { version = "8", default-features = false, features = ["deflate"] }

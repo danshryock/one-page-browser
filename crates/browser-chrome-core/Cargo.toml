@@ -7,4 +7,26 @@ license.workspace = true
 [dependencies]
 browser-core = { path = "../browser-core" }
 render-engine = { path = "../render-engine" }
+rpc-protocol = { path = "../rpc-protocol" }
+zip-assets = { path = "../zip-assets" }
 anyhow = "1"
+serde_json = "1"
+# For `webview_rpc::WebviewRpcServer` — a real, shipped dependency here
+# (unlike `browser-core`'s own use of it, which stays dev-only/test-only:
+# see that crate's Cargo.toml). Already present and vetted elsewhere in the
+# workspace (`browser-core`'s `bitwarden.rs` test fixture, `web-standards-
+# tests`' fixture servers) — sync, no TLS, small, a good fit for a loopback
+# server that never needs to be reachable off-box.
+tiny_http = "0.12"
+
+[build-dependencies]
+# For `build.rs`'s own zipping of `assets/` into the embedded archive —
+# same crate, same minimal `deflate`-only feature set, as `zip-assets`'
+# runtime reading side (see that crate's Cargo.toml comment for why).
+zip = { version = "8", default-features = false, features = ["deflate"] }
+# For walking `assets/` recursively in `build.rs`.
+walkdir = "2"
+
+[dev-dependencies]
+# For `webview_rpc`'s own tests, driving the server with plain HTTP calls.
+ureq = { version = "3", default-features = false, features = ["json"] }
