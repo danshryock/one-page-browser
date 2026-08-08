@@ -190,9 +190,24 @@ fn switcher_bookmarks(app: &Rc<AppState>, params: &Value) -> Result<Value, RpcEr
     Ok(json!({ "bookmarks": bookmarks_json }))
 }
 
+/// Substring matches first (most-recently-visited first, same as before);
+/// once there's a real query, also merges in lexically *similar* titles
+/// (`HistoryStore::search_similar` — shared vocabulary, not a literal
+/// substring; see its own doc comment for exactly what "similar" means),
+/// deduped against the substring matches by URL. This is the one piece of
+/// `browser_chrome_core::build_switcher_rows`'s old matching behavior that
+/// needed reimplementing here rather than just moving: that shared helper
+/// is still used by the (unmigrated) macOS/Windows frontends, so it wasn't
+/// something to delete, but the switcher's real webview page does its own
+/// independent RPC-backed matching now instead of calling it.
 fn switcher_history(app: &Rc<AppState>, params: &Value) -> Result<Value, RpcError> {
     let query = param_str(params, "query").unwrap_or("");
-    let entries = app.history.search(query, 50).map_err(|err| rpc_err(format!("history search failed: {err}")))?;
+    let mut entries = app.history.search(query, 50).map_err(|err| rpc_err(format!("history search failed: {err}")))?;
+    if !query.trim().is_empty() {
+        let seen: std::collections::HashSet<String> = entries.iter().map(|h| h.url.clone()).collect();
+        let similar = app.history.search_similar(query, 5).map_err(|err| rpc_err(format!("history similarity search failed: {err}")))?;
+        entries.extend(similar.into_iter().filter(|h| !seen.contains(&h.url)));
+    }
     let history_json: Vec<Value> = entries
         .iter()
         .map(|h| json!({ "url": h.url, "title": h.title, "domain": h.domain, "time": h.visited_at, "color": palette_color_for(&h.url) }))

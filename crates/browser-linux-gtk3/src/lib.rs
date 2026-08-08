@@ -59,7 +59,22 @@ pub struct AppState {
     title_label: gtk::Label,
     stack: gtk::Stack,
     switcher_panel: gtk::Widget,
-    flowbox: gtk::FlowBox,
+    /// Where `switcher_engine`'s webview gets built, once — part of
+    /// `switcher_panel`'s own widget tree (see `grid_content` in
+    /// `build_window_and_app_with_history`), replacing what used to be a
+    /// native `gtk::FlowBox` of tiles.
+    switcher_container: gtk::Box,
+    /// The switcher's real webview page (`browser://switcher`'s own
+    /// content) — built once, lazily, on first `open_switcher`/
+    /// `open_switcher_editing_url` (`ensure_switcher_engine`), then kept
+    /// alive for the rest of the process: unlike the profile-menu popover
+    /// (rebuilt fresh every open, since it's small and infrequent), the
+    /// switcher opens constantly (F1/Ctrl+T/every new page) and a real
+    /// WebKit webview is expensive enough to construct that doing so on
+    /// every single open would be a real, noticeable regression from the
+    /// old native tile grid's instant toggle. `refresh_switcher_if_open`
+    /// (not a full reload) is what keeps its content current instead.
+    switcher_engine: RefCell<Option<WryEngine>>,
     /// Holds only the theme-dependent CSS rules (see `theme_css`'s doc
     /// comment) — reloaded by `apply_theme` whenever the theme changes,
     /// unlike the separate, never-reloaded base provider set up once in
@@ -116,11 +131,6 @@ pub struct AppState {
     /// passphrase. Never written to disk; cleared along with everything
     /// else when the process exits.
     session_passphrase: RefCell<Option<String>>,
-    /// Snapshot taken by the last `rebuild_switcher_grid` call — the source
-    /// of truth `activate_switcher_row` indexes into, so a tile's widget
-    /// name can just be its position in this list rather than needing a
-    /// separate id/url stashed on the widget itself.
-    switcher_rows: RefCell<Vec<browser_chrome_core::SwitcherRow>>,
     core: RefCell<PageManager<WryEngine>>,
     /// One `wry::WebContext` shared by every page this profile ever opens —
     /// what actually makes cookies/localStorage/cache persist across
@@ -191,7 +201,7 @@ impl AppState {
         self.settings.borrow_mut().max_loaded_pages = limit;
         let evicted = self.core.borrow_mut().set_max_loaded_pages(limit);
         self.unload_engines(&evicted);
-        self.rebuild_switcher_grid();
+        self.refresh_switcher_if_open();
     }
 
     /// Whether `id` currently counts against the loaded-pages limit — test/
@@ -291,7 +301,7 @@ impl AppState {
                 *title_for_cb.borrow_mut() = new_title;
                 if let Some(app) = app_weak.upgrade() {
                     app.record_visit(&id_for_cb);
-                    app.rebuild_switcher_grid();
+                    app.refresh_switcher_if_open();
                     if app.core.borrow().active_id() == id_for_cb {
                         app.refresh_title_label();
                     }
@@ -330,7 +340,7 @@ impl AppState {
         self.unload_engines(&evicted);
 
         self.set_active(&id);
-        self.rebuild_switcher_grid();
+        self.refresh_switcher_if_open();
         Ok(())
     }
 
@@ -369,7 +379,7 @@ impl AppState {
                 *title_for_cb.borrow_mut() = new_title;
                 if let Some(app) = app_weak.upgrade() {
                     app.record_visit(&id_for_cb);
-                    app.rebuild_switcher_grid();
+                    app.refresh_switcher_if_open();
                     if app.core.borrow().active_id() == id_for_cb {
                         app.refresh_title_label();
                     }
@@ -407,7 +417,7 @@ impl AppState {
         let widget = engine.widget();
         let evicted = self.core.borrow_mut().insert_background(id.clone(), engine, title);
         self.unload_engines(&evicted);
-        self.rebuild_switcher_grid();
+        self.refresh_switcher_if_open();
         // A background tab (`window.open()`/target="_blank") never calls
         // `set_active`, which is where every other "opened" case's sync
         // happens — needs its own call here for the same reason.
@@ -615,7 +625,7 @@ impl AppState {
             page.is_playing_audio = playing;
         }
         let app = Rc::clone(self);
-        gtk::glib::idle_add_local_once(move || app.rebuild_switcher_grid());
+        gtk::glib::idle_add_local_once(move || app.refresh_switcher_if_open());
     }
 
     /// Actually tears down the engines for pages `PageManager` just flipped
@@ -667,7 +677,7 @@ impl AppState {
                 *title_for_cb.borrow_mut() = new_title;
                 if let Some(app) = app_weak.upgrade() {
                     app.record_visit(&id_for_cb);
-                    app.rebuild_switcher_grid();
+                    app.refresh_switcher_if_open();
                     if app.core.borrow().active_id() == id_for_cb {
                         app.refresh_title_label();
                     }
@@ -736,11 +746,12 @@ impl AppState {
     fn open_switcher_common(self: &Rc<Self>) {
         self.close_passwords();
         self.stack.set_sensitive(false);
-        // Shown *before* rebuilding: `rebuild_switcher_grid` skips its work
-        // while the panel isn't visible (see its own doc comment), so this
-        // order is what makes the panel actually populated when it appears.
+        self.ensure_switcher_engine();
+        // Shown *before* refreshing: `refresh_switcher_if_open` skips its
+        // work while the panel isn't visible (see its own doc comment), so
+        // this order is what makes it actually populated when it appears.
         self.switcher_panel.show();
-        self.rebuild_switcher_grid();
+        self.refresh_switcher_if_open();
         self.address_bar.grab_focus();
     }
 
@@ -802,15 +813,14 @@ impl AppState {
         }
     }
 
-    /// Moves keyboard focus from the address bar into the switcher grid —
-    /// Down arrow's role while the address bar has focus (see the
-    /// `address_bar.connect_key_press_event` handler). `FlowBox` already
-    /// supports arrow-key navigation among its children once focus is
-    /// inside it, so this is the only push needed; `child_focus` is the
-    /// standard GTK API for "a container receiving focus from outside via
-    /// keyboard navigation," landing on its first (or last-focused) child.
+    /// Moves keyboard focus from the address bar into the switcher's own
+    /// webview — Down arrow's role while the address bar has focus (see the
+    /// `address_bar.connect_key_press_event` handler). A no-op if the
+    /// webview hasn't been built yet (the switcher was never opened).
     pub fn focus_switcher_grid(&self) {
-        self.flowbox.child_focus(gtk::DirectionType::Down);
+        if let Some(engine) = self.switcher_engine.borrow().as_ref() {
+            engine.widget().grab_focus();
+        }
     }
 
     /// Reloads `theme_provider` with the current `Settings::theme`'s CSS —
@@ -1281,13 +1291,12 @@ impl AppState {
         }
     }
 
-
     /// Bookmarks a URL directly, without needing to open it as a real page
-    /// first — test helper for exercising the bookmark-match path in
-    /// `rebuild_switcher_grid` in isolation from the history-match path:
-    /// opening a page normally also ends up recording a history visit once
-    /// its title loads, which would make a search match via history
-    /// instead (already covered by its own existing test).
+    /// first — test helper for exercising the switcher webview's bookmark
+    /// match (`internal_rpc.rs`'s `switcher.bookmarks`) in isolation from
+    /// the history match: opening a page normally also ends up recording a
+    /// history visit once its title loads, which would make a search match
+    /// via history instead (already covered by its own existing test).
     pub fn bookmark_url_for_test(&self, url: &str, title: &str) {
         self.bookmarks.borrow_mut().add(url, title, now_unix());
         if let Err(err) = self.bookmarks.borrow().save(&self.profile) {
@@ -1296,11 +1305,12 @@ impl AppState {
     }
 
     /// Records a history visit directly, without needing to open it as a
-    /// real page first — test helper for exercising the similar-history-
-    /// match path in `rebuild_switcher_grid` with a controlled, rich-enough
-    /// title to test lexical similarity against (the fixture pages' own
-    /// titles are single words, not enough vocabulary for a meaningful
-    /// similarity comparison).
+    /// real page first — test helper for exercising the similar-history
+    /// match (`internal_rpc.rs`'s `switcher_history`, merging in
+    /// `HistoryStore::search_similar`) with a controlled, rich-enough title
+    /// to test lexical similarity against (the fixture pages' own titles
+    /// are single words, not enough vocabulary for a meaningful similarity
+    /// comparison).
     pub fn record_history_visit_for_test(&self, url: &str, title: &str) -> anyhow::Result<()> {
         self.history.record_visit(url, title)
     }
@@ -1408,32 +1418,6 @@ impl AppState {
         self.close_switcher();
     }
 
-    /// Routes a tile activation (click or keyboard Enter/Space, both funnel
-    /// through here — see `rebuild_switcher_grid` and the flowbox's
-    /// `connect_child_activated` handler) through `browser_chrome_core`'s
-    /// shared `activate_row`, keyed by the tile's position in
-    /// `switcher_rows` (the same snapshot `rebuild_switcher_grid` just
-    /// built the grid from). Covers every row kind uniformly, including
-    /// history/bookmark/similar tiles — previously those only supported
-    /// mouse clicks, since they never got a real `widget_name` at all.
-    pub fn activate_switcher_row(self: &Rc<Self>, idx: usize) {
-        let start_page = self.settings.borrow().start_page.clone();
-        let activation = {
-            let rows = self.switcher_rows.borrow();
-            browser_chrome_core::activate_row(&rows, idx, &start_page)
-        };
-        match activation {
-            Some(browser_chrome_core::SwitcherActivation::SwitchTo(id)) => self.switch_to(&id),
-            Some(browser_chrome_core::SwitcherActivation::OpenNewPage(url)) => {
-                if let Err(err) = self.add_page(&url) {
-                    eprintln!("failed to open page: {err}");
-                }
-                self.close_switcher();
-            }
-            None => {}
-        }
-    }
-
     pub fn close_page(self: &Rc<Self>, id: &str) {
         let was_active = self.core.borrow().active_id() == id;
 
@@ -1457,253 +1441,67 @@ impl AppState {
                 }
             }
         }
-        self.rebuild_switcher_grid();
+        self.refresh_switcher_if_open();
         // Redundant (already harmless/idempotent) when `was_active` synced
         // via `set_active`/`add_page` above — needed for the non-active
         // "closed a background tab" case, which neither of those cover.
         self.save_session();
     }
 
-    /// Rebuilds every tile from scratch, sourcing the row list itself from
-    /// `browser_chrome_core::build_switcher_rows` (open pages matching the
-    /// search box's current text, the "+" add row, and — once there's a
-    /// query — matching history/bookmark/lexically-similar entries not
-    /// already open, all deduped against each other; see that function's
-    /// doc comment). This method's job is purely turning each `SwitcherRow`
-    /// into a native GTK tile; each tile's `widget_name` is just its index
-    /// into `switcher_rows`, which both `connect_child_activated` and
-    /// `activate_switcher_row` key off of — one shared activation path for
-    /// every row kind, mouse or keyboard.
-    ///
-    /// No-ops while the switcher panel isn't visible: every page-lifecycle
-    /// event that can trigger this (`add_page`, a title/audio-state change,
-    /// closing a page, an eviction) calls it unconditionally, but destroying
-    /// and recreating every tile is real, non-trivial GTK widget work with
-    /// nothing to show for it while the panel is hidden — the common case
-    /// during ordinary single-tab browsing and, especially, during startup
-    /// (`open_start_page_or_restored_session`, which can call `add_page`
-    /// before the window's event loop is even running). Skipping it there
-    /// also closes off a real reentrancy risk: a title/audio-state callback
-    /// can fire from *inside* `WryEngine::new`'s own post-build event-pump
-    /// workaround (see that function's doc comment), i.e. while GTK is
-    /// still mid-construction of that very page's widgets — rebuilding the
-    /// grid from inside that nested call risked wedging the GTK main thread
-    /// (see `set_page_audio_playing`'s doc comment for how that surfaced).
-    /// `open_switcher_common` shows the panel *then* calls this directly
-    /// (not nested inside another pending operation) so it's always
-    /// up to date the moment it becomes visible.
-    fn rebuild_switcher_grid(self: &Rc<Self>) {
+    /// Builds the switcher's webview into `switcher_container` if it
+    /// doesn't exist yet — see `switcher_engine`'s own doc comment for why
+    /// this is a one-time, persistent build rather than something
+    /// `refresh_switcher_if_open` redoes on every call.
+    fn ensure_switcher_engine(self: &Rc<Self>) {
+        if self.switcher_engine.borrow().is_some() {
+            return;
+        }
+        let url = browser_chrome_core::internal_pages::resolve(browser_chrome_core::internal_pages::SWITCHER, self.asset_port.get(), self.rpc_port.get())
+            .expect("SWITCHER is always a known internal page");
+        let app_weak = Rc::downgrade(self);
+        let engine = WryEngine::new(
+            &self.switcher_container,
+            &url,
+            &mut self.web_context.borrow_mut(),
+            |_title| {},
+            |_playing| {},
+            |_info, _opener| None,
+            move |message| {
+                eprintln!("console.log: {message}");
+                if let Some(app) = app_weak.upgrade() {
+                    app.console_messages.borrow_mut().push(message);
+                }
+            },
+        );
+        match engine {
+            Ok(engine) => *self.switcher_engine.borrow_mut() = Some(engine),
+            Err(err) => eprintln!("failed to build the switcher webview: {err}"),
+        }
+    }
+
+    /// Tells the switcher's already-built webview to re-fetch and re-render
+    /// itself (via its own `assets/switcher/app.js`'s `loadAll`), passing
+    /// the address bar's current text through as the filter query — the
+    /// replacement for what used to be a full native tile-grid rebuild.
+    /// No-ops while the switcher panel isn't visible or the webview hasn't
+    /// been built yet, same "nothing to show for it" reasoning the old
+    /// tile-rebuild had (see every `add_page`/title-change/close-page call
+    /// site this runs from unconditionally). `evaluate_script_for_test`'s
+    /// name is a holdover from when it was only ever used by tests — the
+    /// mechanism itself (WebKitGTK script evaluation) is exactly what a
+    /// production-code refresh needs too, not something test-only.
+    fn refresh_switcher_if_open(&self) {
         if !self.switcher_panel.is_visible() {
             return;
         }
-        for child in self.flowbox.children() {
-            self.flowbox.remove(&child);
-        }
-
+        let binding = self.switcher_engine.borrow();
+        let Some(engine) = binding.as_ref() else { return };
         let query = self.address_bar.text().to_string();
-        let rows = browser_chrome_core::build_switcher_rows(
-            &self.core.borrow(),
-            &self.history,
-            Some(&self.bookmarks.borrow()),
-            &query,
-        );
-
-        for (idx, row) in rows.iter().enumerate() {
-            let flow_child = match row {
-                browser_chrome_core::SwitcherRow::Open { id, title, domain, color } => {
-                    let is_playing_audio = self.core.borrow().page(id).map(|p| p.is_playing_audio).unwrap_or(false);
-                    self.build_open_tile(idx, id, title, domain, color, is_playing_audio)
-                }
-                browser_chrome_core::SwitcherRow::Add => self.build_add_tile(idx),
-                browser_chrome_core::SwitcherRow::History { title, domain, .. } => {
-                    self.build_search_result_tile(idx, "history-tile", title, domain)
-                }
-                browser_chrome_core::SwitcherRow::Bookmark { title, domain, .. } => {
-                    self.build_search_result_tile(idx, "bookmark-tile", title, domain)
-                }
-                browser_chrome_core::SwitcherRow::Similar { title, domain, .. } => {
-                    self.build_search_result_tile(idx, "similar-tile", title, domain)
-                }
-                browser_chrome_core::SwitcherRow::Header(label) => self.build_header_tile(label),
-            };
-            flow_child.set_widget_name(&idx.to_string());
-            flow_child.show_all();
-            self.flowbox.insert(&flow_child, -1);
+        let query_literal = serde_json::to_string(&query).unwrap_or_else(|_| "\"\"".to_string());
+        let script = format!("if (typeof loadAll === 'function') {{ loadAll({query_literal}); }}");
+        if let Err(err) = engine.evaluate_script_for_test(&script, |_| {}) {
+            eprintln!("failed to refresh the switcher webview: {err}");
         }
-
-        *self.switcher_rows.borrow_mut() = rows;
-    }
-
-    /// Builds one open-page tile — real per-page palette color (see the CSS
-    /// comment below), a close button overlaid on top (closing a page is
-    /// not part of `activate_row`'s model — see `activate_switcher_row`'s
-    /// doc comment — so it stays wired directly to `close_page` here), a
-    /// speaker icon overlaid in the opposite corner when `is_playing_audio`
-    /// is set (see `set_page_audio_playing`), and the tile body itself wired
-    /// to `activate_switcher_row(idx)`.
-    fn build_open_tile(
-        self: &Rc<Self>,
-        idx: usize,
-        id: &str,
-        title: &str,
-        domain: &str,
-        color: &str,
-        is_playing_audio: bool,
-    ) -> gtk::FlowBoxChild {
-        let tile = gtk::Button::new();
-        tile.style_context().add_class("page-tile");
-        let css = gtk::CssProvider::new();
-        // Adwaita's button theme draws its own background-image (a
-        // gradient) on top of any background-color, which is why the
-        // tile's real color was only visible on hover (when the theme's
-        // hover state happens to thin that gradient). Explicitly zeroing
-        // background-image/border/box-shadow here removes the theme's
-        // button chrome so the flat color always shows.
-        let _ = css.load_from_data(
-            format!(
-                ".page-tile {{ background-image: none; background-color: {color}; \
-                  border: none; box-shadow: none; border-radius: 10px; color: #fff; }}"
-            )
-            .as_bytes(),
-        );
-        tile.style_context()
-            .add_provider(&css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-        if domain.ends_with("unloaded") {
-            tile.style_context().add_class("page-tile-unloaded");
-        }
-        tile.set_size_request(150, 110);
-        // Keyboard focus should land on the FlowBoxChild wrapper, not
-        // descend into this button, so arrow keys move between tiles
-        // instead of highlighting sub-widgets. Mouse clicks still work —
-        // can_focus only affects keyboard focus/tab order.
-        tile.set_can_focus(false);
-
-        let inner = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        inner.set_margin(10);
-        inner.set_valign(gtk::Align::End);
-        let title_label = gtk::Label::new(Some(title));
-        title_label.set_halign(gtk::Align::Start);
-        title_label.style_context().add_class("tile-title");
-        let domain_label = gtk::Label::new(Some(domain));
-        domain_label.set_halign(gtk::Align::Start);
-        domain_label.style_context().add_class("tile-subtitle");
-        inner.pack_start(&title_label, false, false, 0);
-        inner.pack_start(&domain_label, false, false, 0);
-        tile.add(&inner);
-
-        let app_clone = Rc::clone(self);
-        tile.connect_clicked(move |_| app_clone.activate_switcher_row(idx));
-
-        let close_btn = gtk::Button::new();
-        close_btn.style_context().add_class("tile-close-btn");
-        let close_label = gtk::Label::new(Some("\u{d7}"));
-        close_label.style_context().add_class("tile-close-label");
-        close_btn.add(&close_label);
-        close_btn.set_halign(gtk::Align::End);
-        close_btn.set_valign(gtk::Align::Start);
-        close_btn.set_margin_top(10);
-        close_btn.set_margin_end(10);
-        close_btn.set_size_request(18, 18);
-        close_btn.set_can_focus(false);
-        let app_clone = Rc::clone(self);
-        let id_clone = id.to_string();
-        close_btn.connect_clicked(move |_| {
-            app_clone.close_page(&id_clone);
-        });
-
-        let audio_icon = gtk::Image::from_icon_name(Some("audio-volume-high-symbolic"), gtk::IconSize::Button);
-        audio_icon.style_context().add_class("tile-audio-icon");
-        audio_icon.set_halign(gtk::Align::Start);
-        audio_icon.set_valign(gtk::Align::Start);
-        audio_icon.set_margin_top(10);
-        audio_icon.set_margin_start(10);
-        audio_icon.set_visible(is_playing_audio);
-        audio_icon.set_no_show_all(true);
-
-        let tile_overlay = gtk::Overlay::new();
-        tile_overlay.add(&tile);
-        tile_overlay.add_overlay(&close_btn);
-        tile_overlay.add_overlay(&audio_icon);
-
-        let flow_child = gtk::FlowBoxChild::new();
-        flow_child.add(&tile_overlay);
-        flow_child
-    }
-
-    /// Builds a non-interactive section-heading row ("Open Pages",
-    /// "History", "Bookmarks", "Similar" — see `SwitcherRow::Header`). Uses
-    /// the same `FlowBoxChild` wrapper as every real tile so it still takes
-    /// up a grid cell of its own (which is what forces a line break ahead
-    /// of it, reading as a section divider), but with `can_focus` off so
-    /// the flowbox's native arrow-key navigation skips over it — the gtk3
-    /// equivalent of `next_activatable_row` skipping headers on the other
-    /// front ends — and no click handler at all (`activate_switcher_row`
-    /// already no-ops for header rows via `browser_chrome_core::activate_row`,
-    /// but there's no `connect_clicked` here to trigger it in the first
-    /// place). `FlowBox` has no notion of a child spanning the full row
-    /// width, so this reads as a small labeled divider rather than a true
-    /// full-width heading — the closest available with this widget.
-    fn build_header_tile(&self, label: &str) -> gtk::FlowBoxChild {
-        let heading = gtk::Label::new(Some(label));
-        heading.style_context().add_class("switcher-heading");
-        heading.set_halign(gtk::Align::Start);
-        heading.set_margin_top(6);
-        heading.set_margin_bottom(2);
-
-        let flow_child = gtk::FlowBoxChild::new();
-        flow_child.add(&heading);
-        flow_child.set_can_focus(false);
-        flow_child
-    }
-
-    fn build_add_tile(self: &Rc<Self>, idx: usize) -> gtk::FlowBoxChild {
-        let add_tile = gtk::Button::new();
-        add_tile.style_context().add_class("add-tile");
-        add_tile.set_size_request(150, 110);
-        add_tile.set_can_focus(false);
-        let add_tile_label = gtk::Label::new(Some("+"));
-        add_tile_label.style_context().add_class("add-tile-label");
-        add_tile.add(&add_tile_label);
-        let app_clone = Rc::clone(self);
-        add_tile.connect_clicked(move |_| app_clone.activate_switcher_row(idx));
-
-        let add_child = gtk::FlowBoxChild::new();
-        add_child.add(&add_tile);
-        add_child
-    }
-
-    /// Builds one switcher-grid tile for a history, bookmark, or
-    /// lexically-similar search result — same shape as an open-page tile
-    /// but without a close button, tagged with `extra_css_class`
-    /// (`"history-tile"`/`"bookmark-tile"`/`"similar-tile"`) so each source
-    /// reads as visually distinct. Wired to `activate_switcher_row(idx)`,
-    /// same as every other tile kind.
-    fn build_search_result_tile(self: &Rc<Self>, idx: usize, extra_css_class: &str, title_text: &str, domain: &str) -> gtk::FlowBoxChild {
-        let tile = gtk::Button::new();
-        tile.style_context().add_class("page-tile");
-        tile.style_context().add_class(extra_css_class);
-        tile.set_size_request(150, 110);
-        tile.set_can_focus(false);
-
-        let inner = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        inner.set_margin(10);
-        inner.set_valign(gtk::Align::End);
-        let title_label = gtk::Label::new(Some(title_text));
-        title_label.set_halign(gtk::Align::Start);
-        title_label.style_context().add_class("tile-title");
-        let domain_label = gtk::Label::new(Some(domain));
-        domain_label.set_halign(gtk::Align::Start);
-        domain_label.style_context().add_class("tile-subtitle");
-        inner.pack_start(&title_label, false, false, 0);
-        inner.pack_start(&domain_label, false, false, 0);
-        tile.add(&inner);
-
-        let app_clone = Rc::clone(self);
-        tile.connect_clicked(move |_| app_clone.activate_switcher_row(idx));
-
-        let flow_child = gtk::FlowBoxChild::new();
-        flow_child.add(&tile);
-        flow_child
     }
 
     /// Page ids in creation order — test/inspection helper.
@@ -1711,37 +1509,15 @@ impl AppState {
         self.core.borrow().page_ids()
     }
 
-    /// Number of tiles currently shown in the switcher grid (open pages +
-    /// the "+" add-tile + any history/bookmark search-result tiles) — test/
-    /// inspection helper.
-    pub fn switcher_grid_tile_count(&self) -> usize {
-        self.flowbox.children().len()
-    }
-
-    /// Whether any tile currently in the switcher grid carries
-    /// `css_class` (e.g. `"bookmark-tile"`/`"history-tile"`) — test/
-    /// inspection helper for confirming a specific *kind* of tile is
-    /// present, since the aggregate tile count alone can't distinguish
-    /// "a bookmark tile appeared" from "an open-page tile that used to
-    /// match the empty query no longer matches this one and dropped out".
-    pub fn switcher_grid_has_tile_with_class(&self, css_class: &str) -> bool {
-        self.flowbox.children().iter().any(|child| {
-            child
-                .downcast_ref::<gtk::FlowBoxChild>()
-                .and_then(|fbc| fbc.child())
-                .map(|widget| widget.style_context().has_class(css_class))
-                .unwrap_or(false)
-        })
-    }
-
-    /// Whether keyboard focus is currently on one of the switcher grid's
-    /// tiles — test/inspection helper for confirming `focus_switcher_grid`
-    /// (Down arrow in the address bar) actually landed somewhere, not just
-    /// that it didn't crash. `FlowBox`'s Browse selection mode keeps exactly
-    /// the keyboard-focused child selected, so this is the same signal the
-    /// Delete-key-closes-a-tile handler already reads.
-    pub fn switcher_grid_has_focused_tile(&self) -> bool {
-        !self.flowbox.selected_children().is_empty()
+    /// Whether the switcher's webview currently has keyboard focus — test/
+    /// inspection helper for confirming `focus_switcher_grid` (Down arrow
+    /// in the address bar) actually landed somewhere, not just that it
+    /// didn't crash. Real tile/row content is checked via
+    /// `console_messages_for_test` instead, the same real-webview pattern
+    /// every other internal page's tests already use — there's no native
+    /// widget tree left to introspect for that.
+    pub fn switcher_webview_has_focus(&self) -> bool {
+        self.switcher_engine.borrow().as_ref().map(|engine| engine.widget().is_focus()).unwrap_or(false)
     }
 
     /// Currently active page id — test/inspection helper.
@@ -2041,63 +1817,27 @@ pub fn build_window_and_app(profile: Profile) -> anyhow::Result<(gtk::Window, Rc
 pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore) -> anyhow::Result<(gtk::Window, Rc<AppState>)> {
     let theme_provider = gtk::CssProvider::new();
     if let Some(screen) = gtk::gdk::Screen::default() {
-        // Theme-invariant rules: the switcher grid's tiles and hints always
-        // sit over the scrim (a dark, translucent dimmer over the page
-        // behind — see `scrim_css` below), which stays the same dark tone
-        // regardless of the app's own light/dark theme, the same convention
-        // most apps' modal dimmers use. The settings/profile/keybindings/
-        // bookmarks/passwords overlay boxes used to have a real background
-        // of their own (hence theme-dependent colors, in `theme_provider`/
-        // `theme_css`) — they no longer do (`.settings-box` sits directly on
-        // the scrim now, same as the switcher grid), so their text/button
-        // rules moved here too: only the history/bookmark/similar
-        // search-result tiles (which *do* still have their own background)
-        // remain theme-dependent.
+        // Theme-invariant rules: the overlay chrome (close button/Esc hint),
+        // the title chip, and the passwords unlock overlay's own text/button
+        // styling always sit over the scrim (a dark, translucent dimmer —
+        // see `scrim_css` below) or otherwise don't vary with the app's own
+        // light/dark theme, the same convention most apps' modal dimmers
+        // use. The switcher itself is a real webview now (see
+        // `ensure_switcher_engine`) with its own CSS, not native GTK
+        // widgets styled from here.
         let base_provider = gtk::CssProvider::new();
-        // Each switcher tile is a `gtk::FlowBoxChild` wrapping a `gtk::Overlay`
-        // of stacked buttons (the tile itself, `.tile-close-btn`, the audio
-        // icon) — Adwaita's default `flowboxchild:hover` draws its own
-        // rectangular prelight box around that whole wrapper, so hovering
-        // *any* part of a tile (including the close icon) lit up the entire
-        // card as one unit, and crossing-event delivery between the stacked
-        // sibling buttons made that outer highlight flicker or stick after
-        // the pointer left. Zeroing `flowboxchild:hover` here removes that
-        // container-level visual entirely; each interactive piece then only
-        // shows its own native, single-widget `:hover` (a `filter` brightness
-        // bump, since the tiles' base colors are per-domain and per-theme —
-        // see `build_open_tile`/`theme_css` — so a single flat hover color
-        // can't work for all of them).
         let _ = base_provider.load_from_data(
-            b"flowboxchild:hover { background-image: none; background-color: transparent; \
-                box-shadow: none; border-color: transparent; outline: none; } \
-              .page-tile:hover, .add-tile:hover, .history-tile:hover, .bookmark-tile:hover, \
-                .similar-tile:hover, .tile-close-btn:hover, .overlay-close-btn:hover { \
-                filter: brightness(1.18); } \
-              .tile-title { color: #ffffff; font-weight: 600; } \
-              .tile-subtitle { color: rgba(255, 255, 255, 0.75); } \
-              .add-tile-label { color: #ffffff; font-size: 20px; } \
-              .add-tile { background-image: none; background-color: rgba(255, 255, 255, 0.15); \
-                border: none; box-shadow: none; border-radius: 10px; } \
-              .tile-close-btn { background-image: none; background-color: rgba(0, 0, 0, 0.45); \
-                border: none; box-shadow: none; border-radius: 9999px; padding: 0; \
-                min-width: 0; min-height: 0; } \
-              .tile-close-label { color: #ffffff; } \
+            b".overlay-close-btn:hover { filter: brightness(1.18); } \
               .overlay-close-btn { background-image: none; background-color: rgba(0, 0, 0, 0.45); \
                 border: none; box-shadow: none; border-radius: 9999px; padding: 0; \
                 min-width: 0; min-height: 0; } \
               .overlay-close-label { color: #ffffff; font-size: 14px; } \
               .overlay-esc-hint { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
-              .tile-audio-icon { color: #ffffff; } \
               .title-chip { background-image: none; background-color: alpha(@theme_fg_color, 0.06); \
                 border: 1px solid alpha(@theme_fg_color, 0.22); border-radius: 6px; box-shadow: none; \
                 padding: 4px 12px; } \
               .title-chip:hover { background-color: @theme_base_color; border-color: @theme_selected_bg_color; } \
-              .switcher-hint { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
               .switcher-profile-label { color: rgba(255, 255, 255, 0.6); font-size: 12px; } \
-              .page-tile-unloaded { opacity: 0.5; } \
-              .switcher-heading { color: rgba(255, 255, 255, 0.7); font-weight: 700; font-size: 12px; \
-                letter-spacing: 0.04em; border-bottom: 1px solid rgba(255, 255, 255, 0.18); \
-                padding-bottom: 4px; min-width: 150px; } \
               .settings-box { padding: 16px; } \
               .settings-title { color: #ffffff; font-weight: 600; font-size: 14px; } \
               .settings-box label:not(.settings-title) { color: rgba(255, 255, 255, 0.92); } \
@@ -2264,29 +2004,19 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     let address_bar = gtk::Entry::new();
     address_bar.set_hexpand(true);
 
-    let flowbox = gtk::FlowBox::new();
-    flowbox.set_valign(gtk::Align::Start);
-    // Browse keeps exactly one child highlighted/selected at all times as
-    // arrow keys move over the grid, which is what lets Delete know which
-    // page to close (via selected_children()) and gives keyboard users a
-    // visible "current" tile.
-    flowbox.set_selection_mode(gtk::SelectionMode::Browse);
-    flowbox.set_homogeneous(true);
-    flowbox.set_margin(24);
-    flowbox.set_row_spacing(16);
-    flowbox.set_column_spacing(16);
+    // Where the switcher's real webview gets built (see `ensure_switcher_engine`)
+    // — replaces what used to be a native `gtk::FlowBox` of tiles.
+    let switcher_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    switcher_container.set_vexpand(true);
+    switcher_container.set_hexpand(true);
 
-    let keynav_hint = gtk::Label::new(Some("\u{21b5} Switch to page   \u{2326} Close page"));
-    keynav_hint.style_context().add_class("switcher-hint");
-    keynav_hint.set_halign(gtk::Align::Center);
-
-    let grid_content = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    let grid_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
     grid_content.set_halign(gtk::Align::Fill);
-    grid_content.set_valign(gtk::Align::Start);
-    grid_content.set_margin_top(40);
+    grid_content.set_valign(gtk::Align::Fill);
+    grid_content.set_vexpand(true);
+    grid_content.set_margin_top(12);
     grid_content.pack_start(&address_bar, false, false, 0);
-    grid_content.pack_start(&flowbox, true, true, 0);
-    grid_content.pack_start(&keynav_hint, false, false, 0);
+    grid_content.pack_start(&switcher_container, true, true, 0);
 
     // Top-left, not top-right — the overlay chrome's close icon/Esc hint
     // now own that corner for every overlay.
@@ -2394,7 +2124,8 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         title_label: title_label.clone(),
         stack,
         switcher_panel: switcher_overlay.clone().upcast::<gtk::Widget>(),
-        flowbox: flowbox.clone(),
+        switcher_container: switcher_container.clone(),
+        switcher_engine: RefCell::new(None),
         theme_provider: theme_provider.clone(),
         profile_menu_popover: profile_menu_popover.clone(),
         profile_menu_engine: RefCell::new(None),
@@ -2410,7 +2141,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         passwords_unlock_button: passwords_unlock_button.clone(),
         passwords: RefCell::new(initial_vault_state),
         session_passphrase: RefCell::new(None),
-        switcher_rows: RefCell::new(Vec::new()),
         core: RefCell::new(core),
         web_context: RefCell::new(web_context),
         containers: RefCell::new(HashMap::new()),
@@ -2454,7 +2184,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         let app = Rc::clone(&app);
         address_bar.connect_changed(move |_| {
             if app.is_switcher_open() {
-                app.rebuild_switcher_grid();
+                app.refresh_switcher_if_open();
             }
         });
     }
@@ -2471,11 +2201,10 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         // matches an open page/history entry — checked ahead of the plain
         // `connect_activate` handler below (which GtkEntry still emits
         // afterward for a bare Enter, since we only `Stop` when Ctrl is
-        // actually held). Down arrow moves keyboard focus into the tile grid
-        // (`FlowBox` already supports arrow-key navigation among tiles once
-        // focus is inside it — see the Delete-key handler below, which reads
-        // back `flowbox.selected_children()`), so keyboard-only users can
-        // reach the grid without a mouse.
+        // actually held). Down arrow moves keyboard focus into the switcher's
+        // own webview (see `focus_switcher_grid`) — closing/switching/
+        // filtering inside it is a real page now, with its own click/
+        // keyboard handling, not native FlowBox navigation.
         let app = Rc::clone(&app);
         address_bar.connect_key_press_event(move |entry, event| {
             if !app.is_switcher_open() {
@@ -2494,44 +2223,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
             gtk::glib::Propagation::Proceed
         });
     }
-    {
-        // Fires when a FlowBoxChild is activated — Enter/Space while it has
-        // keyboard focus (tile/close buttons are can_focus(false), so focus
-        // always lands on the FlowBoxChild itself, never its contents).
-        let app = Rc::clone(&app);
-        flowbox.connect_child_activated(move |_, child| {
-            if let Ok(idx) = child.widget_name().parse::<usize>() {
-                app.activate_switcher_row(idx);
-            }
-        });
-    }
-    {
-        // Delete closes whichever tile is currently highlighted by keyboard
-        // navigation (Browse selection mode keeps exactly one selected) —
-        // only meaningful for open-page tiles; the add/history/bookmark/
-        // similar rows have nothing to close, same as `activate_row`
-        // deliberately having no close-page concept.
-        let app = Rc::clone(&app);
-        flowbox.connect_key_press_event(move |flowbox, event| {
-            let is_delete = event.keyval() == gtk::gdk::keys::Key::from_name("Delete");
-            if !is_delete {
-                return gtk::glib::Propagation::Proceed;
-            }
-            if let Some(child) = flowbox.selected_children().into_iter().next() {
-                if let Ok(idx) = child.widget_name().parse::<usize>() {
-                    let open_id = match app.switcher_rows.borrow().get(idx) {
-                        Some(browser_chrome_core::SwitcherRow::Open { id, .. }) => Some(id.clone()),
-                        _ => None,
-                    };
-                    if let Some(id) = open_id {
-                        app.close_page(&id);
-                    }
-                }
-            }
-            gtk::glib::Propagation::Stop
-        });
-    }
-
     {
         // The window's own close button (Ctrl+Q's `Action::Quit` arm calls
         // the same `AppState::quit` method — see its doc comment for why

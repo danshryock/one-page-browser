@@ -385,11 +385,14 @@ fn add_page_related_opens_without_switching_away() {
         assert_eq!(app.active_url().as_deref(), Some(url_a.as_str()), "the active page's content shouldn't change");
 
         app.open_switcher();
-        assert_eq!(
-            app.switcher_grid_tile_count(),
-            4,
-            "the related page should still get a switcher tile (an \"Open Pages\" header + 2 open pages + the always-present Add tile)"
+        assert!(
+            wait_until(|| app.console_messages_for_test().iter().any(|m| m.starts_with("switcher_loaded"))),
+            "expected the switcher webview to load, got {:?}",
+            app.console_messages_for_test()
         );
+        let messages = app.console_messages_for_test();
+        let last = messages.iter().rev().find(|m| m.starts_with("switcher_loaded")).expect("already asserted present above");
+        assert_eq!(parse_metric(last, "pages"), Some(2), "the related page should still show up as a real open page in the switcher, got {last:?}");
 
         cleanup_test_profile(&profile);
     });
@@ -1344,7 +1347,7 @@ fn title_chip_reflects_the_active_pages_real_title() {
 }
 
 #[test]
-fn focus_switcher_grid_moves_keyboard_focus_onto_a_tile() {
+fn focus_switcher_grid_moves_keyboard_focus_onto_the_webview() {
     run_on_gtk_thread(|| {
         let profile = test_profile("down-arrow-focuses-grid");
         let url_a = fixture_url("page_a.html");
@@ -1353,14 +1356,14 @@ fn focus_switcher_grid_moves_keyboard_focus_onto_a_tile() {
         assert!(wait_until(|| app.active_url().as_deref() == Some(url_a.as_str())));
 
         app.open_switcher();
-        assert!(!app.switcher_grid_has_focused_tile(), "sanity check: focus starts in the address bar, not the grid");
+        assert!(!app.switcher_webview_has_focus(), "sanity check: focus starts in the address bar, not the webview");
 
         // Exercises the same `AppState::focus_switcher_grid` the address
         // bar's real Down-arrow key-press handler calls — driven directly
         // rather than via a synthetic key event, this suite's established
         // approach for GTK behavior (see this file's module doc comment).
         app.focus_switcher_grid();
-        assert!(app.switcher_grid_has_focused_tile(), "should move keyboard focus onto a tile in the grid");
+        assert!(wait_until(|| app.switcher_webview_has_focus()), "should move keyboard focus onto the switcher webview");
 
         cleanup_test_profile(&profile);
     });
@@ -1434,18 +1437,24 @@ fn switcher_grid_shows_bookmark_matches_not_currently_open() {
         let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
 
         // Bookmarked directly rather than opened as a real page, so it can
-        // never pick up a history entry (which would make the search match
-        // via the history-tile path instead — already covered by its own
-        // existing test) — isolates the bookmark-tile path specifically.
+        // never pick up a history entry too — isolates the bookmarks-column
+        // path specifically.
         app.bookmark_url_for_test("https://bookmarked-not-open.example", "Bookmarked Not Open");
         assert!(app.bookmarked_urls().contains(&"https://bookmarked-not-open.example".to_string()));
 
         app.open_switcher();
+        // The very first (unfiltered) load already shows this bookmark —
+        // real proof the *search* itself matched it needs the message from
+        // *after* typing specifically, not just any message so far.
+        assert!(wait_until(|| switcher_loaded_messages(&app).len() >= 1));
         app.set_address_bar_text("bookmarked not open");
         assert!(
-            wait_until(|| app.switcher_grid_has_tile_with_class("bookmark-tile")),
-            "searching for a bookmarked page should show it as a bookmark tile in the grid"
+            wait_until(|| switcher_loaded_messages(&app).len() >= 2),
+            "expected a second switcher_loaded after the query changed, got {:?}",
+            app.console_messages_for_test()
         );
+        let last = switcher_loaded_messages(&app).last().cloned().expect("already asserted present above");
+        assert_eq!(parse_metric(&last, "bookmarks"), Some(1), "the search itself should match the bookmark, got {last:?}");
 
         cleanup_test_profile(&profile);
     });
@@ -1462,20 +1471,35 @@ fn switcher_grid_shows_lexically_similar_history_matches() {
         // meaningful similarity comparison) with a title sharing most of
         // its vocabulary with the query below but no literal substring in
         // common ("guide" replaces "tutorial") — isolates the
-        // similar-tile path from the (already-covered) plain history-tile
+        // lexically-similar match path (internal_rpc.rs's `switcher_history`,
+        // merging in `HistoryStore::search_similar`) from the plain
         // substring-match path.
         app.record_history_visit_for_test("https://rust-lang.org/tutorial", "Rust Programming Language Tutorial")
             .expect("record_history_visit_for_test should succeed");
 
         app.open_switcher();
+        assert!(wait_until(|| switcher_loaded_messages(&app).len() >= 1));
         app.set_address_bar_text("rust programming language guide");
         assert!(
-            wait_until(|| app.switcher_grid_has_tile_with_class("similar-tile")),
-            "searching for a lexically similar (but not substring-matching) query should show a similar-history tile"
+            wait_until(|| switcher_loaded_messages(&app).len() >= 2),
+            "expected a second switcher_loaded after the query changed, got {:?}",
+            app.console_messages_for_test()
+        );
+        let last = switcher_loaded_messages(&app).last().cloned().expect("already asserted present above");
+        assert_eq!(
+            parse_metric(&last, "history"),
+            Some(1),
+            "a lexically similar (but not substring-matching) query should still match via search_similar, got {last:?}"
         );
 
         cleanup_test_profile(&profile);
     });
+}
+
+/// Every `switcher_loaded ...` console.log message so far, in order — see
+/// `parse_metric` for pulling a specific count back out of one.
+fn switcher_loaded_messages(app: &Rc<AppState>) -> Vec<String> {
+    app.console_messages_for_test().into_iter().filter(|m| m.starts_with("switcher_loaded")).collect()
 }
 
 #[test]
