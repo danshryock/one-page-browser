@@ -88,17 +88,14 @@ echo "== deploying web-standards-tests fixtures =="
 # Copied onto the shared folder's host-side directory first (cheap, plain
 # `cp`), then onto the VM's own C: drive (a real Windows path, not a UNC
 # one) via `xcopy` — the driver's fixture-URL-derived `expected.txt` reads
-# and the app's own `file:///C:/...` navigation both need a local path;
-# `\\host.lan\Data\...` UNC file:// URLs are a separate, murkier can of
-# worms this sidesteps entirely (never fully root-caused — see
-# `seed-fixture-session.ps1`'s own doc comment for the actual navigation
-# mechanism this now relies on instead).
+# need a local path. Served over a local `http://127.0.0.1` fixture server
+# by the driver itself now (see `windows_driver.rs`'s `FixtureServer`), not
+# navigated to directly — `\\host.lan\Data\...` UNC `file://` URLs were a
+# separate, murkier can of worms the old pre-seeded-session approach existed
+# specifically to avoid; no longer relevant now that navigation goes through
+# a real `add_page_and_switch` command instead.
 cp -r "$REPO_ROOT/web-standards-tests/fixtures" "$(vm_shared_dir)/"
 printf 'xcopy \\\\host.lan\\Data\\fixtures C:\\ClaudeBrowser\\fixtures\\ /E /I /Y\n' | vm_run
-
-echo "== seeding the default profile's session with every fixture case already open =="
-vm_deploy_file "./seed-fixture-session.ps1"
-printf 'powershell -ExecutionPolicy Bypass -File C:\\ClaudeBrowser\\seed-fixture-session.ps1\n' | vm_run
 
 echo "== running the web-standards driver inside the VM =="
 # `printf`, not a heredoc — matches `vm_deploy_file`'s own established fix

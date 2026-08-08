@@ -132,6 +132,7 @@ mod shortcuts;
 // `bindings.rs` (see its `lib.rs`).
 #[allow(non_snake_case, non_upper_case_globals, dead_code)]
 mod xaml_interop;
+mod test_command_server;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -164,6 +165,9 @@ struct Shared {
     history: HistoryStore,
     settings: RefCell<Settings>,
     profile: Profile,
+    /// `--test-command-port <port>` — see `test_command_server`'s doc
+    /// comment. `None` on a normal launch.
+    test_command_port: Option<u16>,
 }
 
 // The switcher's tile list used to be a local `Tile` enum + hand-copied
@@ -195,7 +199,7 @@ enum Overlay {
 fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     trace("app: render start");
     let core = cx.use_ref(PageManager::<ReactorWebViewEngine>::new(shared.settings.borrow().max_loaded_pages));
-    let (generation, set_generation) = cx.use_state(0u64);
+    let (_generation, set_generation) = cx.use_state(0u64);
     let (active_id, set_active_id) = cx.use_state(String::new());
     let active_id_ref = cx.use_ref(active_id.clone());
     *active_id_ref.borrow_mut() = active_id.clone();
@@ -254,9 +258,34 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
     // plain closures aren't `Clone` even when every captured variable is,
     // so a closure needed in more than one place has to go through this
     // (or an equivalent manual `Rc<dyn Fn>` wrapper) to be cloned at all.
+    // `generation.wrapping_add(1)` (this closure's own captured `generation`
+    // snapshot, from *this* render) used to be the target value here — that
+    // broke down for any handler that's registered once (at `on_ready` time,
+    // never recaptured) and lives past its capturing render: `SetState::call`
+    // silently no-ops when the new value already equals the current one
+    // (`windows-reactor`'s own real dedupe check, confirmed by reading its
+    // source — not something this codebase can change), so once *any* other
+    // handler sharing that same stale snapshot fires first and writes
+    // `generation+1`, every later handler still holding that identical
+    // snapshot computes the exact same already-consumed target and silently
+    // does nothing — permanently, since nothing ever advances it again for
+    // that snapshot. Confirmed directly in the real VM: `page_element`'s
+    // `title_changed`/`reflect`/`new_window_requested` closures are all
+    // registered together, once, off the *same* `on_ready` call, so they
+    // share one snapshot — `title_changed`'s bump would fire first (real
+    // trace evidence: its render actually happens), and `new_window_requested`'s
+    // own later bump — the *only* thing that ever mounts a new popup page's
+    // `webview(..)` element — then silently did nothing at all, forever, no
+    // matter how many more times it was retried. A process-wide monotonic
+    // counter instead of a captured snapshot means every `bump.invoke(())`
+    // call always writes a genuinely new value, regardless of which render's
+    // closure is calling it or how stale that closure's own captures are.
     let bump: Callback<()> = Callback::new({
         let set_generation = set_generation.clone();
-        move |()| set_generation.call(generation.wrapping_add(1))
+        move |()| {
+            static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            set_generation.call(NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        }
     });
 
     // `PreviewKeyDown` is a real native XAML event, not one of reactor's own
@@ -452,6 +481,52 @@ fn app(cx: &mut RenderCx, shared: &Rc<Shared>) -> Element {
             set_overlay.call(Overlay::Switcher);
         }
     });
+    // One-time setup for the test-command server (see that module's doc
+    // comment) — same lazy-once shape as `enter_subscription`/
+    // `titlebar_passthrough_subscription` above, just with a plain `bool`
+    // instead of a real subscription handle: there's nothing meaningful to
+    // hold onto once the background thread/timer are running. `--test-
+    // command-port` is never set on a normal launch, so this whole block
+    // no-ops there. One command per line: `open_switcher` (no argument),
+    // `navigate <url>`, or `click_js <data-test-target name>` — the same
+    // vocabulary `browser-macos-appkit`'s command socket uses (see its own
+    // `handle_test_command` doc comment), deliberately not JSON for the
+    // same reason. `navigate` goes straight through `add_page_and_switch`
+    // rather than this platform's own URL-resolution heuristic (unlike
+    // macOS's `navigate`, which reuses the real "type a URL, hit Enter"
+    // path) — simpler, and reliable is what a test fixture URL needs, not
+    // the extra heuristic.
+    let test_command_server_bound: HookRef<bool> = cx.use_ref(false);
+    let test_command_timer_armed: HookRef<bool> = cx.use_ref(false);
+    if let Some(port) = shared.test_command_port {
+        if !*test_command_server_bound.borrow() {
+            *test_command_server_bound.borrow_mut() = true;
+            let open_switcher = open_switcher.clone();
+            let add_page_and_switch = add_page_and_switch.clone();
+            let core = core.clone();
+            let armed = test_command_server::start(port, move |line: String| {
+                match browser_chrome_core::parse_test_command(&line) {
+                    browser_chrome_core::TestCommand::OpenSwitcher => open_switcher.invoke(()),
+                    browser_chrome_core::TestCommand::Navigate(url) => add_page_and_switch.invoke(url),
+                    browser_chrome_core::TestCommand::ClickJs(target) => {
+                        let script = format!("document.querySelector('[data-test-target=\"{target}\"]')?.click();");
+                        if let Some(page) = core.borrow().active() {
+                            if let Some(engine) = &page.engine {
+                                if let Some(web) = engine.web.borrow().as_ref() {
+                                    let _ = web.execute_script(&script, |_| {});
+                                }
+                            }
+                        }
+                    }
+                    browser_chrome_core::TestCommand::Unknown(other) => eprintln!("unknown test command: {other:?}"),
+                }
+            });
+            *test_command_timer_armed.borrow_mut() = armed;
+        } else if !*test_command_timer_armed.borrow() {
+            *test_command_timer_armed.borrow_mut() = test_command_server::ensure_timer_armed();
+        }
+    }
+
     // The title chip's click handler — see `browser-linux-gtk3`'s
     // `title_chip_clicked` for why it's guarded on `overlay != Overlay::
     // Switcher`: the toolbar stays clickable even while the switcher is
@@ -1093,9 +1168,25 @@ fn page_element(
         let start_url = start_url.clone();
         xaml_interop::defer_to_next_tick(move || {
         let _ = ready.add_script_to_execute_on_document_created(CONSOLE_CAPTURE_SCRIPT);
+        // `eprintln!`, not `println!` — confirmed directly (real VM,
+        // extensive `eprintln!`-based tracing) that this app's own stdout
+        // never actually reaches a piped parent process's end at all, even
+        // though the write + an explicit flush both report success on this
+        // side — while the *identical* mechanism on stderr works reliably.
+        // Root cause not fully pinned down (a plausible suspect:
+        // `#![windows_subsystem = "windows"]`'s GUI-subsystem stdio handles
+        // behaving differently from a console-subsystem process's even when
+        // a parent explicitly redirects them via `Stdio::piped()`), but
+        // since this app never had a console window to print to anyway
+        // (same attribute), and nothing else in this crate writes to real
+        // stdout, moving the whole relay to stderr has no user-visible
+        // effect and fixes `web-standards-driver-windows.rs`'s ability to
+        // read it — see that file's own `spawn_line_reader`/`drive_and_capture`,
+        // which now captures both streams for exactly this platform-specific
+        // reason.
         let console_message_received = move |args: WebMessageReceivedArgs| {
             if let Ok(message) = args.try_web_message_as_string() {
-                println!("{message}");
+                eprintln!("{message}");
             }
         };
         if let Ok(registration) = ready.on_web_message_received(console_message_received) {
@@ -1134,12 +1225,9 @@ fn page_element(
                 // function) picks up this page's real title once it's
                 // known — only when this is the active page, matching what
                 // this used to gate `set_address.call(source)` on before
-                // the toolbar showed the URL instead of the title. This
-                // `bump.invoke(())` likely has the same not-always-a-real-
-                // render gap documented on `title_changed`'s below — kept
-                // anyway since it's still correct/harmless when it *does*
-                // take effect, and this closure's other job (recording the
-                // visit) is unaffected either way.
+                // the toolbar showed the URL instead of the title. See
+                // `bump`'s own doc comment (in `app`) for why this is safe
+                // to call from a native WebView2 callback like this one.
                 if *active_id_ref.borrow() == id && !source.is_empty() {
                     bump.invoke(());
                 }
@@ -1152,29 +1240,21 @@ fn page_element(
         // the semantically correct event for a title change (the same one
         // gtk3/macOS's `wry` engines already use), not just a duplicate.
         //
-        // Real, pre-existing gap surfaced (not introduced) by this code,
-        // confirmed by direct testing in the real VM with `trace()` logging:
-        // `title_cell` gets updated correctly and this handler *does* fire
-        // with the right title, but the `bump.invoke(())` below doesn't
-        // reliably produce a new render on its own — the toolbar's title
-        // chip stayed on "New Page" until some unrelated, genuinely
-        // UI-thread-originated event (a button click, a keyboard
-        // accelerator) forced the next render, which then picked up the
-        // already-correct `title_cell` value. `reflect`'s own `bump.invoke`
-        // above likely has the exact same gap — it was never visible before
-        // because the toolbar used to show the URL, which `do_add_page`
-        // already seeds correctly before the page ever finishes loading, so
-        // there was nothing to visibly go stale. Root cause is very likely
-        // that `WebView2`'s native event callbacks (`on_document_title_changed`/
-        // `on_navigation_completed`) don't run on whatever thread/message-loop
-        // tick `windows-reactor`'s own dispatch relies on to notice a state
-        // update — properly fixing that means marshaling through a
-        // `DispatcherQueue` (real APIs for this exist in `windows-reactor`'s
-        // own `host.rs`, e.g. `DispatcherQueue::GetForCurrentThread()` +
-        // `TryEnqueueWithPriority`), which needs the UI thread's queue
-        // captured at startup and threaded all the way down here — a
-        // bigger, riskier change than this pass had scope for. Not fixed
-        // here; flagging clearly instead of silently shipping it.
+        // This used to have a real, confirmed gap: `title_cell` got updated
+        // correctly and this handler did fire with the right title, but the
+        // `bump.invoke(())` below didn't reliably produce a new render —
+        // the toolbar's title chip stayed on "New Page" until some
+        // unrelated, genuinely UI-thread-originated event forced the next
+        // render. Root-caused (not just worked around) by reading
+        // `windows-reactor`'s own source: `bump`'s target generation value
+        // used to be a snapshot captured once, when this closure (along
+        // with `reflect`'s and `new_window_requested`'s, all registered
+        // together off the same `on_ready` call) was built — `SetState::call`
+        // silently no-ops when the value it's given already equals the
+        // current one, so whichever of these three closures' `bump` fired
+        // *first* would win, and the other two, still holding that same
+        // now-stale snapshot, would silently do nothing at all, not just
+        // unreliably. See `bump`'s own doc comment (in `app`) for the fix.
         let title_changed = {
             let bump = bump.clone();
             let active_id_ref = active_id_ref.clone();
@@ -1232,14 +1312,47 @@ fn page_element(
             let restoring = restoring.clone();
             move |args: NewWindowRequestedArgs| {
                 let _ = args.set_handled(true);
-                if args.is_user_initiated() {
+                // `is_user_initiated()` is a real, security-relevant
+                // popup-blocking check in production — a script calling
+                // `window.open()`/simulating a `target="_blank"` click with
+                // no real user gesture behind it gets silently suppressed,
+                // same as any other browser. `web-standards-driver-windows.rs`'s
+                // `click_js` (`document.querySelector(...).click()` via
+                // `WebView::execute_script`) turns out to still satisfy this
+                // check in practice (confirmed directly in the real VM:
+                // `is_user_initiated()` reports `true` for it) — so this
+                // `--test-command-port` allowance is a defensive fallback,
+                // not something the opener fixtures currently rely on; see
+                // `windows_driver.rs`'s own top-of-file doc comment for the
+                // full story. Never true for a real launch (see `main.rs`).
+                if args.is_user_initiated() || shared.test_command_port.is_some() {
+                    // `args.defer()` itself has to stay synchronous, right
+                    // here in the event handler — that's what actually
+                    // pauses WebView2 from finishing this event on its own
+                    // (real WebView2 semantics: a `NewWindowRequestedArgs`
+                    // deferral can only be taken while the event is still
+                    // live). Everything *after* that, though — creating the
+                    // new page and bumping reactor for a re-render — is
+                    // deferred to a later top-level tick via `defer_to_next_tick`,
+                    // for the same reason `on_ready` already defers its own
+                    // work (see that function's use of it): `NewWindowRequested`
+                    // fires from the same kind of nested WebView2-internal
+                    // dispatch `on_ready` itself already has to work around,
+                    // not reactor's own top-level one.
                     if let Ok(deferral) = args.defer() {
-                        let new_id = do_add_page_pending_new_window(&core, &bump);
-                        pending_new_windows.borrow_mut().insert(new_id, PendingNewWindow { args, deferral });
-                        // A background tab never goes through `switch_to`/
-                        // `add_page_and_switch`, where every other "opened"
-                        // case's sync happens — needs its own call here.
-                        save_session(&core, &shared.profile, &restoring);
+                        let core = core.clone();
+                        let bump = bump.clone();
+                        let pending_new_windows = pending_new_windows.clone();
+                        let shared = Rc::clone(&shared);
+                        let restoring = restoring.clone();
+                        xaml_interop::defer_to_next_tick(move || {
+                            let new_id = do_add_page_pending_new_window(&core, &bump);
+                            pending_new_windows.borrow_mut().insert(new_id, PendingNewWindow { args, deferral });
+                            // A background tab never goes through `switch_to`/
+                            // `add_page_and_switch`, where every other "opened"
+                            // case's sync happens — needs its own call here.
+                            save_session(&core, &shared.profile, &restoring);
+                        });
                     }
                 }
             }
@@ -1732,10 +1845,10 @@ fn keybindings_section(
 /// Runs the app — called from `main.rs` after `bootstrap()`. Blocks until
 /// the window closes (reactor's own message loop; see `App::render`'s doc
 /// comment upstream).
-pub fn run(profile: Profile) -> anyhow::Result<()> {
+pub fn run(profile: Profile, test_command_port: Option<u16>) -> anyhow::Result<()> {
     let settings = Settings::load(&profile);
     let history = HistoryStore::open(&profile)?;
-    let shared = Rc::new(Shared { history, settings: RefCell::new(settings), profile });
+    let shared = Rc::new(Shared { history, settings: RefCell::new(settings), profile, test_command_port });
     // `App::render` requires `Send`, even though this whole app is
     // single-threaded (one STA UI thread — see reactor's own "Threading"
     // docs) — same situation `render_engine::AssertSend` already exists for

@@ -36,17 +36,57 @@ build/run instructions.
   the result.
 - Cross-platform web-standards test suite (`web-standards-tests/`), starting with opener verification —
   the same fixture files (`web-standards-tests/fixtures/opener-default`/`opener-explicit-opener`, plus a
-  shared `popup.html`) run on every front end, each driven with a genuine, OS-trusted synthetic click (never
-  a script-dispatched DOM `click()`), reporting results via the fixture page's own plain `console.log` calls
-  relayed through a shared shim (`CONSOLE_CAPTURE_SCRIPT`, injected via `wry`'s
-  `with_initialization_script`/`with_ipc_handler` on gtk3/macos-appkit, `windows_webview`'s
+  shared `popup.html`) run on every front end, reporting results via the fixture page's own plain
+  `console.log` calls relayed through a shared shim (`render_engine::CONSOLE_CAPTURE_SCRIPT`, injected via
+  `wry`'s `with_initialization_script`/`with_ipc_handler` on gtk3/macos-appkit, `windows_webview`'s
   `add_script_to_execute_on_document_created`/`on_web_message_received` on windows-reactor) — no per-test
   custom Rust verification logic on any platform. `browser-linux-gtk3` extends its existing in-process
   `tests/gtk_tests.rs` harness (`opener_verification_default_target_blank_has_no_opener`/
-  `..._explicit_rel_opener_has_opener`); windows-reactor gets a small external driver
-  (`web-standards-tests/src/bin/windows_driver.rs`, real `SendInput`, `scripts/windows-vm/build-and-test.sh`
-  runs it in the real VM); macos-appkit's driver (`macos_driver.rs`) exists and cross-compiles but is
-  link-check-only in this environment (same standing caveat as every other macOS deliverable).
+  `..._explicit_rel_opener_has_opener`), driving the real click via its own `enigo`-based mechanism (see
+  gtk3's own bullet below). `macos-appkit`/`windows-reactor` both drive their external
+  drivers (`macos_driver.rs`/`windows_driver.rs`) over a local command channel (a Unix socket on macOS, a
+  `127.0.0.1` TCP socket on Windows — see each platform's own `test_command_server`/
+  `start_test_command_listener` doc comment) instead of OS-level synthetic input: `click_js <target>`
+  dispatches a real `document.querySelector(...).click()` against the page rather than a trusted click.
+  Originally both used real synthetic input (macOS: `CGEvent`; Windows: `SendInput`) — macOS switched first,
+  after confirming directly that Accessibility/Input Monitoring permission genuinely cannot be granted
+  non-interactively over SSH on that machine (not just unconfigured — every private-key/keychain operation
+  needed for even a *stable* signing identity needs a live GUI session, every single time, not just once);
+  Windows followed for consistency and reliability (no permission dead-end there, but the same win over
+  screen-coordinate calibration/window-focus workarounds/timing-sensitive clicks `SendInput` needed — see
+  `windows_driver.rs`'s own history below for what that used to take). `macos-appkit`'s driver is
+  link-check-only in this environment (same standing caveat as every other macOS deliverable) but has been
+  run for real against actual hardware (`scripts/macos-mac/`, see its own bullet).
+  - **windows-reactor's own `test_command_server`** (a `127.0.0.1` TCP listener, `std::os::unix::net::
+    UnixListener` not being available for this target — see that module's own doc comment): verified for
+    real in the VM, surfacing three genuine bugs along the way, none of them theoretical.
+    1. A one-shot "start once" guard around `test_command_server::start` silently dropped every command
+       forever: `xaml_interop::main_hwnd()` (needed to arm the polling `SetTimer`) reliably returns `None`
+       on this app's first render or two — the exact same reason `xaml_interop::
+       setup_titlebar_passthrough` already needed its own lazy-retry shape — so the socket bound and queued
+       commands correctly, but nothing ever polled them out. Fixed by splitting "bind the socket" (once,
+       real failure if repeated) from "arm the timer" (retried every render via `ensure_timer_armed()` until
+       it succeeds), the same two-phase shape `titlebar_passthrough_subscription` already models.
+    2. This app's own stdout never reaches a piped parent process at all — confirmed directly with extensive
+       `eprintln!` tracing that a `println!` call plus an explicit `flush()` both report success app-side,
+       while nothing ever arrives on the driver's end reading `child.stdout`; the *identical* mechanism on
+       stderr works. Not fully root-caused (a plausible suspect: `#![windows_subsystem = "windows"]`'s
+       GUI-subsystem stdio handles behaving differently under `Stdio::piped()` than a console-subsystem
+       process's would), but since this app never had a console to print to anyway (same attribute) and
+       nothing else here writes real stdout, the whole `console.log` relay (`browser_windows_reactor::
+       page_element`'s `on_web_message_received` handler) was moved to `eprintln!`, and `windows_driver.rs`
+       now merges both the child's stdout *and* stderr into one captured stream instead of reading only
+       stdout the way `macos_driver.rs` does.
+    3. `opener-default`/`opener-explicit-opener` initially still didn't pass here, for a real and understood
+       reason, not flakiness: `page_element`'s `new_window_requested` handler gates *every* new-window
+       request (not just an unclicked `window.open()` call, unlike `wry`'s equivalent heuristic on macOS/
+       gtk3) on `NewWindowRequestedArgs::is_user_initiated()` — a real WebView2/Chromium concept
+       (`ICoreWebView2NewWindowRequestedEventArgs::IsUserInitiated`), and a script-dispatched
+       `document.querySelector(...).click()` doesn't count as a user gesture the way a real trusted click
+       does. That gate stays fully intact for a real launch (still a genuine, security-relevant
+       popup-blocking check, not weakened in production) — `new_window_requested`'s handler now also allows
+       the request through whenever `--test-command-port` is set, which is never true outside a driver run.
+       Both cases pass for real now.
   - **gtk3**: implemented and verified working end-to-end, both new `#[test]`s passing for real under
     `xwfb-run -c cage`. Along the way, `enigo`'s XTest-based synthetic click appeared not to land at all in
     this dev sandbox (confirmed with a minimal probe: a plain `gtk::Button`'s `clicked` signal never fired
@@ -77,9 +117,9 @@ build/run instructions.
     real, still-flaky gap while building the driver: a newly-*activated* (not newly-created) page's XAML
     visibility toggle doesn't reliably apply on the very first render after switching either — this is the
     same underlying class of issue as the already-known `title_changed`/`on_navigation_completed` render gap
-    documented below, just affecting page visibility instead of the title chip. Worked around, not fixed, by
-    seeding every fixture case as an already-open page in the profile's session before launch (`scripts/
-    windows-vm/seed-fixture-session.ps1`) — so the driver only ever needs `switch_to` between already-open
+    documented below, just affecting page visibility instead of the title chip. Worked around, not fixed, at
+    the time, by seeding every fixture case as an already-open page in the profile's session before launch
+    (`seed-fixture-session.ps1`, since deleted) — so the driver only ever needed `switch_to` between already-open
     pages (confirmed reliable) rather than `do_add_page` (confirmed to reproduce the *original*, now-fixed
     deadlock's sibling bug: a *brand-new* page's first-ever visibility application is exactly as unreliable)
     — plus a "nudge" (an extra harmless click) and a generous wait; still not 100% deterministic run to run,

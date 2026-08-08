@@ -22,6 +22,17 @@ fn main() -> anyhow::Result<()> {
     // `--app-id`/`CLAUDE_BROWSER_APP_ID` if given, and migrates an existing
     // user's data forward from a previous `APP_ID` otherwise.
     browser_core::init_app_id(args.clone());
+    // `--test-command-port <port>`: only ever passed by
+    // `web-standards-driver-windows`/other automated tests — see
+    // `test_command_server`'s doc comment. Parsed here (not via
+    // `resolve_url_argument`) the same way `browser-macos-appkit`'s
+    // `--test-command-socket` is, so `resolve_url_argument` doesn't
+    // mistake its value for a bare positional URL either.
+    let test_command_port = args
+        .iter()
+        .position(|a| a == "--test-command-port")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<u16>().ok());
     let result = if let Some(url) = browser_core::resolve_url_argument(args.clone()) {
         // Never constructs a `WebView2` control at all (confirmed: neither
         // `run_chooser` nor its window tree touches WebView2/`CoreWebView2`
@@ -29,9 +40,26 @@ fn main() -> anyhow::Result<()> {
         let default_profile = browser_core::resolve_profile_name(args);
         browser_windows_reactor::run_chooser(url, default_profile)
     } else {
-        let profile = browser_core::Profile::new(browser_core::resolve_profile_name(args));
+        // --incognito/--private/--guest (three names for the same thing —
+        // see `Profile::ephemeral`'s doc comment), same precedence over
+        // --profile as `browser-linux-gtk3`'s main already gives it: a
+        // private window is never "the work profile, but private," it's
+        // always its own unlinked session. Also what `web-standards-driver-windows.rs`
+        // now launches every case under — otherwise each case's own
+        // continuous-session-sync writes (a real feature, not a test-only
+        // concern) would leak into the *next* case's freshly spawned
+        // process on restore, including a stray `console.log` from a
+        // restored popup page re-navigating on its own — confirmed
+        // directly (real VM run): a case's `expected.txt` diff failed
+        // against an extra, unrelated `opener_is_set=false` line that
+        // turned out to be exactly this.
+        let profile = if browser_core::resolve_ephemeral_requested(args.clone()) {
+            browser_core::Profile::ephemeral()
+        } else {
+            browser_core::Profile::new(browser_core::resolve_profile_name(args))
+        };
         set_webview2_user_data_folder(&profile);
-        browser_windows_reactor::run(profile)
+        browser_windows_reactor::run(profile, test_command_port)
     };
     browser_windows_reactor::trace(&format!("main: run returned {result:?}"));
     result?;

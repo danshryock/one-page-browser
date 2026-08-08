@@ -708,7 +708,7 @@ pub(crate) fn defer_to_next_tick(callback: impl FnOnce() + 'static) {
     }
 }
 
-fn main_hwnd() -> Option<windows::Win32::HWND> {
+pub(crate) fn main_hwnd() -> Option<windows::Win32::HWND> {
     let raw = windows_reactor::with_active_host(|host| -> Result<isize> {
         let window = host.window();
         window.cast::<IWindowNative>()?.GetWindowHandle()

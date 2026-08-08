@@ -242,17 +242,20 @@ pub fn resolve_passphrase_setup_requested<I: IntoIterator<Item = String>>(args: 
 pub fn resolve_url_argument<I: IntoIterator<Item = String>>(args: I) -> Option<String> {
     let mut args = args.into_iter().skip(1); // skip argv[0]
     while let Some(arg) = args.next() {
-        // `--test-command-socket`: only `browser-macos-appkit` parses this
-        // (see its `main.rs` — `web-standards-tests/src/bin/macos_driver.rs`
-        // passes it), but this scan has to know to skip its value too, the
-        // same as `--profile`/`--app-id` below — otherwise the socket path
-        // gets mistaken for a bare positional URL, silently routing to the
-        // external-link chooser window instead of a normal launch. Confirmed
-        // directly: the app launched fine and looked completely idle, no
-        // crash, no socket ever created, no output at all — because it was
-        // sitting in `run_chooser`, waiting for a chooser interaction that
-        // was never coming.
-        if arg == "--profile" || arg == "--app-id" || arg == "--test-command-socket" {
+        // `--test-command-socket`/`--test-command-port`: only
+        // `browser-macos-appkit`/`browser-windows-reactor` respectively
+        // parse these (see each crate's own `main.rs` —
+        // `web-standards-tests/src/bin/macos_driver.rs`/`windows_driver.rs`
+        // pass them), but this scan has to know to skip their values too,
+        // the same as `--profile`/`--app-id` below — otherwise the
+        // socket path/port number gets mistaken for a bare positional URL,
+        // silently routing to the external-link chooser window instead of
+        // a normal launch. Confirmed directly (for `--test-command-socket`
+        // originally): the app launched fine and looked completely idle,
+        // no crash, no socket ever created, no output at all — because it
+        // was sitting in `run_chooser`, waiting for a chooser interaction
+        // that was never coming.
+        if arg == "--profile" || arg == "--app-id" || arg == "--test-command-socket" || arg == "--test-command-port" {
             args.next(); // consume its value too, not the URL
             continue;
         }
@@ -548,6 +551,15 @@ mod tests {
         assert_eq!(
             resolve_url_argument(args(&["program", "--app-id=renamed", "https://example.com"])),
             Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_url_argument_skips_the_test_command_port_flags_value() {
+        assert_eq!(
+            resolve_url_argument(args(&["program", "--test-command-port", "9123"])),
+            None,
+            "the port number shouldn't be mistaken for a bare positional URL"
         );
     }
 

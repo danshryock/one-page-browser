@@ -699,26 +699,38 @@ impl AppState {
         unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.02, true, &timer_block) };
     }
 
-    /// One command per line: `open_switcher` (no argument), `navigate
-    /// <url>`, or `click_js <data-test-target name>` — deliberately not
-    /// JSON (nothing here needs nested structure, and this is test-only
-    /// surface area, not a real protocol). `navigate` reuses
-    /// `address_bar_activated` itself — the same method a real Enter
-    /// keypress in the address bar reaches — rather than calling
-    /// `add_page` directly, so this exercises the real "type a URL, hit
-    /// Enter" user path, not a shortcut around it.
+    /// One command per line — deliberately not JSON (nothing here needs
+    /// nested structure, and this is test-only surface area, not a real
+    /// protocol). The three commands every socket-based frontend's driver
+    /// actually uses (`open_switcher`/`navigate <url>`/`click_js <data-
+    /// test-target name>`) are parsed by the shared
+    /// `browser_chrome_core::parse_test_command` — see that function's own
+    /// doc comment for why (removes a hand-duplicated parser
+    /// `browser-windows-reactor`'s own `test_command_server` used to carry
+    /// separately). Everything below `TestCommand::Unknown`'s arm is a
+    /// macOS-only extension beyond that shared core, mostly added to
+    /// reproduce/regression-test specific real bugs this session rather
+    /// than as standing infrastructure every platform needs — see each
+    /// arm's own comment. `navigate` reuses `address_bar_activated` itself
+    /// — the same method a real Enter keypress in the address bar reaches
+    /// — rather than calling `add_page` directly, so this exercises the
+    /// real "type a URL, hit Enter" user path, not a shortcut around it.
     fn handle_test_command(self: &Rc<Self>, line: &str) {
-        let (command, arg) = line.split_once(' ').unwrap_or((line, ""));
-        match command {
-            "open_switcher" => self.open_switcher(),
-            "navigate" => {
-                self.address_bar.setStringValue(&NSString::from_str(arg));
-                self.address_bar_activated();
+        let command = match browser_chrome_core::parse_test_command(line) {
+            browser_chrome_core::TestCommand::OpenSwitcher => return self.open_switcher(),
+            browser_chrome_core::TestCommand::Navigate(url) => {
+                self.address_bar.setStringValue(&NSString::from_str(&url));
+                return self.address_bar_activated();
             }
-            "click_js" => {
-                let script = format!("document.querySelector('[data-test-target=\"{arg}\"]')?.click();");
+            browser_chrome_core::TestCommand::ClickJs(target) => {
+                let script = format!("document.querySelector('[data-test-target=\"{target}\"]')?.click();");
                 self.with_active(|engine| engine.evaluate_script_for_test(&script));
+                return;
             }
+            browser_chrome_core::TestCommand::Unknown(command) => command,
+        };
+        let arg = line.split_once(' ').map(|(_, arg)| arg).unwrap_or("");
+        match command.as_str() {
             // Exercises the switcher's keyboard-only path (Up/Down arrow
             // selection, then Enter to activate) the same way a real
             // keyboard would, without needing OS-level synthetic input —

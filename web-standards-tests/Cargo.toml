@@ -25,30 +25,19 @@ anyhow = "1"
 # in-process test (`crates/browser-linux-gtk3/tests/gtk_tests.rs`) already
 # reads.
 serde_json = "1"
-
-# `windows` (not `windows-core`/`windows-reactor`/`windows-webview`, which
-# `browser-windows-reactor` uses): this is a wholly separate process driving
-# the real app from the *outside* via `SendInput`/window-finding — it shares
-# no types with the app, so there's no reason to match its git-pinned
-# `windows-core` version.
-[target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_Graphics_Gdi",
-] }
+# Serves fixtures over real http://127.0.0.1 instead of file:// — needed on
+# macOS (wry's macOS `navigate_to_url` uses a plain `loadRequest:` for every
+# URL scheme, but WKWebView only reliably loads local content via the
+# distinct `loadFileURL:allowingReadAccessToURL:` API; a `file://` URL
+# through `loadRequest:` never actually commits navigation at all — confirmed
+# directly on real hardware, `didCommitNavigation` never fires, so wry's own
+# pending-script queue never flushes either) and reused unconditionally
+# (Windows too, not target-gated) for consistency between the two external
+# drivers now that both are socket-based — same fix, same reasoning, as
+# `browser-linux-gtk3/tests/gtk_tests.rs`'s own `FixtureServer` for the
+# analogous GTK-side wry bug.
+tiny_http = "0.12"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.24"
 core-foundation = "0.10"
-# Serves fixtures over real http://127.0.0.1 instead of file:// — wry's
-# macOS `navigate_to_url` uses a plain `loadRequest:` for every URL scheme,
-# but WKWebView only reliably loads local content via the distinct
-# `loadFileURL:allowingReadAccessToURL:` API; a `file://` URL through
-# `loadRequest:` never actually commits navigation at all (confirmed
-# directly on real hardware — `didCommitNavigation` never fires, so wry's
-# own pending-script queue never flushes either). Same fix, same reasoning,
-# as `browser-linux-gtk3/tests/gtk_tests.rs`'s `FixtureServer` for the
-# analogous GTK-side wry bug.
-tiny_http = "0.12"

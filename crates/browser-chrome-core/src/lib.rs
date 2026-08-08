@@ -25,9 +25,18 @@
 //! should we open" decision — one of the `PageController`-shaped follow-ups
 //! that doc comment already called out). `SettingsController`/
 //! `KeybindingsController`/`ProfilePickerModel` remain future work.
+//!
+//! `test_commands` is a different kind of shared piece — not a real UI
+//! decision, just a parser for the local test-command channel
+//! `browser-macos-appkit`/`browser-windows-reactor` each run (see that
+//! module's own doc comment) — kept here anyway rather than a new crate,
+//! since it was hand-duplicated the exact same way the real decision logic
+//! above used to be before this crate existed.
 
 mod restore;
 mod switcher;
+mod test_commands;
 
 pub use restore::{resolve_restore_plan, RestorePlan};
 pub use switcher::{activate_row, build_switcher_rows, next_activatable_row, SwitcherActivation, SwitcherNavDirection, SwitcherRow};
+pub use test_commands::{parse_test_command, TestCommand};
