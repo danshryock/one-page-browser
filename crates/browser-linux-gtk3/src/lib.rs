@@ -870,6 +870,17 @@ impl AppState {
                 return;
             }
         };
+        // A webview reports no natural/content size of its own the way a
+        // native widget would, so without an explicit request GTK's size
+        // negotiation has nothing to lay the popover out with and it
+        // collapses to a real, on-screen 1x1 — confirmed directly, not just
+        // theoretical, and confirmed that setting it on the *container*
+        // alone (before the webview widget existed) wasn't enough; the
+        // actual webview widget itself needs it. Sized to comfortably fit
+        // `profile_menu.js`'s real content (profile row, Settings/
+        // Passwords, switch-profile list, add profile) without scrolling
+        // for the common case.
+        engine.widget().set_size_request(280, 400);
 
         self.profile_menu_popover.add(&container);
         container.show_all();
@@ -1082,6 +1093,30 @@ impl AppState {
     /// inspection helper.
     pub fn is_profile_menu_open(&self) -> bool {
         self.profile_menu_popover.is_visible()
+    }
+
+    /// The profile-menu popover's real allocated (width, height) — test/
+    /// inspection helper for confirming it's actually big enough to show
+    /// its content, not just that it's technically visible. A webview
+    /// reports no natural content size of its own for GTK's layout to use
+    /// (see `show_profile_menu`'s own `set_size_request` doc comment), so
+    /// this is a real, previously-hit failure mode, not a hypothetical one.
+    pub fn profile_menu_popover_size(&self) -> (i32, i32) {
+        let allocation = self.profile_menu_popover.allocation();
+        (allocation.width(), allocation.height())
+    }
+
+    /// The profile-menu popover's *webview widget's* real allocated (width,
+    /// height) — diagnostic test helper, separate from
+    /// `profile_menu_popover_size`: a `gtk::Popover`'s own `allocation()`
+    /// may not reflect its real on-screen size the way an ordinary child
+    /// widget's would (it's shown via its own separate `GdkWindow`), so
+    /// this checks the actual content widget instead.
+    pub fn profile_menu_webview_size(&self) -> Option<(i32, i32)> {
+        self.profile_menu_engine.borrow().as_ref().map(|engine| {
+            let allocation = engine.widget().allocation();
+            (allocation.width(), allocation.height())
+        })
     }
 
     /// Whether the multi-match credential picker popover is currently

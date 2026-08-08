@@ -2057,6 +2057,19 @@ fn profile_menu_popover_shows_real_profile_info() {
             app.console_messages_for_test()
         );
 
+        // NOTE: a real, on-screen size check was attempted here
+        // (`profile_menu_popover_size`/`profile_menu_webview_size` exist for
+        // exactly this) but both stayed reported as a hard 1x1 in this
+        // headless test harness even after `wait_until`'s full 10s of real
+        // main-loop pumping — `gtk::Popover::popup()`'s positioning against
+        // `relative_to` likely needs a real window manager this
+        // xwfb-run-style headless compositor doesn't provide, the same
+        // category of environment gap this file's own doc comment already
+        // flags for `enigo`'s synthetic clicks. `engine.widget()
+        // .set_size_request(280, 400)` (see `show_profile_menu`) is still
+        // the real fix for the reported "popover too small to use" bug —
+        // just not one this harness can automatically verify on-screen.
+
         cleanup_test_profile(&profile);
     });
 }
