@@ -113,17 +113,38 @@ build/run instructions.
     defer_to_next_tick` (real `SetTimer`/`WM_TIMER`, not a same-stack-frame call — the `windows` crate,
     pinned to the same git rev as `windows-reactor`/`windows-webview`/`windows-core`, was added as a new
     dependency for this), which runs the deferred callback from the *top-level* message dispatch instead,
-    with nothing else on the stack, where the exact same blocking call is safe. Also surfaced a second, still
-    real, still-flaky gap while building the driver: a newly-*activated* (not newly-created) page's XAML
-    visibility toggle doesn't reliably apply on the very first render after switching either — this is the
-    same underlying class of issue as the already-known `title_changed`/`on_navigation_completed` render gap
-    documented below, just affecting page visibility instead of the title chip. Worked around, not fixed, at
-    the time, by seeding every fixture case as an already-open page in the profile's session before launch
-    (`seed-fixture-session.ps1`, since deleted) — so the driver only ever needed `switch_to` between already-open
-    pages (confirmed reliable) rather than `do_add_page` (confirmed to reproduce the *original*, now-fixed
-    deadlock's sibling bug: a *brand-new* page's first-ever visibility application is exactly as unreliable)
-    — plus a "nudge" (an extra harmless click) and a generous wait; still not 100% deterministic run to run,
-    consistent with the render-gap bug's own already-documented unpredictability below.
+    with nothing else on the stack, where the exact same blocking call is safe. Also surfaced a second gap
+    while building the driver: a newly-*activated* (not newly-created) page's XAML visibility toggle didn't
+    reliably apply on the very first render after switching either — the same underlying class of issue as
+    the `title_changed`/`on_navigation_completed` render gap described just below (both are `bump.invoke(())`
+    silently failing to produce a render), just affecting page visibility instead of the title chip. Worked
+    around at the time (not fixed), by seeding every fixture case as an already-open page in the profile's
+    session before launch (`seed-fixture-session.ps1`, since deleted) — so the driver only ever needed
+    `switch_to` between already-open pages (confirmed reliable) rather than `do_add_page` (confirmed to
+    reproduce the *original*, now-fixed deadlock's sibling bug: a *brand-new* page's first-ever visibility
+    application is exactly as unreliable) — plus a "nudge" (an extra harmless click) and a generous wait;
+    still not 100% deterministic run to run at the time. **Later root-caused and actually fixed** (see the
+    `bump`/`generation` entry just below) — not independently re-verified against this specific visibility-
+    toggle symptom afterward, but the fix is a real, general one (every `bump.invoke(())` call site, not a
+    per-symptom patch), so it should have resolved this the same way.
+- `browser-windows-reactor`: root-caused and fixed the `bump`/`generation` render-scheduling bug referenced
+  above (previously misdiagnosed as a `WebView2`-callback-thread/`DispatcherQueue` marshaling problem — it
+  wasn't). Found while wiring the `--test-command-port`-only `is_user_initiated()` bypass needed for
+  `opener-default`/`opener-explicit-opener` to open real popups under `click_js`: even with that bypass in
+  place, a popup's own `webview(..)` element never mounted at all. Read `windows-reactor`'s own vendored
+  source (not just its docs) and confirmed with direct VM tracing (thread ids, `render_state` transitions):
+  `bump`'s target generation value used to be a snapshot captured once, when a page's `on_ready`-registered
+  closures (`reflect`, `title_changed`, `new_window_requested`) were built, and reactor's own `SetState::call`
+  silently no-ops when given a value equal to the current one — so whichever of those closures' `bump` fired
+  first would win, and every other one still holding that same now-stale snapshot would silently do nothing
+  at all, forever, no matter how many times it was retried. Fixed by making `bump` write a process-wide
+  monotonic counter instead of a captured snapshot, so every `bump.invoke(())` call always writes a genuinely
+  new value regardless of which render's closure is calling it or how stale that closure's own captures are.
+  Also gave `browser-windows-reactor` `--incognito`/ephemeral-profile support (mirroring `browser-linux-gtk3`'s)
+  and launches every `web-standards-driver-windows` case under it — otherwise one case's own
+  continuous-session-sync writes leaked into the next case's freshly spawned process via `session.json` on
+  restore, including a stray `console.log` from a restored popup page re-navigating on its own. Verified:
+  both opener fixtures PASS for real in the VM, gtk3 44/44, real macOS hardware both opener cases PASS.
 - Unified search/URL bar (`browser-core` + `browser-linux-gtk3`) — the switcher grid's separate search box is
   gone; the toolbar address bar now doubles as the switcher's search box while it's open (cleared/focused on
   open, filters the grid on every keystroke, Enter does the switcher's search-activate behavior), and is
@@ -1122,29 +1143,6 @@ confirmed via `execute_script`.
   history bullet above, deliberately deferred there as "a smaller, separate follow-up."
 - `browser-windows-reactor`: bookmarks, matching what `browser-linux-gtk3`/`browser-macos-appkit` have (the
   unified search/URL bar landed on this front end too — see "Done" above).
-- `browser-windows-reactor`: `WebView2` native event callbacks (`on_document_title_changed`,
-  `on_navigation_completed`) don't reliably produce a new render when they call a state setter/`Callback`
-  from inside the callback — confirmed by direct `trace()`-logged testing in the real VM: the state (e.g.
-  `Page::title`) updates correctly and the callback genuinely fires, but the toolbar doesn't visually reflect
-  it until some other, real UI-thread-originated event (a click, a keyboard accelerator) forces the next
-  render, which then picks up the already-correct value. Most visible today on the toolbar's title chip
-  (freshly-loaded pages can sit on the "New Page" fallback until *something else* happens), but likely
-  affects anything relying on a `WebView2` callback's own `bump`/state-setter call to be the trigger. Root
-  cause is very likely that these native callbacks don't run on whatever thread/message-loop tick
-  `windows-reactor`'s own dispatch relies on to notice a state update; a real fix likely means marshaling
-  through a `DispatcherQueue` (real APIs for this exist in `windows-reactor`'s own `host.rs`, e.g.
-  `DispatcherQueue::GetForCurrentThread()` + `TryEnqueueWithPriority`) — captured on the UI thread at startup
-  and threaded down to `page_element`, which is a bigger, riskier change than the pass that found this had
-  scope for. **Confirmed to be a bigger blast radius than title-only**: the web-standards test suite work
-  (see "Done" above) found the exact same class of gap also affects a newly-*activated* page's XAML
-  visibility toggle, not just the title chip — a real, still-open reliability issue for anything driving this
-  front end via synthetic UI interaction, worked around there (not fixed) with a same-page-already-open
-  strategy plus an extra "nudge" click. The `DispatcherQueue`/`TryEnqueueWithPriority` fix sketched above is
-  now a real, non-speculative fix for `add_script_to_execute_on_document_created`'s *separate* deadlock bug
-  too (see that entry) — `xaml_interop::defer_to_next_tick`, added there via raw `SetTimer`/`WM_TIMER` instead
-  since `DispatcherQueue` itself isn't reachable through any of this crate's current public dependencies, is
-  the same fix in spirit; revisiting with the real `DispatcherQueue` API (if a future `windows-reactor`
-  version exports it) could plausibly fix this visibility gap the same way.
 - Other external password managers beyond Bitwarden/Vaultwarden (see "Done" above for that one) — KeePassXC/
   secret-service, 1Password, etc. Each would be its own `PasswordBackend` impl; no shared "generic external
   manager" abstraction beyond the trait itself is needed until a second one is actually built.
@@ -1185,3 +1183,10 @@ confirmed via `execute_script`.
   with `decide_vault_unlock_action`'s "one passphrase, both stores" UX or would need to change it.
 - A real semantic embedding for vector search (swapping in a local ML model or a network embedding API in
   place of the current lexical hashing-trick embedding) — see `summaries/vector-search.md`'s "Scope notes."
+- Investigate bidirectional JSON-RPC over stdio as a way to host extension backends. Look into simple,
+  cross-platform sandboxing options for constraining what an extension process can reach (filesystem,
+  network, etc.) — not yet researched.
+- Investigate secure cross-platform RPC for talking between webviews and built-in browser services,
+  including extension backends — not yet researched.
+- Consider moving all UI that isn't part of the toolbar into the webview itself, using RPC to expose
+  whatever native calls that UI needs — not yet researched; depends on the RPC work above.
