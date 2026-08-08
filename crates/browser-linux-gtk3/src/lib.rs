@@ -79,6 +79,11 @@ pub struct AppState {
     /// approach, and guarantees the profile list/current profile it shows
     /// is never stale.
     profile_menu_engine: RefCell<Option<WryEngine>>,
+    /// Anchored to the passwords toolbar button — `show_credential_picker_popover`
+    /// pops it up with plain GTK rows (no webview, unlike the profile menu)
+    /// when the active page's domain has more than one saved login to
+    /// choose from. See `fill_credentials_for_active_page`.
+    credential_picker_popover: gtk::Popover,
     keybindings: RefCell<Keybindings>,
     /// The toolbar star-toggle button, so its icon can be refreshed whenever
     /// the active page changes or a bookmark is added/removed for it.
@@ -879,15 +884,21 @@ impl AppState {
         self.refresh_bookmark_toggle_button();
     }
 
-    /// Resolves the vault's unlock/setup state (see
-    /// `decide_vault_unlock_action`'s doc comment) — opening this might mean
+    /// The passwords toolbar button's/`OpenPasswords` keybinding's target —
+    /// resolves the vault's unlock/setup state (see
+    /// `decide_vault_unlock_action`'s doc comment) first, which might mean
     /// silently reusing an already-known passphrase, silently establishing a
-    /// brand new vault under one, or genuinely needing a prompt. If the
-    /// vault ends up unlocked (silently, or was already), navigates
-    /// straight to `browser://passwords` — real browsing/editing of saved
-    /// logins lives there now, not in this overlay. Only when a real prompt
-    /// is still needed does `passwords_panel` actually show, rendering just
-    /// that prompt (see `rebuild_passwords_panel`).
+    /// brand new vault under one, or genuinely needing a prompt (only then
+    /// does `passwords_panel` actually show, rendering just that prompt —
+    /// see `rebuild_passwords_panel`). Once the vault is (or already was)
+    /// unlocked, this is an **autofill** action for the *active page*, not
+    /// "browse everything" — see `fill_credentials_for_active_page`.
+    /// Browsing/editing every saved login lives at `browser://passwords`
+    /// now, reached only via the avatar menu's Passwords link
+    /// (`navigation.open_passwords`) or a bookmark, deliberately not from
+    /// here: autofill needs the page you're actually trying to log into
+    /// still active, which navigating away from it to a full "all passwords"
+    /// page would defeat entirely.
     pub fn open_passwords(self: &Rc<Self>) {
         self.close_switcher();
 
@@ -908,11 +919,63 @@ impl AppState {
         }
 
         if matches!(*self.passwords.borrow(), VaultState::Unlocked(_)) {
-            self.close_passwords();
-            self.open_or_focus_internal_page(browser_chrome_core::internal_pages::PASSWORDS);
+            self.fill_credentials_for_active_page();
             return;
         }
         self.show_passwords_panel();
+    }
+
+    /// The real autofill action once the vault is known to be unlocked:
+    /// matches the active page's domain against every saved login with a
+    /// password (`fill_active_page_with_login` itself re-checks the domain
+    /// too — this is just what picks *which* entry to try). Exactly one
+    /// match fills it directly, no UI at all; more than one shows a small
+    /// native picker (`credential_picker_popover`) to choose from; zero
+    /// matches is a silent no-op, same as clicking a native browser's
+    /// autofill icon on a page it has nothing saved for.
+    fn fill_credentials_for_active_page(self: &Rc<Self>) {
+        let active_domain = self.core.borrow().active().map(|p| domain_of(&p.current_url()));
+        let Some(domain) = active_domain else { return };
+        let matches: Vec<browser_core::Login> = match &*self.passwords.borrow() {
+            VaultState::Unlocked(store) => {
+                store.list().unwrap_or_default().into_iter().filter(|entry| entry.domain == domain && entry.password.is_some()).collect()
+            }
+            VaultState::Locked | VaultState::NotSetUp => Vec::new(),
+        };
+        match matches.as_slice() {
+            [] => {}
+            [only] => self.fill_active_page_with_login(only),
+            _ => self.show_credential_picker_popover(&matches),
+        }
+    }
+
+    /// Lists `matches` (more than one saved login for the active page's
+    /// domain) in a small popover anchored to the passwords toolbar button —
+    /// same native `gtk::Popover` mechanism as `show_profile_menu`, just
+    /// plain GTK widgets this time (no webview needed for a 2-3-row pick
+    /// list). Picking one fills it and dismisses the popover.
+    fn show_credential_picker_popover(self: &Rc<Self>, matches: &[browser_core::Login]) {
+        for child in self.credential_picker_popover.children() {
+            self.credential_picker_popover.remove(&child);
+        }
+
+        let list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        list_box.set_margin(8);
+        for entry in matches {
+            let row = gtk::Button::with_label(&format!("{} \u{2014} {}", entry.domain, entry.username));
+            row.style_context().add_class("flat");
+            let app_clone = Rc::clone(self);
+            let entry_clone = entry.clone();
+            row.connect_clicked(move |_| {
+                app_clone.fill_active_page_with_login(&entry_clone);
+                app_clone.credential_picker_popover.popdown();
+            });
+            list_box.pack_start(&row, false, false, 0);
+        }
+
+        self.credential_picker_popover.add(&list_box);
+        list_box.show_all();
+        self.credential_picker_popover.popup();
     }
 
     /// Tries to open the vault with `passphrase`, updating `self.passwords`/
@@ -1009,6 +1072,12 @@ impl AppState {
     /// inspection helper.
     pub fn is_profile_menu_open(&self) -> bool {
         self.profile_menu_popover.is_visible()
+    }
+
+    /// Whether the multi-match credential picker popover is currently
+    /// shown — test/inspection helper.
+    pub fn is_credential_picker_open(&self) -> bool {
+        self.credential_picker_popover.is_visible()
     }
 
     /// The passwords toolbar button's target — see `toggle_settings`.
@@ -2112,7 +2181,10 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         Some("dialog-password-symbolic"),
         gtk::IconSize::Button,
     )));
-    passwords_button.set_tooltip_text(Some("Password manager"));
+    passwords_button.set_tooltip_text(Some("Fill saved password"));
+    // Anchored here once; `show_credential_picker_popover` gives it fresh
+    // rows on each open when there's more than one match to choose from.
+    let credential_picker_popover = gtk::Popover::new(Some(&passwords_button));
     for button in [
         &back_button,
         &forward_button,
@@ -2326,6 +2398,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         theme_provider: theme_provider.clone(),
         profile_menu_popover: profile_menu_popover.clone(),
         profile_menu_engine: RefCell::new(None),
+        credential_picker_popover: credential_picker_popover.clone(),
         keybindings: RefCell::new(Keybindings::load(&profile)),
         bookmark_toggle_button: bookmark_toggle_button.clone(),
         bookmarks: RefCell::new(bookmarks),

@@ -1048,7 +1048,7 @@ fn bookmarks_toggle_for_active_page() {
 }
 
 #[test]
-fn password_vault_setup_navigates_to_the_real_passwords_page_once_unlocked() {
+fn password_vault_setup_then_autofill_for_the_active_page() {
     run_on_gtk_thread(|| {
         let profile = test_profile("password-vault-basics");
         let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
@@ -1063,20 +1063,45 @@ fn password_vault_setup_navigates_to_the_real_passwords_page_once_unlocked() {
         );
         assert!(profile.has_vault_passphrase(), "setting up the vault should mark the profile as vault-protected");
 
-        app.add_password_for_test("https://example.com", "alice", "hunter2", "personal account");
-        app.add_password_for_test("https://example.com", "bob", "letmein", "");
-        assert_eq!(
-            app.password_vault_usernames(),
-            vec!["bob".to_string(), "alice".to_string()],
-            "most-recently-added credential should list first"
-        );
+        let login_url = fixture_url("login_form.html");
+        app.add_page(&login_url).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(login_url.as_str())));
+        app.add_password_for_test(&login_url, "alice", "hunter2", "personal account");
+        assert_eq!(app.password_vault_usernames(), vec!["alice".to_string()]);
 
-        // Once the vault is unlocked, open_passwords navigates to the real
-        // browser://passwords page instead of showing the (now unlock-only)
-        // overlay — see AppState::open_passwords's own doc comment.
+        // Once the vault is unlocked, open_passwords is a real autofill
+        // action for the *active* page, not "browse everything" — see
+        // AppState::open_passwords's own doc comment. Exactly one saved
+        // login matches this page's domain, so it should fill directly,
+        // no picker UI at all.
         app.open_passwords();
-        assert!(!app.is_passwords_open(), "the overlay should close once the vault is unlocked, not linger");
-        assert!(wait_until(|| app.active_url().is_some_and(|url| url.contains("/passwords/index.html"))));
+        assert!(!app.is_passwords_open(), "the unlock overlay should never show once the vault is already unlocked");
+        assert!(!app.is_credential_picker_open(), "a single match should fill directly, not show the multi-match picker");
+        assert!(wait_until_login_form_shows(&app, "alice|hunter2"), "the single matching login should be filled directly");
+
+        cleanup_test_profile(&profile);
+    });
+}
+
+#[test]
+fn password_vault_shows_a_picker_popover_for_multiple_matches() {
+    run_on_gtk_thread(|| {
+        let profile = test_profile("password-vault-multi-match");
+        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
+        assert!(app.try_open_vault_with("correct horse battery staple", true));
+
+        let login_url = fixture_url("login_form.html");
+        app.add_page(&login_url).expect("add_page should succeed");
+        assert!(wait_until(|| app.active_url().as_deref() == Some(login_url.as_str())));
+        // Both share the same (empty, for a file:// URL — see the
+        // credential_fill tests' own comment on this) domain, so both
+        // match the active page.
+        app.add_password_for_test(&login_url, "alice", "hunter2", "");
+        app.add_password_for_test(&login_url, "bob", "letmein", "");
+
+        app.open_passwords();
+        assert!(app.is_credential_picker_open(), "more than one matching login should show the picker popover, not guess which one to fill");
+        assert!(wait_until_login_form_shows(&app, "|"), "neither login should have been filled yet");
 
         cleanup_test_profile(&profile);
     });
@@ -1096,14 +1121,13 @@ fn password_vault_reuses_an_already_known_passphrase_with_no_second_prompt() {
         app.note_unlocked_with_passphrase("shared passphrase");
 
         // Opening the vault for the first time should silently establish it
-        // under the *same* passphrase — straight to the real passwords
-        // page, no prompt-completion step needed (unlike the test above,
-        // which simulates completing a real prompt since no passphrase was
-        // known yet in that scenario).
+        // under the *same* passphrase — no unlock-prompt overlay at all,
+        // unlike a real prompt-completion flow (there's nothing to fill yet
+        // here, so no autofill assertion — that's the test above's job).
         app.open_passwords();
         assert!(
-            wait_until(|| app.active_url().is_some_and(|url| url.contains("/passwords/index.html"))),
-            "a passphrase already known this session should silently unlock/set up the vault and navigate straight there, not prompt for a new one"
+            !app.is_passwords_open(),
+            "a passphrase already known this session should silently unlock/set up the vault, not show a prompt"
         );
         assert!(profile.has_vault_passphrase(), "opening the vault should have set up its own marker under the shared passphrase");
 
