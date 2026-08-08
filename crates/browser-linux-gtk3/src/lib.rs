@@ -2078,11 +2078,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         Some("view-grid-symbolic"),
         gtk::IconSize::Button,
     )));
-    let settings_button = gtk::Button::new();
-    settings_button.set_image(Some(&gtk::Image::from_icon_name(
-        Some("preferences-system-symbolic"),
-        gtk::IconSize::Button,
-    )));
     let profile_button = gtk::Button::new();
     profile_button.set_image(Some(&gtk::Image::from_icon_name(
         Some("avatar-default-symbolic"),
@@ -2123,7 +2118,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         &forward_button,
         &reload_button,
         &switcher_toggle,
-        &settings_button,
         &profile_button,
         &bookmark_toggle_button,
         &screenshot_button,
@@ -2176,7 +2170,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     header_bar.set_custom_title(Some(&address_group));
 
     header_bar.pack_end(&switcher_toggle);
-    header_bar.pack_end(&settings_button);
     header_bar.pack_end(&profile_button);
     header_bar.pack_end(&screenshot_button);
     header_bar.pack_end(&reader_mode_button);
@@ -2540,12 +2533,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         let app = Rc::clone(&app);
         switcher_close_button.connect_clicked(move |_| {
             app.close_switcher();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        settings_button.connect_clicked(move |_| {
-            app.open_or_focus_internal_page(browser_chrome_core::internal_pages::PROFILE);
         });
     }
     {
