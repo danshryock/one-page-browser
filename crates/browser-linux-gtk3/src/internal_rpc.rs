@@ -21,10 +21,10 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
 
-use browser_chrome_core::{RpcBody, RpcHandler};
+use browser_chrome_core::{internal_pages, RpcBody, RpcHandler};
 use browser_core::{
     domain_of, launch_new_encrypted_profile_process, launch_new_ephemeral_process, launch_new_profile_process, list_profile_names,
-    palette_color_for, Action, BitwardenStatus, Login, PasswordBackend, Theme,
+    palette_color_for, Action, BitwardenStatus, KeyChord, Login, LoginFields, PasswordBackend, Theme,
 };
 use rpc_protocol::RpcError;
 use serde_json::{json, Value};
@@ -56,8 +56,15 @@ const METHODS: &[&str] = &[
     "profile.password_managers.connect_bitwarden",
     "profile.password_managers.disconnect_bitwarden",
     "profile.keybindings.list",
+    "profile.keybindings.set_bindings",
+    "switcher.remove_bookmark",
     "passwords.list",
     "passwords.reveal",
+    "passwords.add",
+    "passwords.update",
+    "passwords.delete",
+    "navigation.open_settings",
+    "navigation.open_passwords",
 ];
 
 /// Builds the complete method registry for `WebviewRpcServer::start` — see
@@ -132,8 +139,15 @@ fn dispatch(app: &Rc<AppState>, method: &str, params: &Value) -> Result<Value, R
         "profile.password_managers.connect_bitwarden" => password_managers_connect_bitwarden(app, params),
         "profile.password_managers.disconnect_bitwarden" => password_managers_disconnect_bitwarden(app),
         "profile.keybindings.list" => keybindings_list(app),
+        "profile.keybindings.set_bindings" => keybindings_set_bindings(app, params),
+        "switcher.remove_bookmark" => switcher_remove_bookmark(app, params),
         "passwords.list" => passwords_list(app),
         "passwords.reveal" => passwords_reveal(app, params),
+        "passwords.add" => passwords_add(app, params),
+        "passwords.update" => passwords_update(app, params),
+        "passwords.delete" => passwords_delete(app, params),
+        "navigation.open_settings" => navigation_open_settings(app),
+        "navigation.open_passwords" => navigation_open_passwords(app),
         _ => Err(rpc_err(format!("unknown internal method {method:?}"))),
     }
 }
@@ -287,11 +301,127 @@ fn keybindings_list(app: &Rc<AppState>) -> Result<Value, RpcError> {
     let bindings: Vec<Value> = Action::ALL
         .iter()
         .map(|action| {
-            let chords: Vec<String> = keybindings.bindings_for(*action).iter().map(|chord| chord.to_string()).collect();
-            json!({ "label": action.label(), "chords": chords })
+            let chords: Vec<Value> = keybindings.bindings_for(*action).iter().map(chord_to_json).collect();
+            // `serde_json::to_value` on a fieldless enum like `Action` (external
+            // tagging, the serde default) serializes to its bare variant name —
+            // exactly the string `keybindings_set_bindings` parses back with
+            // `serde_json::from_value::<Action>`, so the two stay in sync by
+            // construction rather than a hand-maintained name list on each side.
+            let action_name = serde_json::to_value(action).expect("Action always serializes");
+            json!({ "action": action_name, "label": action.label(), "chords": chords })
         })
         .collect();
     Ok(json!({ "bindings": bindings }))
+}
+
+fn chord_to_json(chord: &KeyChord) -> Value {
+    json!({ "ctrl": chord.ctrl, "alt": chord.alt, "shift": chord.shift, "key": chord.key, "display": chord.to_string() })
+}
+
+/// Replaces one action's chords wholesale — the web Keyboard Shortcuts
+/// editor's add/remove both do a full read-modify-write of the current list,
+/// same as the native keybindings editor this replaces (see `Keybindings::
+/// set_bindings`'s own doc comment).
+fn keybindings_set_bindings(app: &Rc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    let action_value = params.get("action").ok_or_else(|| rpc_err("missing \"action\""))?;
+    let action: Action = serde_json::from_value(action_value.clone()).map_err(|err| rpc_err(format!("invalid action: {err}")))?;
+    let chords_value = params.get("chords").and_then(Value::as_array).ok_or_else(|| rpc_err("missing \"chords\" array"))?;
+    let chords: Vec<KeyChord> = chords_value
+        .iter()
+        .map(|c| {
+            let ctrl = c.get("ctrl").and_then(Value::as_bool).unwrap_or(false);
+            let alt = c.get("alt").and_then(Value::as_bool).unwrap_or(false);
+            let shift = c.get("shift").and_then(Value::as_bool).unwrap_or(false);
+            let key = c.get("key").and_then(Value::as_str).unwrap_or("").to_string();
+            KeyChord::new(ctrl, alt, shift, key)
+        })
+        .collect();
+
+    app.keybindings.borrow_mut().set_bindings(action, chords);
+    app.keybindings.borrow().save(&app.profile).map_err(|err| rpc_err(format!("failed to save keybindings: {err}")))?;
+    Ok(json!({}))
+}
+
+fn switcher_remove_bookmark(app: &Rc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    let url = param_str(params, "url").ok_or_else(|| rpc_err("missing \"url\""))?;
+    app.bookmarks.borrow_mut().remove(url);
+    app.bookmarks.borrow().save(&app.profile).map_err(|err| rpc_err(format!("failed to save bookmarks: {err}")))?;
+    Ok(json!({}))
+}
+
+fn login_fields_from_params(params: &Value) -> Result<LoginFields, RpcError> {
+    let site = param_str(params, "site").ok_or_else(|| rpc_err("missing \"site\""))?.to_string();
+    let username = param_str(params, "username").unwrap_or("").to_string();
+    let password = param_str(params, "password").filter(|p| !p.is_empty()).map(str::to_string);
+    let notes = param_str(params, "notes").unwrap_or("").to_string();
+    Ok(LoginFields { site, username, password, passkey: None, notes })
+}
+
+fn passwords_add(app: &Rc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    let fields = login_fields_from_params(params)?;
+    let source = param_str(params, "source").unwrap_or("browser");
+    if source == "bitwarden" {
+        let backend = app.bitwarden_backend().ok_or_else(|| rpc_err("Bitwarden isn't connected"))?;
+        backend.add(fields).map_err(|err| rpc_err(format!("failed to add Bitwarden login: {err}")))?;
+    } else {
+        match &*app.passwords.borrow() {
+            VaultState::Unlocked(store) => {
+                store.add(fields).map_err(|err| rpc_err(format!("failed to add login: {err}")))?;
+            }
+            VaultState::Locked | VaultState::NotSetUp => return Err(rpc_err("the password vault is locked")),
+        }
+    }
+    Ok(json!({}))
+}
+
+fn passwords_update(app: &Rc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    let id = param_str(params, "id").ok_or_else(|| rpc_err("missing \"id\""))?;
+    let fields = login_fields_from_params(params)?;
+    let source = param_str(params, "source").unwrap_or("browser");
+    if source == "bitwarden" {
+        let backend = app.bitwarden_backend().ok_or_else(|| rpc_err("Bitwarden isn't connected"))?;
+        backend.update(id, fields).map_err(|err| rpc_err(format!("failed to update Bitwarden login: {err}")))?;
+    } else {
+        match &*app.passwords.borrow() {
+            VaultState::Unlocked(store) => {
+                store.update(id, fields).map_err(|err| rpc_err(format!("failed to update login: {err}")))?;
+            }
+            VaultState::Locked | VaultState::NotSetUp => return Err(rpc_err("the password vault is locked")),
+        }
+    }
+    Ok(json!({}))
+}
+
+fn passwords_delete(app: &Rc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    let id = param_str(params, "id").ok_or_else(|| rpc_err("missing \"id\""))?;
+    let source = param_str(params, "source").unwrap_or("browser");
+    if source == "bitwarden" {
+        let backend = app.bitwarden_backend().ok_or_else(|| rpc_err("Bitwarden isn't connected"))?;
+        backend.delete(id).map_err(|err| rpc_err(format!("failed to delete Bitwarden login: {err}")))?;
+    } else {
+        match &*app.passwords.borrow() {
+            VaultState::Unlocked(store) => {
+                store.delete(id).map_err(|err| rpc_err(format!("failed to delete login: {err}")))?;
+            }
+            VaultState::Locked | VaultState::NotSetUp => return Err(rpc_err("the password vault is locked")),
+        }
+    }
+    Ok(json!({}))
+}
+
+/// The profile-menu popover's Settings/Passwords links call these instead of
+/// navigating themselves: a page inside a small popover webview has no way
+/// to tell the host to navigate the *real* active page other than RPC. Both
+/// just forward to the same singleton-focus-or-open logic the (native)
+/// toolbar buttons use directly — see `AppState::open_or_focus_internal_page`.
+fn navigation_open_settings(app: &Rc<AppState>) -> Result<Value, RpcError> {
+    app.open_or_focus_internal_page(internal_pages::PROFILE);
+    Ok(json!({}))
+}
+
+fn navigation_open_passwords(app: &Rc<AppState>) -> Result<Value, RpcError> {
+    app.open_or_focus_internal_page(internal_pages::PASSWORDS);
+    Ok(json!({}))
 }
 
 fn passwords_list(app: &Rc<AppState>) -> Result<Value, RpcError> {

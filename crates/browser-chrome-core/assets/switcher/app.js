@@ -7,7 +7,8 @@ let openPages = [];
 let bookmarks = [];
 let history = [];
 
-function rowHtml({ swatchColor, title, sub, closable, id }) {
+function rowHtml({ swatchColor, title, sub, action, id }) {
+  const button = action ? `<button class="iconbtn close-page-btn" data-action="${action}">✕</button>` : "";
   return `
     <div class="listrow" data-id="${escapeHtml(id)}">
       <div class="swatch" style="background:${escapeHtml(swatchColor)}"></div>
@@ -15,25 +16,25 @@ function rowHtml({ swatchColor, title, sub, closable, id }) {
         <div class="row-title">${escapeHtml(title)}</div>
         <div class="row-sub">${escapeHtml(sub)}</div>
       </div>
-      ${closable ? '<button class="iconbtn close-page-btn" data-action="close">✕</button>' : ""}
+      ${button}
     </div>`;
 }
 
-function renderColumn(elementId, items, closable) {
+function renderColumn(elementId, items, action) {
   const el = document.getElementById(elementId);
   if (items.length === 0) {
     el.innerHTML = '<div class="empty-state">Nothing here yet.</div>';
     return;
   }
   el.innerHTML = items
-    .map((item) => rowHtml({ swatchColor: item.color, title: item.title, sub: item.sub, closable, id: item.id }))
+    .map((item) => rowHtml({ swatchColor: item.color, title: item.title, sub: item.sub, action, id: item.id }))
     .join("");
 }
 
 function renderAll() {
-  renderColumn("open-rows", openPages.map((p) => ({ id: p.id, color: p.color, title: p.title, sub: p.url })), true);
-  renderColumn("bookmarks-rows", bookmarks.map((b) => ({ id: b.url, color: b.color, title: b.title, sub: b.domain })), false);
-  renderColumn("history-rows", history.map((h) => ({ id: h.url, color: h.color, title: h.title, sub: h.domain })), false);
+  renderColumn("open-rows", openPages.map((p) => ({ id: p.id, color: p.color, title: p.title, sub: p.url })), "close");
+  renderColumn("bookmarks-rows", bookmarks.map((b) => ({ id: b.url, color: b.color, title: b.title, sub: b.domain })), "remove-bookmark");
+  renderColumn("history-rows", history.map((h) => ({ id: h.url, color: h.color, title: h.title, sub: h.domain })), null);
 }
 
 async function loadAll(query) {
@@ -72,11 +73,17 @@ document.getElementById("search").addEventListener("input", (event) => {
 
 document.getElementById("columns").addEventListener("click", (event) => {
   const closeBtn = event.target.closest('[data-action="close"]');
+  const removeBookmarkBtn = event.target.closest('[data-action="remove-bookmark"]');
   const row = event.target.closest(".listrow");
   if (!row) return;
   const id = row.dataset.id;
   if (closeBtn) {
     rpcCall("switcher.close_page", { id }).then(() => loadAll(document.getElementById("search").value.trim())).catch((err) => console.error(err));
+    event.stopPropagation();
+    return;
+  }
+  if (removeBookmarkBtn) {
+    rpcCall("switcher.remove_bookmark", { url: id }).then(() => loadAll(document.getElementById("search").value.trim())).catch((err) => console.error(err));
     event.stopPropagation();
     return;
   }

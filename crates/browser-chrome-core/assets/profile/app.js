@@ -242,24 +242,105 @@ function wireSearchEngines() {
   }
 }
 
-// ---- Keyboard Shortcuts section (read-only) ----
+// ---- Keyboard Shortcuts section ----
+// Chords are full objects ({ctrl,alt,shift,key,display}), not plain
+// strings — set_bindings needs the structured form back, so the display
+// string alone (what a read-only view would need) isn't enough here.
+let capturingAction = null;
+let latestBindingsByAction = {};
+
+function chordTag(action, chord) {
+  return `<span class="row-sub" style="background:var(--hover);padding:2px 6px;border-radius:5px;display:inline-flex;align-items:center;gap:4px">
+    ${escapeHtml(chord.display)}
+    <button class="iconbtn" style="width:14px;height:14px" data-remove-chord="${escapeHtml(action)}" data-chord='${escapeHtml(JSON.stringify(chord))}'>✕</button>
+  </span>`;
+}
+
 function renderShortcuts(bindings) {
   const rows = bindings
-    .map(
-      (b) => `
+    .map((b) => {
+      const isCapturing = capturingAction === b.action;
+      const addBtn = isCapturing
+        ? `<span class="row-sub" style="padding:2px 6px">Press a key…</span>`
+        : `<button class="iconbtn" data-add-chord="${escapeHtml(b.action)}" title="Add shortcut">+</button>`;
+      return `
       <div class="listrow">
         <span style="flex:1">${escapeHtml(b.label)}</span>
-        <div style="display:flex;gap:4px">
-          ${b.chords.map((chord) => `<span class="row-sub" style="background:var(--hover);padding:2px 6px;border-radius:5px">${escapeHtml(chord)}</span>`).join("") || '<span class="row-sub">unbound</span>'}
+        <div style="display:flex;gap:4px;align-items:center">
+          ${b.chords.map((chord) => chordTag(b.action, chord)).join("") || (isCapturing ? "" : '<span class="row-sub">unbound</span>')}
+          ${addBtn}
         </div>
-      </div>`
-    )
+      </div>`;
+    })
     .join("");
   return `
     <div class="section">
       <div class="sidehead section-title">Keyboard shortcuts</div>
       ${rows}
     </div>`;
+}
+
+function keyEventToChord(event) {
+  // Named keys keep their event.key value (e.g. "F1", "Escape", "ArrowLeft"
+  // trimmed to "Left" to match KeyChord's existing normalized vocabulary —
+  // see browser_core::keybindings.rs); a single printable character is
+  // uppercased to match the same normalized form every native frontend
+  // already stores ("T", not "t").
+  let key = event.key;
+  if (key.startsWith("Arrow")) key = key.slice(5);
+  else if (key.length === 1) key = key.toUpperCase();
+  return { ctrl: event.ctrlKey, alt: event.altKey, shift: event.shiftKey, key };
+}
+
+// Registered exactly once at module load (not per-render, unlike the
+// content click listener below — a re-registered `document`-level listener
+// would never get cleaned up by `innerHTML` replacement the way listeners
+// on replaced child elements do, and would silently pile up every time the
+// Keyboard Shortcuts tab is revisited).
+document.addEventListener("keydown", async (event) => {
+  if (!capturingAction) return;
+  event.preventDefault();
+  const action = capturingAction;
+  capturingAction = null;
+  // Bare Escape cancels the capture instead of binding it — the same
+  // convention as every overlay in this app already using Escape to
+  // close/cancel, not something a user would expect to rebind by accident.
+  if (event.key === "Escape" && !event.ctrlKey && !event.altKey && !event.shiftKey) {
+    await renderShortcutsSection();
+    return;
+  }
+  const chord = keyEventToChord(event);
+  const existing = latestBindingsByAction[action] || [];
+  await rpcCall("profile.keybindings.set_bindings", { action, chords: [...existing, chord] });
+  await renderShortcutsSection();
+});
+
+function wireShortcuts() {
+  const content = document.getElementById("content");
+  content.addEventListener("click", async (event) => {
+    const addBtn = event.target.closest("[data-add-chord]");
+    const removeBtn = event.target.closest("[data-remove-chord]");
+    if (addBtn) {
+      capturingAction = addBtn.dataset.addChord;
+      await renderSection();
+    } else if (removeBtn) {
+      const action = removeBtn.dataset.removeChord;
+      const chord = JSON.parse(removeBtn.dataset.chord);
+      const remaining = (latestBindingsByAction[action] || []).filter(
+        (c) => !(c.ctrl === chord.ctrl && c.alt === chord.alt && c.shift === chord.shift && c.key === chord.key)
+      );
+      await rpcCall("profile.keybindings.set_bindings", { action, chords: remaining });
+      await renderShortcutsSection();
+    }
+  });
+}
+
+async function renderShortcutsSection() {
+  const { bindings } = await rpcCall("profile.keybindings.list", {});
+  latestBindingsByAction = Object.fromEntries(bindings.map((b) => [b.action, b.chords]));
+  document.getElementById("content").innerHTML = renderShortcuts(bindings);
+  wireShortcuts();
+  console.log(`profile_section_rendered section=shortcuts`);
 }
 
 async function reloadSettings() {
@@ -282,8 +363,8 @@ async function renderSection() {
     content.innerHTML = renderSearchEngines();
     wireSearchEngines();
   } else if (activeSection === "shortcuts") {
-    const { bindings } = await rpcCall("profile.keybindings.list", {});
-    content.innerHTML = renderShortcuts(bindings);
+    await renderShortcutsSection();
+    return; // renderShortcutsSection already logs profile_section_rendered
   }
   console.log(`profile_section_rendered section=${activeSection}`);
 }

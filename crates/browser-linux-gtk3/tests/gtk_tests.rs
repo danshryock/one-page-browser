@@ -43,7 +43,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use browser_chrome_core::{embedded_assets, EmbeddedAssetServer, RpcBody, RpcHandler, WebviewRpcServer};
-use browser_core::{Action, HistoryStore, PasswordBackend, Profile};
+use browser_core::{HistoryStore, Profile};
 use enigo::MouseControllable;
 use browser_linux_gtk3::{build_window_and_app, build_window_and_app_with_history, AppState};
 use gtk::prelude::*;
@@ -825,44 +825,6 @@ fn toolbar_address_bar_resolves_search_queries() {
 }
 
 #[test]
-fn settings_overlay_mutual_exclusion_and_save() {
-    run_on_gtk_thread(|| {
-        let profile = test_profile("settings-overlay");
-        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
-        app.add_page(&fixture_url("page_a.html")).expect("add_page should succeed");
-
-        // Settings overlay: shows/hides in place of a modal dialog, is mutually
-        // exclusive with the switcher grid (both are reachable from the header
-        // bar regardless of which, if either, is currently open), pre-populates
-        // from the current Settings, and Save actually persists an edit.
-        app.open_settings();
-        assert!(app.is_settings_open(), "open_settings should show the settings overlay");
-        assert_eq!(
-            app.settings_start_page_entry_text(),
-            app.settings().start_page,
-            "open_settings should pre-populate the start-page field from current settings"
-        );
-
-        app.open_switcher();
-        assert!(!app.is_settings_open(), "opening the switcher while settings is open should close settings");
-        assert!(app.is_switcher_open(), "opening the switcher while settings is open should still open the switcher");
-        app.close_switcher();
-
-        app.open_settings();
-        app.open_settings(); // re-opening while already open should stay open, not toggle closed
-        assert!(app.is_settings_open(), "opening settings while already open should leave it open");
-
-        let edited_start_page = "https://edited-start-page.example";
-        app.set_settings_start_page(edited_start_page);
-        app.save_settings();
-        assert_eq!(app.settings().start_page, edited_start_page, "Save should persist an edited start page into Settings");
-        assert!(!app.is_settings_open(), "Save should close the settings overlay");
-
-        cleanup_test_profile(&profile);
-    });
-}
-
-#[test]
 fn every_overlay_toggle_button_closes_on_a_second_click() {
     run_on_gtk_thread(|| {
         let profile = test_profile("overlay-toggle");
@@ -879,21 +841,15 @@ fn every_overlay_toggle_button_closes_on_a_second_click() {
         app.toggle_switcher();
         assert!(!app.is_switcher_open(), "second toggle_switcher should close the switcher");
 
-        app.toggle_settings();
-        assert!(app.is_settings_open(), "first toggle_settings should open settings");
-        app.toggle_settings();
-        assert!(!app.is_settings_open(), "second toggle_settings should close settings");
-
         app.toggle_profile_picker();
         assert!(app.is_profile_picker_open(), "first toggle_profile_picker should open the profile picker");
         app.toggle_profile_picker();
         assert!(!app.is_profile_picker_open(), "second toggle_profile_picker should close the profile picker");
 
-        app.toggle_bookmarks();
-        assert!(app.is_bookmarks_open(), "first toggle_bookmarks should open bookmarks");
-        app.toggle_bookmarks();
-        assert!(!app.is_bookmarks_open(), "second toggle_bookmarks should close bookmarks");
-
+        // A fresh test profile never has a vault passphrase set up, so
+        // toggle_passwords still shows (just) the unlock/setup prompt here —
+        // browsing saved logins itself moved to browser://passwords (see
+        // open_or_focus_internal_page's own tests).
         app.toggle_passwords();
         assert!(app.is_passwords_open(), "first toggle_passwords should open the password manager");
         app.toggle_passwords();
@@ -1000,9 +956,7 @@ fn no_saved_session_falls_back_to_the_configured_start_page() {
         // suite has no real network access, and current_url() reflects the
         // real webview's URL, not just whatever was requested.
         let start_page = fixture_url("page_a.html");
-        app.open_settings();
-        app.set_settings_start_page(&start_page);
-        app.save_settings();
+        app.set_start_page_for_test(&start_page);
 
         app.open_start_page_or_restored_session();
         assert_eq!(app.page_ids().len(), 1, "a fresh profile with no saved session should open exactly the start page");
@@ -1063,7 +1017,7 @@ fn unified_address_bar_clears_on_open_and_restores_on_close() {
 }
 
 #[test]
-fn bookmarks_toggle_and_overlay() {
+fn bookmarks_toggle_for_active_page() {
     run_on_gtk_thread(|| {
         let profile = test_profile("bookmarks");
         let url_a = fixture_url("page_a.html");
@@ -1087,24 +1041,12 @@ fn bookmarks_toggle_and_overlay() {
         assert!(wait_until(|| app.active_url().as_deref() == Some(url_b.as_str())));
         assert!(!app.is_active_bookmarked(), "switching to a different, unbookmarked page shouldn't show it as bookmarked");
 
-        // The bookmarks overlay is mutually exclusive with the others, same
-        // as settings/profile-picker/keybindings.
-        app.open_settings();
-        app.open_bookmarks();
-        assert!(!app.is_settings_open(), "opening bookmarks while settings is open should close settings");
-        assert!(app.is_bookmarks_open(), "open_bookmarks should show the bookmarks overlay");
-        assert!(!app.is_background_page_interactive(), "open_bookmarks should make the background page stack insensitive");
-
-        app.close_bookmarks();
-        assert!(!app.is_bookmarks_open());
-        assert!(app.is_background_page_interactive(), "closing bookmarks should restore background page interactivity");
-
         cleanup_test_profile(&profile);
     });
 }
 
 #[test]
-fn password_vault_setup_add_and_overlay_mutual_exclusion() {
+fn password_vault_setup_navigates_to_the_real_passwords_page_once_unlocked() {
     run_on_gtk_thread(|| {
         let profile = test_profile("password-vault-basics");
         let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
@@ -1112,57 +1054,27 @@ fn password_vault_setup_add_and_overlay_mutual_exclusion() {
         assert!(app.password_vault_usernames().is_empty());
         assert!(!profile.has_vault_passphrase(), "a fresh profile shouldn't have a vault passphrase yet");
 
-        // Simulates the user completing show_vault_passphrase_prompt's
-        // setup flow.
+        // Simulates the user completing the in-overlay vault setup prompt.
         assert!(
             app.try_open_vault_with("correct horse battery staple", true),
             "setting up a fresh vault should succeed"
         );
         assert!(profile.has_vault_passphrase(), "setting up the vault should mark the profile as vault-protected");
 
-        app.add_password_via_fields("https://example.com", "alice", "hunter2", "personal account");
-        app.add_password_via_fields("https://example.com", "bob", "letmein", "");
+        app.add_password_for_test("https://example.com", "alice", "hunter2", "personal account");
+        app.add_password_for_test("https://example.com", "bob", "letmein", "");
         assert_eq!(
             app.password_vault_usernames(),
             vec!["bob".to_string(), "alice".to_string()],
             "most-recently-added credential should list first"
         );
 
-        // Mutually exclusive with the other overlays, same as bookmarks.
-        app.open_settings();
+        // Once the vault is unlocked, open_passwords navigates to the real
+        // browser://passwords page instead of showing the (now unlock-only)
+        // overlay — see AppState::open_passwords's own doc comment.
         app.open_passwords();
-        assert!(!app.is_settings_open(), "opening the password manager while settings is open should close settings");
-        assert!(app.is_passwords_open(), "open_passwords should show the password manager overlay");
-        assert!(!app.is_background_page_interactive(), "open_passwords should make the background page stack insensitive");
-
-        app.close_passwords();
-        assert!(!app.is_passwords_open());
-        assert!(app.is_background_page_interactive(), "closing the password manager should restore background page interactivity");
-
-        cleanup_test_profile(&profile);
-    });
-}
-
-#[test]
-fn password_vault_edit_updates_a_login_in_place() {
-    run_on_gtk_thread(|| {
-        let profile = test_profile("password-vault-edit");
-        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
-        assert!(app.try_open_vault_with("correct horse battery staple", true));
-
-        app.add_password_via_fields("https://example.com", "alice", "old-pw", "old notes");
-        app.add_password_via_fields("https://b.example", "bob", "pw", "");
-        assert_eq!(app.password_vault_usernames().len(), 2, "sanity check: both logins should exist before editing either");
-
-        let alice_id = app.password_vault_id_for_username("alice").expect("alice's login should exist");
-        app.start_editing_local_login(&alice_id);
-        // Editing reuses the same add form, so submitting again should
-        // update in place rather than create a third entry.
-        app.add_password_via_fields("https://example.com", "alice", "new-pw", "updated notes");
-
-        assert_eq!(app.password_vault_usernames().len(), 2, "editing shouldn't create a third entry");
-        let updated_id = app.password_vault_id_for_username("alice").expect("alice's login should still exist");
-        assert_eq!(updated_id, alice_id, "the same row should have been updated, not replaced");
+        assert!(!app.is_passwords_open(), "the overlay should close once the vault is unlocked, not linger");
+        assert!(wait_until(|| app.active_url().is_some_and(|url| url.contains("/passwords/index.html"))));
 
         cleanup_test_profile(&profile);
     });
@@ -1181,185 +1093,21 @@ fn password_vault_reuses_an_already_known_passphrase_with_no_second_prompt() {
         assert!(!profile.has_vault_passphrase());
         app.note_unlocked_with_passphrase("shared passphrase");
 
-        // Opening the vault for the first time should silently establish
-        // it under the *same* passphrase — straight to the panel, no
-        // prompt-completion step needed (unlike the test above, which
-        // simulates completing a real prompt since no passphrase was known
-        // yet in that scenario).
+        // Opening the vault for the first time should silently establish it
+        // under the *same* passphrase — straight to the real passwords
+        // page, no prompt-completion step needed (unlike the test above,
+        // which simulates completing a real prompt since no passphrase was
+        // known yet in that scenario).
         app.open_passwords();
         assert!(
-            app.is_passwords_open(),
-            "a passphrase already known this session should silently unlock/set up the vault, not prompt for a new one"
+            wait_until(|| app.active_url().is_some_and(|url| url.contains("/passwords/index.html"))),
+            "a passphrase already known this session should silently unlock/set up the vault and navigate straight there, not prompt for a new one"
         );
         assert!(profile.has_vault_passphrase(), "opening the vault should have set up its own marker under the shared passphrase");
 
-        app.add_password_via_fields("https://example.com", "alice", "hunter2", "");
+        app.add_password_for_test("https://example.com", "alice", "hunter2", "");
         assert_eq!(app.password_vault_usernames(), vec!["alice".to_string()]);
 
-        app.close_passwords();
-        assert!(!app.is_passwords_open());
-
-        cleanup_test_profile(&profile);
-    });
-}
-
-/// A fake local server standing in for `bw serve`, tracking a single
-/// locked/unlocked flag so a test can exercise the real locked → unlock →
-/// unlocked transition `rebuild_passwords_list` renders. Shuts down (via
-/// `Server::unblock`) when dropped — same technique as `browser-core`'s own
-/// `bitwarden.rs` tests, just not shared code (different crates).
-struct FakeBitwardenServer {
-    server: std::sync::Arc<tiny_http::Server>,
-    join: Option<std::thread::JoinHandle<()>>,
-    base_url: String,
-}
-
-impl Drop for FakeBitwardenServer {
-    fn drop(&mut self) {
-        self.server.unblock();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
-    }
-}
-
-/// Spawns a fake `bw serve`, stateful enough to prove edits/deletes
-/// actually persist (not just that the HTTP call didn't error): items live
-/// in a shared, mutable list seeded with one "Fake Bank / carol" login;
-/// `PUT`/`DELETE` really mutate it, and `GET /list/object/items` always
-/// reflects the current state.
-fn spawn_fake_bitwarden_server() -> FakeBitwardenServer {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
-
-    let unlocked = Arc::new(AtomicBool::new(false));
-    let items = Arc::new(Mutex::new(vec![serde_json::json!({
-        "id": "1", "type": 1, "name": "Fake Bank", "notes": "",
-        "login": {"username": "carol", "password": "pw", "uris": [{"uri": "https://fakebank.example"}]}
-    })]));
-    let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("binding a loopback test server should succeed"));
-    let addr = server.server_addr().to_ip().expect("this test server always binds an IP socket, not a unix one");
-    let base_url = format!("http://{addr}");
-    let server_for_thread = Arc::clone(&server);
-    let join = std::thread::spawn(move || {
-        while let Ok(mut request) = server_for_thread.recv() {
-            let mut body_text = String::new();
-            let _ = std::io::Read::read_to_string(request.as_reader(), &mut body_text);
-            let method = request.method().to_string();
-            let url = request.url().to_string();
-
-            let (status, body) = if method == "GET" && url == "/status" {
-                let status_str = if unlocked.load(Ordering::SeqCst) { "unlocked" } else { "locked" };
-                (200, format!(r#"{{"success":true,"data":{{"template":{{"status":"{status_str}"}}}}}}"#))
-            } else if method == "POST" && url == "/unlock" {
-                unlocked.store(true, Ordering::SeqCst);
-                (200, r#"{"success":true}"#.to_string())
-            } else if method == "GET" && url == "/list/object/items" {
-                let items = items.lock().unwrap();
-                (200, serde_json::json!({"success": true, "data": {"data": *items}}).to_string())
-            } else if method == "PUT" && url.starts_with("/object/item/") {
-                let id = url.trim_start_matches("/object/item/");
-                let sent: serde_json::Value = serde_json::from_str(&body_text).unwrap_or_default();
-                let mut items = items.lock().unwrap();
-                match items.iter_mut().find(|item| item["id"] == id) {
-                    Some(item) => {
-                        item["name"] = sent["name"].clone();
-                        item["notes"] = sent["notes"].clone();
-                        item["login"] = sent["login"].clone();
-                        (200, r#"{"success":true}"#.to_string())
-                    }
-                    None => (404, r#"{"success":false,"message":"not found"}"#.to_string()),
-                }
-            } else if method == "DELETE" && url.starts_with("/object/item/") {
-                let id = url.trim_start_matches("/object/item/");
-                items.lock().unwrap().retain(|item| item["id"] != id);
-                (200, r#"{"success":true}"#.to_string())
-            } else {
-                (404, r#"{"success":false,"message":"not found"}"#.to_string())
-            };
-            let _ = request.respond(tiny_http::Response::from_string(body).with_status_code(status));
-        }
-    });
-    FakeBitwardenServer { server, join: Some(join), base_url }
-}
-
-#[test]
-fn bitwarden_section_reflects_locked_then_unlocked_state_and_lists_its_items() {
-    run_on_gtk_thread(|| {
-        let profile = test_profile("bitwarden-section");
-        let fake_server = spawn_fake_bitwarden_server();
-        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
-
-        // open_passwords() only reaches rebuild_passwords_list (and so the
-        // Bitwarden section) once the *local* vault is past its own setup/
-        // unlock prompt — unrelated to Bitwarden, but a fresh profile has
-        // neither set up yet, so this test's own local vault needs setting
-        // up first (same as `password_vault_setup_add_and_overlay_mutual_exclusion`).
-        assert!(app.try_open_vault_with("local vault passphrase", true), "setting up the local vault should succeed");
-
-        app.open_settings();
-        app.set_bitwarden_fields(true, &fake_server.base_url);
-        app.save_settings();
-
-        app.open_passwords();
-        assert!(
-            app.passwords_list_contains_text("Bitwarden is locked"),
-            "the Bitwarden section should show the locked state before unlocking"
-        );
-        assert!(!app.passwords_list_contains_text("carol"), "a locked Bitwarden shouldn't list any items yet");
-
-        // Drives the real backend the same way `show_bitwarden_unlock_prompt`
-        // would, minus its own GTK widgets — same "drive AppState/backend
-        // methods directly" approach the vault's own tests use.
-        app.bitwarden_backend().expect("Bitwarden should be enabled").unlock("anything").expect("the fake server always accepts unlock");
-
-        app.open_passwords(); // re-renders the list against the now-unlocked fake server
-        assert!(app.passwords_list_contains_text("carol"), "the fake server's item should show up in the Bitwarden section once unlocked");
-        assert!(app.passwords_list_contains_text("fakebank.example"));
-
-        app.close_passwords();
-        cleanup_test_profile(&profile);
-    });
-}
-
-#[test]
-fn bitwarden_edit_and_delete_round_trip_through_the_fake_server() {
-    run_on_gtk_thread(|| {
-        let profile = test_profile("bitwarden-edit-delete");
-        let fake_server = spawn_fake_bitwarden_server();
-        // Bitwarden rows only render once the *local* vault is past its own
-        // setup prompt — see the equivalent comment in the locked/unlocked
-        // test above.
-        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
-        assert!(app.try_open_vault_with("local vault passphrase", true));
-
-        app.open_settings();
-        app.set_bitwarden_fields(true, &fake_server.base_url);
-        app.save_settings();
-
-        let backend = app.bitwarden_backend().expect("Bitwarden should be enabled");
-        backend.unlock("anything").expect("the fake server always accepts unlock");
-
-        // Edit: same "reuse the add form" flow as the local-vault edit test,
-        // just targeting the Bitwarden row instead.
-        app.open_passwords();
-        assert!(app.passwords_list_contains_text("carol"));
-        app.start_editing_bitwarden_login("1");
-        app.add_password_via_fields("https://fakebank.example", "carol-updated", "new-pw", "");
-
-        app.open_passwords(); // re-render against the fake server's now-updated state
-        assert!(app.passwords_list_contains_text("carol-updated"), "the edit should have persisted through PUT /object/item/1");
-        let entries = backend.list().unwrap();
-        assert_eq!(entries.len(), 1, "editing shouldn't create a second item");
-        assert_eq!(entries[0].username, "carol-updated", "the update should have replaced the username, not just added text alongside it");
-        assert_eq!(entries[0].password.as_deref(), Some("new-pw"));
-
-        // Delete.
-        assert_eq!(backend.list().unwrap().len(), 1, "sanity check: exactly one Bitwarden item before deleting it");
-        app.delete_bitwarden_login_for_test("1");
-        assert!(backend.list().unwrap().is_empty(), "DELETE /object/item/1 should have removed it from the fake server");
-
-        app.close_passwords();
         cleanup_test_profile(&profile);
     });
 }
@@ -1412,7 +1160,7 @@ fn credential_fill_populates_the_pages_login_form() {
         // on both sides — using the exact same URL for the login's `site`
         // as the page actually open keeps the domain-match check consistent
         // regardless of what `domain_of` returns for this scheme.
-        app.add_password_via_fields(&login_url, "alice", "hunter2", "");
+        app.add_password_for_test(&login_url, "alice", "hunter2", "");
 
         app.fill_active_page_with_local_login("alice");
         assert!(wait_until_login_form_shows(&app, "alice|hunter2"), "the login form's fields should reflect the filled values");
@@ -1438,7 +1186,7 @@ fn credential_fill_prefers_autocomplete_attributes_over_position() {
         app.add_page(&login_url).expect("add_page should succeed");
         assert!(wait_until(|| app.active_url().as_deref() == Some(login_url.as_str())));
 
-        app.add_password_via_fields(&login_url, "alice", "hunter2", "");
+        app.add_password_for_test(&login_url, "alice", "hunter2", "");
         app.fill_active_page_with_local_login("alice");
         assert!(
             wait_until_login_form_shows(&app, "alice|hunter2"),
@@ -1463,7 +1211,7 @@ fn credential_fill_does_nothing_when_the_logins_domain_doesnt_match_the_active_p
         // A real (non-empty-domain) site, deliberately not the active
         // page's own — the fill should be refused, not just unfilled by
         // coincidence.
-        app.add_password_via_fields("https://not-the-active-page.example", "mallory", "shouldnt-appear", "");
+        app.add_password_for_test("https://not-the-active-page.example", "mallory", "shouldnt-appear", "");
 
         app.fill_active_page_with_local_login("mallory");
         // There's nothing to positively wait for here (a fill that correctly
@@ -1643,73 +1391,13 @@ fn ephemeral_profile_never_persists_and_marks_the_window_private() {
         app.toggle_bookmark_for_active();
         assert!(app.is_active_bookmarked(), "bookmarking should still work in-memory for the session");
 
-        app.set_settings_start_page("https://should-not-persist.example");
-        app.save_settings();
+        app.set_start_page_for_test("https://should-not-persist.example");
 
         // None of that should ever touch disk — an ephemeral profile never
         // gets a directory of its own at all, unlike a real named profile.
         assert!(profile.settings_path().map(|p| !p.exists()).unwrap_or(true), "settings should never be written to disk");
         assert!(profile.bookmarks_path().map(|p| !p.exists()).unwrap_or(true), "bookmarks should never be written to disk");
         assert!(profile.keybindings_path().map(|p| !p.exists()).unwrap_or(true), "keybindings should never be written to disk");
-    });
-}
-
-#[test]
-fn keybindings_editor_lives_inside_settings() {
-    run_on_gtk_thread(|| {
-        let profile = test_profile("keybindings-in-settings");
-        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
-
-        // The keybindings editor is no longer its own overlay/toolbar
-        // button — it's folded into settings, rebuilt every time settings
-        // opens, one row per Action::ALL.
-        app.open_settings();
-        assert!(app.is_settings_open());
-        assert_eq!(
-            app.keybindings_row_count(),
-            Action::ALL.len(),
-            "opening settings should populate the keybindings editor with one row per action"
-        );
-
-        app.close_settings();
-        assert!(!app.is_settings_open());
-
-        cleanup_test_profile(&profile);
-    });
-}
-
-#[test]
-fn search_engine_management_add_and_remove() {
-    run_on_gtk_thread(|| {
-        let profile = test_profile("engine-management");
-        let (_window, app) = build_window_and_app(profile.clone()).expect("build_window_and_app should succeed");
-
-        app.open_settings();
-        let default_count = app.settings_engine_names().len();
-        assert_eq!(app.engines_row_count(), default_count, "the management list should start with one row per default engine");
-
-        // Adding a new engine should update the real Settings data, the
-        // management list, and the default-engine dropdown (the fix for the
-        // dropdown previously always showing a fixed list regardless of
-        // what Settings actually contained).
-        app.add_search_engine_via_fields("Kagi", "https://kagi.com/search?q={query}");
-        assert!(app.settings_engine_names().contains(&"Kagi".to_string()));
-        assert_eq!(app.engines_row_count(), default_count + 1);
-
-        // Re-adding the same name updates in place rather than duplicating.
-        app.add_search_engine_via_fields("Kagi", "https://kagi.com/search?q={query}&updated=1");
-        assert_eq!(app.engines_row_count(), default_count + 1, "re-adding an existing name shouldn't duplicate its row");
-
-        // Removing every engine down to one should leave the dropdown
-        // correctly reflecting whichever one engine remains as the default.
-        while app.settings_engine_names().len() > 1 {
-            let name = app.settings_engine_names()[0].clone();
-            app.remove_search_engine_by_name(&name);
-        }
-        assert_eq!(app.settings_engine_names().len(), 1);
-        assert_eq!(app.engine_combo_active_id().as_deref(), Some(app.settings_engine_names()[0].as_str()));
-
-        cleanup_test_profile(&profile);
     });
 }
 
@@ -1810,9 +1498,7 @@ fn switching_to_light_theme_reloads_the_theme_css() {
             "the theme provider should start with the default dark theme's CSS"
         );
 
-        app.open_settings();
-        app.select_light_theme_radio();
-        app.save_settings();
+        app.set_theme_for_test(browser_core::Theme::Light);
 
         assert!(
             app.theme_provider_css().contains("rgba(0,0,0,0.06)"),

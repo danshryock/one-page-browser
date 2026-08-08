@@ -57,10 +57,74 @@ function renderContent(query) {
         <span class="dots">${shown ? escapeHtml(shown) : "••••••••"}</span>
         <button class="iconbtn" data-action="reveal" title="Show password">👁</button>
         <button class="iconbtn" data-action="copy" title="Copy password">⧉</button>
+        <button class="iconbtn" data-action="edit" title="Edit">✎</button>
+        <button class="iconbtn" data-action="delete" title="Delete">✕</button>
       </div>`;
     })
     .join("");
 }
+
+// ---- Add/edit form ----
+// Bitwarden-sourced logins can still be edited/deleted (the backend
+// supports it — see PasswordBackend), but a brand-new login always goes to
+// the local vault: this app has no Bitwarden item-creation flow of its own,
+// same simplification the native password manager overlay it replaces
+// already made.
+function renderForm(entry) {
+  const isEdit = !!entry;
+  return `
+    <div class="section" style="border:1px solid var(--border-strong);border-radius:8px;margin:0 24px 14px;padding:14px">
+      <div class="sidehead" style="margin-bottom:8px">${isEdit ? "Edit login" : "Add login"}</div>
+      <div style="display:flex;flex-direction:column;gap:8px;max-width:360px">
+        <input type="text" id="form-site" placeholder="Site (e.g. https://example.com)" value="${escapeHtml(entry?.site || "")}">
+        <input type="text" id="form-username" placeholder="Username" value="${escapeHtml(entry?.username || "")}">
+        <input type="password" id="form-password" placeholder="${isEdit ? "New password (leave blank to keep current)" : "Password"}">
+        <input type="text" id="form-notes" placeholder="Notes (optional)" value="${escapeHtml(entry?.notes || "")}">
+      </div>
+      <div class="error-text" id="form-error"></div>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="btn btn-primary" id="form-submit">${isEdit ? "Save" : "Add"}</button>
+        <button class="btn" id="form-cancel">Cancel</button>
+      </div>
+    </div>`;
+}
+
+async function openForm(entry) {
+  const formRoot = document.getElementById("form-root");
+  let currentPassword = "";
+  if (entry) {
+    const revealed = await revealPassword({ dataset: { id: entry.id, source: entry.source } });
+    currentPassword = revealed;
+  }
+  formRoot.innerHTML = renderForm(entry);
+  document.getElementById("form-submit").addEventListener("click", async () => {
+    const site = document.getElementById("form-site").value.trim();
+    const username = document.getElementById("form-username").value.trim();
+    const typedPassword = document.getElementById("form-password").value;
+    const notes = document.getElementById("form-notes").value.trim();
+    const password = typedPassword || (entry ? currentPassword : "");
+    if (!site) {
+      document.getElementById("form-error").textContent = "Site is required.";
+      return;
+    }
+    try {
+      if (entry) {
+        await rpcCall("passwords.update", { id: entry.id, source: entry.source, site, username, password, notes });
+      } else {
+        await rpcCall("passwords.add", { source: "browser", site, username, password, notes });
+      }
+      formRoot.innerHTML = "";
+      await load();
+    } catch (err) {
+      document.getElementById("form-error").textContent = String(err.message || err);
+    }
+  });
+  document.getElementById("form-cancel").addEventListener("click", () => {
+    formRoot.innerHTML = "";
+  });
+}
+
+document.getElementById("add-login-btn").addEventListener("click", () => openForm(null));
 
 async function load() {
   const result = await rpcCall("passwords.list", {});
@@ -100,10 +164,21 @@ document.getElementById("content").addEventListener("click", async (event) => {
   if (!row) return;
   const actionBtn = event.target.closest("[data-action]");
   if (!actionBtn) return;
+  const action = actionBtn.dataset.action;
+  const entry = allEntries.find((e) => e.id === row.dataset.id && e.source === row.dataset.source);
+  if (action === "edit" && entry) {
+    await openForm(entry);
+    return;
+  }
+  if (action === "delete" && entry) {
+    await rpcCall("passwords.delete", { id: entry.id, source: entry.source });
+    await load();
+    return;
+  }
   const password = await revealPassword(row);
-  if (actionBtn.dataset.action === "reveal") {
+  if (action === "reveal") {
     renderContent(document.getElementById("search").value.trim());
-  } else if (actionBtn.dataset.action === "copy" && navigator.clipboard) {
+  } else if (action === "copy" && navigator.clipboard) {
     navigator.clipboard.writeText(password).catch((err) => console.error(err));
   }
 });

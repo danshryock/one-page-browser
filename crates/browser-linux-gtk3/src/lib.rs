@@ -13,9 +13,8 @@ use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use browser_core::{
-    decide_vault_unlock_action, domain_of, list_profile_names, resolve_address_input, Action, BitwardenBackend, BitwardenStatus,
-    Bookmarks, HistoryStore, KeyChord, Keybindings, Login, LoginFields, PageManager, PasswordBackend, PasswordStore, Profile, Session,
-    SessionPage, Settings, Theme, VaultUnlockAction, APP_TITLE,
+    decide_vault_unlock_action, domain_of, list_profile_names, resolve_address_input, Action, BitwardenBackend, Bookmarks, HistoryStore,
+    KeyChord, Keybindings, PageManager, PasswordStore, Profile, Session, SessionPage, Settings, Theme, VaultUnlockAction, APP_TITLE,
 };
 use gtk::prelude::*;
 use render_engine::{NewWindowInfo, RenderEngine, WebContext, WebKitWebView, WryEngine};
@@ -37,15 +36,6 @@ enum VaultState {
     /// The vault has a passphrase, but it hasn't been unlocked this run yet.
     Locked,
     Unlocked(PasswordStore),
-}
-
-/// Which backend a `Login` shown in the password manager overlay actually
-/// came from — `update`/`delete` must route to the same one, since there's
-/// no "move a login between backends" operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoginSource {
-    Local,
-    Bitwarden,
 }
 
 pub struct AppState {
@@ -70,69 +60,30 @@ pub struct AppState {
     stack: gtk::Stack,
     switcher_panel: gtk::Widget,
     flowbox: gtk::FlowBox,
-    /// The settings overlay's root widget — an in-window overlay rather than
-    /// a modal `gtk::Dialog` (matching `browser-windows-winui`'s settings
-    /// surface, which led with this pattern since it needed to avoid
-    /// `ContentDialog`'s async `ShowAsync`; gtk3 had no such constraint, this
-    /// is purely for consistency between the two front ends).
-    settings_panel: gtk::Widget,
-    start_page_entry: gtk::Entry,
-    engine_combo: gtk::ComboBoxText,
-    /// Rebuilt from `Settings::search_engines` each time settings opens and
-    /// after every add/remove — holds one row per engine, with a "×" to
-    /// remove it.
-    engines_list_box: gtk::Box,
-    new_engine_name_entry: gtk::Entry,
-    new_engine_url_entry: gtk::Entry,
-    unlimited_check: gtk::CheckButton,
-    limit_spin: gtk::SpinButton,
-    light_theme_radio: gtk::RadioButton,
-    dark_theme_radio: gtk::RadioButton,
-    bitwarden_check: gtk::CheckButton,
-    bitwarden_url_entry: gtk::Entry,
     /// Holds only the theme-dependent CSS rules (see `theme_css`'s doc
     /// comment) — reloaded by `apply_theme` whenever the theme changes,
     /// unlike the separate, never-reloaded base provider set up once in
     /// `build_window_and_app`.
     theme_provider: gtk::CssProvider,
     /// The profile picker overlay's root widget — same in-window-overlay
-    /// pattern as `settings_panel`/`switcher_panel`.
+    /// pattern as `switcher_panel`.
     profile_panel: gtk::Widget,
     /// Rebuilt from `browser_core::list_profile_names()` each time the
     /// picker opens — holds one row per existing profile.
     profile_list_box: gtk::Box,
     new_profile_entry: gtk::Entry,
     new_profile_encrypted_check: gtk::CheckButton,
-    /// The keybindings editor's row list — lives inside the settings overlay
-    /// (see `open_settings`'s doc comment for why it's not a separate
-    /// overlay of its own), rebuilt from `Keybindings::bindings_for` each
-    /// time settings opens (and after every add/remove).
-    keybindings_list_box: gtk::Box,
     keybindings: RefCell<Keybindings>,
-    /// `Some(action)` while the editor is waiting for the next real keydown
-    /// to become that action's new binding — checked first, ahead of normal
-    /// shortcut dispatch, by the window's `key-press-event` handler.
-    listening_for: Cell<Option<Action>>,
-    /// The bookmarks overlay's root widget — same in-window-overlay pattern
-    /// as the other four.
-    bookmarks_panel: gtk::Widget,
-    /// Rebuilt from `Bookmarks::all()` each time the overlay opens and after
-    /// every add/remove.
-    bookmarks_list_box: gtk::Box,
     /// The toolbar star-toggle button, so its icon can be refreshed whenever
     /// the active page changes or a bookmark is added/removed for it.
     bookmark_toggle_button: gtk::Button,
     bookmarks: RefCell<Bookmarks>,
-    /// The password manager overlay's root widget — same in-window-overlay
-    /// pattern as the other five.
+    /// The password manager overlay's root widget — now only ever shows the
+    /// unlock/setup prompt below; browsing/editing saved logins lives at
+    /// `browser://passwords` (see `internal_pages::PASSWORDS`) once the
+    /// vault is unlocked — `open_passwords` navigates there and closes this
+    /// overlay itself the moment that happens.
     passwords_panel: gtk::Widget,
-    /// The vault locked/setup sub-group — shown instead of
-    /// `passwords_content_box` while `passwords` isn't
-    /// `VaultState::Unlocked`. Replaces the old separate-window
-    /// `show_vault_passphrase_prompt`: the passphrase is now collected
-    /// in-overlay, the same toggled-sub-group shape
-    /// `browser-macos-appkit`'s `rebuild_passwords_view` already uses.
-    passwords_unlock_box: gtk::Box,
     /// Text toggles "Set Up Password Vault"/"Unlock Password Vault"
     /// depending on `Profile::has_vault_passphrase()`.
     passwords_unlock_heading: gtk::Label,
@@ -142,15 +93,6 @@ pub struct AppState {
     /// Label toggles "Set Up"/"Unlock", same condition as
     /// `passwords_unlock_heading`.
     passwords_unlock_button: gtk::Button,
-    /// The vault contents sub-group (saved-logins list + add/edit form) —
-    /// shown once `passwords` is `VaultState::Unlocked`.
-    passwords_content_box: gtk::Box,
-    /// Rebuilt from `VaultState::Unlocked`'s `PasswordStore::list()` each
-    /// time the overlay opens and after every add/update/delete.
-    passwords_list_box: gtk::Box,
-    /// Text toggles "Add Login"/"Edit Login" alongside
-    /// `submit_password_button`'s label.
-    passwords_form_heading: gtk::Label,
     /// Whether the vault has ever been set up, is set up but not opened
     /// this session, or is open and ready to use — see
     /// `decide_vault_unlock_action`'s doc comment for how a profile that
@@ -163,35 +105,6 @@ pub struct AppState {
     /// passphrase. Never written to disk; cleared along with everything
     /// else when the process exits.
     session_passphrase: RefCell<Option<String>>,
-    /// The add/edit-credential form's fields — read/cleared by
-    /// `submit_login_from_fields`, same pattern as
-    /// `new_engine_name_entry`/`new_engine_url_entry` for the settings
-    /// overlay's search-engine form. Doubles as the edit form too (see
-    /// `start_editing_login`) rather than being a second, separate form.
-    new_password_site_entry: gtk::Entry,
-    new_password_username_entry: gtk::Entry,
-    new_password_password_entry: gtk::Entry,
-    new_password_notes_entry: gtk::Entry,
-    /// Which existing login (if any) the form above is currently editing,
-    /// and which backend it came from — `None` means "add new" mode.
-    editing_login: RefCell<Option<(String, LoginSource)>>,
-    /// Chooses which backend a brand-new login (`editing_login: None`) gets
-    /// saved to — only meaningfully offered (see `rebuild_passwords_panel`)
-    /// when Bitwarden integration is enabled; otherwise hidden and every add
-    /// goes to the local vault, same as before this field existed.
-    save_destination_combo: gtk::ComboBoxText,
-    save_destination_row: gtk::Box,
-    /// Submits the add/edit form — labeled "Add" or "Save" depending on
-    /// `editing_login`.
-    submit_password_button: gtk::Button,
-    /// Only visible while `editing_login` is `Some` — abandons the edit and
-    /// returns the form to "add new" mode.
-    cancel_edit_button: gtk::Button,
-    /// Surfaces the last add/update/delete failure against either backend
-    /// (a network error, Bitwarden being locked mid-action, etc.) or a
-    /// failed inline Bitwarden-unlock attempt — cleared at the top of every
-    /// `rebuild_passwords_panel` call.
-    passwords_error_label: gtk::Label,
     /// Snapshot taken by the last `rebuild_switcher_grid` call — the source
     /// of truth `activate_switcher_row` indexes into, so a tile's widget
     /// name can just be its position in this list rather than needing a
@@ -289,23 +202,18 @@ impl AppState {
         }
     }
 
-    /// Toggles reader mode on the active page — see
-    /// `WryEngine::toggle_reader_mode`'s doc comment for what it actually
-    /// does and its limitations. The toolbar button's action; a no-op if the
-    /// active page's engine isn't currently loaded.
-    pub fn toggle_reader_mode(self: &Rc<Self>) {
-        self.with_active(|engine| engine.toggle_reader_mode());
-    }
-
     /// Fills the active page's login form with `entry`'s username/password
-    /// (see `WryEngine::fill_login`) and closes the password manager
-    /// overlay — the "Fill" button's action. Re-checks `entry.domain`
-    /// against the active page's domain itself (a no-op, silent return if
-    /// it doesn't match, or if there's no password to fill) — `build_login_row`
-    /// already gates whether the button is shown on the same check, but the
-    /// restriction needs to be real and enforced here too, not just a UI
-    /// affordance that only holds as long as this is the sole caller.
-    fn fill_active_page_with_login(self: &Rc<Self>, entry: &Login) {
+    /// (see `WryEngine::fill_login`) if `entry.domain` matches the active
+    /// page's domain — filling credentials into a page whose domain doesn't
+    /// match what they were saved for is a real phishing-adjacent footgun,
+    /// not just a UX nicety to restrict. No native UI calls this directly
+    /// right now (the old passwords overlay's Fill button moved away with
+    /// the rest of that overlay — see `internal_rpc.rs`'s own doc comment on
+    /// the passwords/autofill capability gap); kept alive because the real
+    /// autocomplete-attribute-aware fill mechanism itself is unrelated to
+    /// which UI triggers it, and a real decoupled trigger is planned
+    /// follow-up work, not a dropped capability.
+    fn fill_active_page_with_login(self: &Rc<Self>, entry: &browser_core::Login) {
         let Some(password) = entry.password.clone() else { return };
         let active_domain = self.core.borrow().active().map(|p| domain_of(&p.current_url()));
         if active_domain.as_deref() != Some(entry.domain.as_str()) {
@@ -313,7 +221,27 @@ impl AppState {
         }
         let username = entry.username.clone();
         self.with_active(|engine| engine.fill_login(&username, &password));
-        self.close_passwords();
+    }
+
+    /// Test helper: simulates the (currently UI-less — see
+    /// `fill_active_page_with_login`'s doc comment) autofill action for the
+    /// local vault's entry with the given username.
+    pub fn fill_active_page_with_local_login(self: &Rc<Self>, username: &str) {
+        let entry = match &*self.passwords.borrow() {
+            VaultState::Unlocked(store) => store.list().unwrap_or_default().into_iter().find(|e| e.username == username),
+            VaultState::Locked | VaultState::NotSetUp => None,
+        };
+        if let Some(entry) = entry {
+            self.fill_active_page_with_login(&entry);
+        }
+    }
+
+    /// Toggles reader mode on the active page — see
+    /// `WryEngine::toggle_reader_mode`'s doc comment for what it actually
+    /// does and its limitations. The toolbar button's action; a no-op if the
+    /// active page's engine isn't currently loaded.
+    pub fn toggle_reader_mode(self: &Rc<Self>) {
+        self.with_active(|engine| engine.toggle_reader_mode());
     }
 
     pub fn add_page(self: &Rc<Self>, url: &str) -> anyhow::Result<()> {
@@ -621,6 +549,33 @@ impl AppState {
         browser_chrome_core::internal_pages::display_url(url, self.asset_port.get()).map(str::to_string).unwrap_or_else(|| url.to_string())
     }
 
+    /// Navigates to one of the browser's own internal pages
+    /// (`browser_chrome_core::internal_pages::{PROFILE,PASSWORDS}`) — or, if
+    /// it's already open somewhere, switches to that existing page instead
+    /// of opening a duplicate. The single navigation entry point for
+    /// Settings/Passwords now that they're real pages rather than native
+    /// overlays: used by the toolbar buttons, keybinding dispatch, and (via
+    /// `internal_rpc.rs`'s `navigation.open_settings`/`.open_passwords`) the
+    /// profile-menu popover, which has no other way to tell the host to
+    /// navigate the *real* active page from inside its own small webview.
+    pub fn open_or_focus_internal_page(self: &Rc<Self>, target: &'static str) {
+        let existing = self
+            .core
+            .borrow()
+            .pages()
+            .iter()
+            .find(|p| browser_chrome_core::internal_pages::display_url(&p.current_url(), self.asset_port.get()) == Some(target))
+            .map(|p| p.id.clone());
+        match existing {
+            Some(id) => self.switch_to(&id),
+            None => {
+                if let Err(err) = self.add_page(target) {
+                    eprintln!("failed to open {target}: {err}");
+                }
+            }
+        }
+    }
+
     /// Updates page `id`'s tracked audio-playing state and refreshes the
     /// switcher grid so its tile's speaker icon reflects it. Split out from
     /// the real `connect_is_playing_audio_notify` signal handler (wired in
@@ -768,9 +723,7 @@ impl AppState {
     /// defensively closes the others rather than ever showing more than one
     /// at once.
     fn open_switcher_common(self: &Rc<Self>) {
-        self.close_settings();
         self.close_profile_picker();
-        self.close_bookmarks();
         self.close_passwords();
         self.stack.set_sensitive(false);
         // Shown *before* rebuilding: `rebuild_switcher_grid` skips its work
@@ -850,214 +803,14 @@ impl AppState {
         self.flowbox.child_focus(gtk::DirectionType::Down);
     }
 
-    /// Shows the settings overlay, populated from the current `Settings`,
-    /// and rebuilds the keybindings editor's rows into the same overlay
-    /// (moved here rather than being its own separate overlay/toolbar
-    /// button — one "app configuration" destination instead of two). See
-    /// `open_switcher`'s doc comment for why it closes the other overlays
-    /// first.
-    pub fn open_settings(self: &Rc<Self>) {
-        self.close_switcher();
-        self.close_profile_picker();
-        self.close_bookmarks();
-        self.close_passwords();
-        let settings = self.settings.borrow();
-        self.start_page_entry.set_text(&settings.start_page);
-        match settings.max_loaded_pages {
-            Some(n) => {
-                self.unlimited_check.set_active(false);
-                self.limit_spin.set_value(n as f64);
-                self.limit_spin.set_sensitive(true);
-            }
-            None => {
-                self.unlimited_check.set_active(true);
-                self.limit_spin.set_sensitive(false);
-            }
-        }
-        match settings.theme {
-            Theme::Light => self.light_theme_radio.set_active(true),
-            Theme::Dark => self.dark_theme_radio.set_active(true),
-        }
-        match &settings.bitwarden_server_url {
-            Some(url) => {
-                self.bitwarden_check.set_active(true);
-                self.bitwarden_url_entry.set_text(url);
-            }
-            None => {
-                self.bitwarden_check.set_active(false);
-                self.bitwarden_url_entry.set_text("");
-            }
-        }
-        drop(settings);
-        self.refresh_engine_combo();
-        self.rebuild_engines_list();
-        self.new_engine_name_entry.set_text("");
-        self.new_engine_url_entry.set_text("");
-        self.listening_for.set(None);
-        self.rebuild_keybindings_list();
-        self.stack.set_sensitive(false);
-        self.settings_panel.show();
-    }
-
-    /// Hides the settings overlay without saving — used by Cancel, the
-    /// scrim, and Escape. Always use this (rather than hiding
-    /// `settings_panel` directly) so the stack never gets left insensitive.
-    /// Also cancels any in-progress keybinding "press keys…" capture, same
-    /// as closing used to when the keybindings editor was its own overlay.
-    pub fn close_settings(&self) {
-        self.listening_for.set(None);
-        self.settings_panel.hide();
-        self.stack.set_sensitive(true);
-    }
-
-    /// Reads the overlay's fields back into `Settings`, applies the loaded-
-    /// pages limit immediately (via `set_max_loaded_pages`, same as before),
-    /// saves to disk, and closes the overlay — the settings overlay's Save
-    /// action.
-    pub fn save_settings(self: &Rc<Self>) {
-        {
-            let mut settings = self.settings.borrow_mut();
-            settings.start_page = self.start_page_entry.text().to_string();
-            if let Some(id) = self.engine_combo.active_id() {
-                settings.default_search_engine = id.to_string();
-            }
-            settings.theme = if self.light_theme_radio.is_active() { Theme::Light } else { Theme::Dark };
-            settings.bitwarden_server_url = if self.bitwarden_check.is_active() {
-                let url = self.bitwarden_url_entry.text().to_string();
-                let url = url.trim();
-                Some(if url.is_empty() { "http://127.0.0.1:8087".to_string() } else { url.to_string() })
-            } else {
-                None
-            };
-        }
-        let new_limit = if self.unlimited_check.is_active() {
-            None
-        } else {
-            Some(self.limit_spin.value_as_int().max(1) as usize)
-        };
-        self.set_max_loaded_pages(new_limit);
-        if let Err(err) = self.settings().save(&self.profile) {
-            eprintln!("failed to save settings: {err}");
-        }
-        self.apply_theme();
-        self.close_settings();
-    }
-
     /// Reloads `theme_provider` with the current `Settings::theme`'s CSS —
     /// called once at startup (right after `AppState` is constructed) and
-    /// again every time `save_settings` runs, so a theme change takes
-    /// effect immediately without needing a restart.
+    /// again whenever `profile.settings.update_general` changes it (see
+    /// `internal_rpc.rs`), so a theme change takes effect immediately
+    /// without needing a restart.
     pub fn apply_theme(&self) {
         let theme = self.settings.borrow().theme;
         let _ = self.theme_provider.load_from_data(theme_css(theme).as_bytes());
-    }
-
-    /// Whether the settings overlay is currently shown — test/inspection
-    /// helper.
-    pub fn is_settings_open(&self) -> bool {
-        self.settings_panel.is_visible()
-    }
-
-    /// The settings toolbar button's target — closes the overlay if it's
-    /// already open instead of just re-opening/re-seeding it, same
-    /// open-again-to-close convention every overlay's trigger button now
-    /// follows (see `toggle_switcher`, the original of this pattern).
-    pub fn toggle_settings(self: &Rc<Self>) {
-        if self.is_settings_open() {
-            self.close_settings();
-        } else {
-            self.open_settings();
-        }
-    }
-
-    /// Repopulates the default-search-engine dropdown from the live
-    /// `Settings::search_engines` (rather than a fixed list) and re-selects
-    /// the current default — called whenever settings opens and after every
-    /// engine add/remove, so it never goes stale.
-    fn refresh_engine_combo(&self) {
-        self.engine_combo.remove_all();
-        let settings = self.settings.borrow();
-        for engine in &settings.search_engines {
-            self.engine_combo.append(Some(&engine.name), &engine.name);
-        }
-        self.engine_combo.set_active_id(Some(&settings.default_search_engine));
-    }
-
-    /// Rebuilds the search engine management list from scratch, one row per
-    /// `Settings::search_engines` entry with its query URL template shown
-    /// underneath and a "×" to remove it. The "×" is omitted entirely when
-    /// only one engine remains, since `Settings::remove_search_engine`
-    /// refuses to remove the last one anyway — no point offering a button
-    /// that would just silently do nothing.
-    fn rebuild_engines_list(self: &Rc<Self>) {
-        for child in self.engines_list_box.children() {
-            self.engines_list_box.remove(&child);
-        }
-
-        let engines = self.settings.borrow().search_engines.clone();
-        let can_remove = engines.len() > 1;
-        for engine in engines {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-
-            let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            let name_label = gtk::Label::new(Some(&engine.name));
-            name_label.set_halign(gtk::Align::Start);
-            let url_label = gtk::Label::new(Some(&engine.query_url_template));
-            url_label.set_halign(gtk::Align::Start);
-            url_label.style_context().add_class("tile-subtitle");
-            labels.pack_start(&name_label, false, false, 0);
-            labels.pack_start(&url_label, false, false, 0);
-            row.pack_start(&labels, true, true, 0);
-
-            if can_remove {
-                let remove_button = gtk::Button::with_label("\u{d7}");
-                let app_clone = Rc::clone(self);
-                let name = engine.name.clone();
-                remove_button.connect_clicked(move |_| {
-                    app_clone.remove_search_engine_by_name(&name);
-                });
-                row.pack_start(&remove_button, false, false, 0);
-            }
-
-            self.engines_list_box.pack_start(&row, false, false, 0);
-        }
-        self.engines_list_box.show_all();
-    }
-
-    /// Removes a search engine by name, saves immediately, and refreshes
-    /// both the management list and the default-engine dropdown (which may
-    /// have had its selection reassigned, if the removed engine was the
-    /// default — see `Settings::remove_search_engine`). The management
-    /// list's "×" button action.
-    pub fn remove_search_engine_by_name(self: &Rc<Self>, name: &str) {
-        self.settings.borrow_mut().remove_search_engine(name);
-        if let Err(err) = self.settings().save(&self.profile) {
-            eprintln!("failed to save settings: {err}");
-        }
-        self.rebuild_engines_list();
-        self.refresh_engine_combo();
-    }
-
-    /// Reads the "Add engine" row's fields and adds a new search engine
-    /// (or updates an existing one with the same name), saves immediately,
-    /// clears the fields, and refreshes both the management list and the
-    /// dropdown. Does nothing if either field is blank.
-    pub fn add_search_engine_from_fields(self: &Rc<Self>) {
-        let name = self.new_engine_name_entry.text().to_string();
-        let name = name.trim();
-        let url = self.new_engine_url_entry.text().to_string();
-        let url = url.trim();
-        if name.is_empty() || url.is_empty() {
-            return;
-        }
-        self.settings.borrow_mut().add_search_engine(name, url);
-        if let Err(err) = self.settings().save(&self.profile) {
-            eprintln!("failed to save settings: {err}");
-        }
-        self.new_engine_name_entry.set_text("");
-        self.new_engine_url_entry.set_text("");
-        self.rebuild_engines_list();
-        self.refresh_engine_combo();
     }
 
     /// Shows the profile picker, rebuilt from `list_profile_names()` each
@@ -1066,8 +819,6 @@ impl AppState {
     /// overlays first.
     pub fn open_profile_picker(self: &Rc<Self>) {
         self.close_switcher();
-        self.close_settings();
-        self.close_bookmarks();
         self.close_passwords();
         self.new_profile_entry.set_text("");
         self.new_profile_encrypted_check.set_active(false);
@@ -1170,96 +921,6 @@ impl AppState {
         self.close_profile_picker();
     }
 
-    /// Shows the bookmarks overlay, rebuilt from the current `Bookmarks`
-    /// each time — see `open_switcher`'s doc comment for why it closes the
-    /// other overlays first.
-    pub fn open_bookmarks(self: &Rc<Self>) {
-        self.close_switcher();
-        self.close_settings();
-        self.close_profile_picker();
-        self.close_passwords();
-        self.rebuild_bookmarks_list();
-        self.stack.set_sensitive(false);
-        self.bookmarks_panel.show();
-    }
-
-    /// Hides the bookmarks overlay. Always use this (rather than hiding
-    /// `bookmarks_panel` directly) so the stack never gets left insensitive.
-    pub fn close_bookmarks(&self) {
-        self.bookmarks_panel.hide();
-        self.stack.set_sensitive(true);
-    }
-
-    /// Whether the bookmarks overlay is currently shown — test/inspection
-    /// helper.
-    pub fn is_bookmarks_open(&self) -> bool {
-        self.bookmarks_panel.is_visible()
-    }
-
-    /// The bookmarks toolbar button's target — see `toggle_settings`.
-    pub fn toggle_bookmarks(self: &Rc<Self>) {
-        if self.is_bookmarks_open() {
-            self.close_bookmarks();
-        } else {
-            self.open_bookmarks();
-        }
-    }
-
-    /// Rebuilds the bookmarks overlay's list of rows from scratch, most-
-    /// recently-added first (`Bookmarks::all()`'s order). Each row opens the
-    /// bookmark as a new page when clicked; the "×" removes it without
-    /// opening anything.
-    fn rebuild_bookmarks_list(self: &Rc<Self>) {
-        for child in self.bookmarks_list_box.children() {
-            self.bookmarks_list_box.remove(&child);
-        }
-
-        let bookmarks = self.bookmarks.borrow();
-        let all = bookmarks.all();
-        if all.is_empty() {
-            let empty_label = gtk::Label::new(Some("No bookmarks yet"));
-            empty_label.set_halign(gtk::Align::Start);
-            self.bookmarks_list_box.pack_start(&empty_label, false, false, 0);
-        }
-        for bookmark in all {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-
-            let open_button = gtk::Button::new();
-            open_button.set_hexpand(true);
-            open_button.style_context().add_class("flat");
-            let label_text = if bookmark.title.is_empty() { bookmark.url.clone() } else { format!("{} — {}", bookmark.title, bookmark.domain) };
-            let label = gtk::Label::new(Some(&label_text));
-            label.set_halign(gtk::Align::Start);
-            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            open_button.add(&label);
-
-            let app_clone = Rc::clone(self);
-            let url = bookmark.url.clone();
-            open_button.connect_clicked(move |_| {
-                if let Err(err) = app_clone.add_page(&url) {
-                    eprintln!("failed to open bookmark: {err}");
-                }
-                app_clone.close_bookmarks();
-            });
-            row.pack_start(&open_button, true, true, 0);
-
-            let remove_button = gtk::Button::with_label("\u{d7}");
-            let app_clone = Rc::clone(self);
-            let url = bookmark.url.clone();
-            remove_button.connect_clicked(move |_| {
-                app_clone.bookmarks.borrow_mut().remove(&url);
-                if let Err(err) = app_clone.bookmarks.borrow().save(&app_clone.profile) {
-                    eprintln!("failed to save bookmarks: {err}");
-                }
-                app_clone.rebuild_bookmarks_list();
-                app_clone.refresh_bookmark_toggle_button();
-            });
-            row.pack_start(&remove_button, false, false, 0);
-
-            self.bookmarks_list_box.pack_start(&row, false, false, 0);
-        }
-        self.bookmarks_list_box.show_all();
-    }
 
     /// Adds or removes a bookmark for the active page — the toolbar star
     /// button's toggle action, and the `ToggleBookmark` keybinding.
@@ -1277,23 +938,18 @@ impl AppState {
         self.refresh_bookmark_toggle_button();
     }
 
-    /// Shows the password manager overlay. Unlike every other overlay, this
-    /// first has to resolve the vault's unlock/setup state (see
-    /// `decide_vault_unlock_action`'s doc comment) — opening it might mean
-    /// silently reusing an already-known passphrase, silently establishing
-    /// a brand new vault under one, or genuinely needing a prompt. Unlike
-    /// this crate's earlier design, a "genuinely needing a prompt" outcome
-    /// no longer opens a separate `gtk::Window` — `rebuild_passwords_panel`
-    /// (called by `show_passwords_panel` below) renders the locked/setup
-    /// sub-group inline instead, same as `browser-macos-appkit` already
-    /// does.
+    /// Resolves the vault's unlock/setup state (see
+    /// `decide_vault_unlock_action`'s doc comment) — opening this might mean
+    /// silently reusing an already-known passphrase, silently establishing a
+    /// brand new vault under one, or genuinely needing a prompt. If the
+    /// vault ends up unlocked (silently, or was already), navigates
+    /// straight to `browser://passwords` — real browsing/editing of saved
+    /// logins lives there now, not in this overlay. Only when a real prompt
+    /// is still needed does `passwords_panel` actually show, rendering just
+    /// that prompt (see `rebuild_passwords_panel`).
     pub fn open_passwords(self: &Rc<Self>) {
         self.close_switcher();
-        self.close_settings();
         self.close_profile_picker();
-        self.close_bookmarks();
-        // Always opens fresh, never mid-edit from a previous visit.
-        self.cancel_editing_login();
 
         if !matches!(*self.passwords.borrow(), VaultState::Unlocked(_)) {
             match decide_vault_unlock_action(&self.profile, self.session_passphrase.borrow().as_deref()) {
@@ -1309,6 +965,12 @@ impl AppState {
                 // renders the locked/setup sub-group for a real prompt.
                 VaultUnlockAction::PromptToSetUp | VaultUnlockAction::PromptToUnlock => {}
             }
+        }
+
+        if matches!(*self.passwords.borrow(), VaultState::Unlocked(_)) {
+            self.close_passwords();
+            self.open_or_focus_internal_page(browser_chrome_core::internal_pages::PASSWORDS);
+            return;
         }
         self.show_passwords_panel();
     }
@@ -1380,7 +1042,8 @@ impl AppState {
         }
         let is_setup = !self.profile.has_vault_passphrase();
         if self.try_open_vault_with(&passphrase, is_setup) {
-            self.rebuild_passwords_panel();
+            self.close_passwords();
+            self.open_or_focus_internal_page(browser_chrome_core::internal_pages::PASSWORDS);
         } else {
             self.passwords_unlock_error_label.set_text("Couldn't open the vault with that passphrase. Try again.");
             self.passwords_unlock_entry.set_text("");
@@ -1422,82 +1085,13 @@ impl AppState {
         self.settings().bitwarden_server_url.clone().map(BitwardenBackend::new)
     }
 
-    /// One row for a `Login` — a label, a Copy button, an Edit button
-    /// (fills the add/edit form from this entry — see `start_editing_login`),
-    /// a "×" delete button (all three wired to route through `source` so
-    /// they hit whichever backend this entry actually came from — identical
-    /// for local and Bitwarden entries now, both are fully read/write), and
-    /// a Fill button, shown only when `entry.password` is set and
-    /// `entry.domain` matches `active_domain` — filling credentials into a
-    /// page whose domain doesn't match what they were saved for is a real
-    /// phishing-adjacent footgun, not just a UX nicety to restrict.
-    fn build_login_row(self: &Rc<Self>, entry: &Login, source: LoginSource, active_domain: Option<&str>) -> gtk::Box {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-
-        let label_text = format!("{} \u{2014} {}", entry.domain, entry.username);
-        let label = gtk::Label::new(Some(&label_text));
-        label.set_halign(gtk::Align::Start);
-        label.set_hexpand(true);
-        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        row.pack_start(&label, true, true, 0);
-
-        if entry.password.is_some() && active_domain == Some(entry.domain.as_str()) {
-            let fill_button = gtk::Button::with_label("Fill");
-            let app_clone = Rc::clone(self);
-            let entry_clone = entry.clone();
-            fill_button.connect_clicked(move |_| {
-                app_clone.fill_active_page_with_login(&entry_clone);
-            });
-            row.pack_start(&fill_button, false, false, 0);
-        }
-
-        let copy_button = gtk::Button::with_label("Copy");
-        let password = entry.password.clone().unwrap_or_default();
-        copy_button.connect_clicked(move |_| {
-            if let Some(display) = gtk::gdk::Display::default() {
-                if let Some(clipboard) = gtk::Clipboard::default(&display) {
-                    clipboard.set_text(&password);
-                }
-            }
-        });
-        row.pack_start(&copy_button, false, false, 0);
-
-        let edit_button = gtk::Button::with_label("Edit");
-        let app_clone = Rc::clone(self);
-        let entry_clone = entry.clone();
-        edit_button.connect_clicked(move |_| {
-            app_clone.start_editing_login(&entry_clone, source);
-        });
-        row.pack_start(&edit_button, false, false, 0);
-
-        let remove_button = gtk::Button::with_label("\u{d7}");
-        let app_clone = Rc::clone(self);
-        let id = entry.id.clone();
-        remove_button.connect_clicked(move |_| {
-            app_clone.delete_login(&id, source);
-        });
-        row.pack_start(&remove_button, false, false, 0);
-
-        row
-    }
-
-    /// Rebuilds the password manager overlay: first toggles
-    /// `passwords_unlock_box` vs. `passwords_content_box` based on
-    /// `self.passwords`' state (mirroring
-    /// `browser-macos-appkit::rebuild_passwords_view`) — if not yet
-    /// unlocked, updates the unlock/setup heading/label/button text and
-    /// returns, without touching the list below at all. Once unlocked,
-    /// rebuilds the credential list from scratch, as two separate sections
-    /// rather than one list interleaved by timestamp: "Saved" (the local
-    /// vault) and, if Bitwarden integration is enabled, "Bitwarden". They're
-    /// kept separate because their timestamps aren't comparable in any
-    /// meaningful way (Bitwarden's own `revisionDate` isn't even fetched —
-    /// see `bitwarden.rs`), so merging them into one sorted list would just
-    /// be misleading. Both sections are fully read/write (see
-    /// `build_login_row`) — also rebuilds `save_destination_combo`'s
-    /// contents/visibility and clears any leftover error message, since
-    /// this runs every time the overlay's state might have changed
-    /// underneath it.
+    /// Reflects the vault's unlock/setup state in `passwords_unlock_box` —
+    /// all `passwords_panel` shows now that browsing/editing saved logins
+    /// lives at `browser://passwords` (see `internal_pages::PASSWORDS`):
+    /// this overlay's only remaining job is collecting a passphrase.
+    /// `open_passwords` closes the overlay and navigates there itself the
+    /// moment the vault becomes unlocked — this just renders the prompt
+    /// while it isn't.
     fn rebuild_passwords_panel(self: &Rc<Self>) {
         let unlocked = matches!(*self.passwords.borrow(), VaultState::Unlocked(_));
         let is_setup = !self.profile.has_vault_passphrase();
@@ -1509,227 +1103,11 @@ impl AppState {
             "Your password vault is passphrase-protected."
         });
         self.passwords_unlock_button.set_label(if is_setup { "Set Up" } else { "Unlock" });
-        self.passwords_unlock_box.set_visible(!unlocked);
-        self.passwords_content_box.set_visible(unlocked);
 
         if !unlocked {
             self.passwords_unlock_entry.set_text("");
             self.passwords_unlock_error_label.set_text("");
             self.passwords_unlock_entry.grab_focus();
-            return;
-        }
-
-        self.passwords_error_label.set_text("");
-        for child in self.passwords_list_box.children() {
-            self.passwords_list_box.remove(&child);
-        }
-
-        // Computed once, up front, so every row's Fill-button gating (see
-        // `build_login_row`) checks against the same snapshot rather than
-        // re-deriving it per row.
-        let active_domain = self.core.borrow().active().map(|p| domain_of(&p.current_url()));
-
-        let local_entries = match &*self.passwords.borrow() {
-            VaultState::Unlocked(store) => store.list().unwrap_or_else(|err| {
-                eprintln!("failed to list password entries: {err}");
-                Vec::new()
-            }),
-            VaultState::Locked | VaultState::NotSetUp => Vec::new(),
-        };
-
-        let saved_title = gtk::Label::new(Some("Saved"));
-        saved_title.set_halign(gtk::Align::Start);
-        saved_title.style_context().add_class("tile-subtitle");
-        self.passwords_list_box.pack_start(&saved_title, false, false, 0);
-        if local_entries.is_empty() {
-            let empty_label = gtk::Label::new(Some("No saved passwords yet"));
-            empty_label.set_halign(gtk::Align::Start);
-            self.passwords_list_box.pack_start(&empty_label, false, false, 0);
-        }
-        for entry in &local_entries {
-            let row = self.build_login_row(entry, LoginSource::Local, active_domain.as_deref());
-            self.passwords_list_box.pack_start(&row, false, false, 0);
-        }
-
-        let bitwarden_enabled = self.bitwarden_backend().is_some();
-        self.save_destination_row.set_visible(bitwarden_enabled);
-        self.refresh_save_destination_combo();
-
-        if let Some(backend) = self.bitwarden_backend() {
-            let bitwarden_title = gtk::Label::new(Some("Bitwarden"));
-            bitwarden_title.set_halign(gtk::Align::Start);
-            bitwarden_title.style_context().add_class("tile-subtitle");
-            self.passwords_list_box.pack_start(&bitwarden_title, false, false, 0);
-
-            match backend.status() {
-                Err(err) => {
-                    let label = gtk::Label::new(Some(&format!("Could not connect (is `bw serve` running?): {err}")));
-                    label.set_halign(gtk::Align::Start);
-                    label.set_line_wrap(true);
-                    self.passwords_list_box.pack_start(&label, false, false, 0);
-                }
-                Ok(BitwardenStatus::Locked) => {
-                    // In-overlay unlock, replacing the old
-                    // `show_bitwarden_unlock_prompt` popup window — built
-                    // fresh each rebuild, same as every other row in this
-                    // list, rather than a persistent `AppState` field (this
-                    // is a small, dynamically-shown row, unlike the vault's
-                    // own locked/setup sub-group above, which is the whole
-                    // overlay's alternate state and so gets named fields).
-                    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                    let label = gtk::Label::new(Some("Bitwarden is locked"));
-                    label.set_halign(gtk::Align::Start);
-                    row.pack_start(&label, false, false, 0);
-                    let unlock_entry = gtk::Entry::new();
-                    unlock_entry.set_visibility(false);
-                    unlock_entry.set_placeholder_text(Some("Bitwarden master password"));
-                    unlock_entry.set_hexpand(true);
-                    row.pack_start(&unlock_entry, true, true, 0);
-                    let unlock_button = gtk::Button::with_label("Unlock");
-                    row.pack_start(&unlock_button, false, false, 0);
-                    self.passwords_list_box.pack_start(&row, false, false, 0);
-
-                    let try_unlock: Rc<dyn Fn()> = {
-                        let app = Rc::clone(self);
-                        let unlock_entry = unlock_entry.clone();
-                        Rc::new(move || {
-                            let Some(backend) = app.bitwarden_backend() else { return };
-                            let password = unlock_entry.text().to_string();
-                            if password.is_empty() {
-                                return;
-                            }
-                            match backend.unlock(&password) {
-                                Ok(()) => app.rebuild_passwords_panel(),
-                                Err(err) => {
-                                    app.passwords_error_label.set_text(&format!("Couldn't unlock Bitwarden: {err}"));
-                                    unlock_entry.set_text("");
-                                    unlock_entry.grab_focus();
-                                }
-                            }
-                        })
-                    };
-                    {
-                        let try_unlock = Rc::clone(&try_unlock);
-                        unlock_button.connect_clicked(move |_| try_unlock());
-                    }
-                    {
-                        let try_unlock = Rc::clone(&try_unlock);
-                        unlock_entry.connect_activate(move |_| try_unlock());
-                    }
-                }
-                Ok(BitwardenStatus::Unlocked) => match backend.list() {
-                    Ok(entries) if entries.is_empty() => {
-                        let label = gtk::Label::new(Some("No Bitwarden items"));
-                        label.set_halign(gtk::Align::Start);
-                        self.passwords_list_box.pack_start(&label, false, false, 0);
-                    }
-                    Ok(entries) => {
-                        for entry in &entries {
-                            let row = self.build_login_row(entry, LoginSource::Bitwarden, active_domain.as_deref());
-                            self.passwords_list_box.pack_start(&row, false, false, 0);
-                        }
-                    }
-                    Err(err) => {
-                        let label = gtk::Label::new(Some(&format!("Failed to list Bitwarden items: {err}")));
-                        label.set_halign(gtk::Align::Start);
-                        label.set_line_wrap(true);
-                        self.passwords_list_box.pack_start(&label, false, false, 0);
-                    }
-                },
-            }
-        }
-
-        self.passwords_list_box.show_all();
-    }
-
-    /// Rebuilds `save_destination_combo`'s entries — "Local vault" always,
-    /// plus "Bitwarden" when it's enabled — preserving the current
-    /// selection if it's still valid, defaulting to "local" otherwise. Split
-    /// out from `rebuild_passwords_panel` since `start_editing_login` also
-    /// needs to leave the combo's *contents* alone while just disabling it.
-    fn refresh_save_destination_combo(&self) {
-        let bitwarden_enabled = self.bitwarden_backend().is_some();
-        let previously_selected = self.save_destination_combo.active_id().map(|s| s.to_string());
-        self.save_destination_combo.remove_all();
-        self.save_destination_combo.append(Some("local"), "Local vault");
-        if bitwarden_enabled {
-            self.save_destination_combo.append(Some("bitwarden"), "Bitwarden");
-        }
-        let restore = previously_selected.filter(|id| id == "local" || (id == "bitwarden" && bitwarden_enabled));
-        self.save_destination_combo.set_active_id(Some(restore.as_deref().unwrap_or("local")));
-    }
-
-    /// Fills the add/edit form from `entry` and switches it into "edit"
-    /// mode — reuses the exact same form the add-new-credential flow does,
-    /// rather than a second, separate edit form. `submit_login_from_fields`
-    /// checks `editing_login` to decide whether to `add` or `update`.
-    fn start_editing_login(self: &Rc<Self>, entry: &Login, source: LoginSource) {
-        self.new_password_site_entry.set_text(&entry.site);
-        self.new_password_username_entry.set_text(&entry.username);
-        self.new_password_password_entry.set_text(entry.password.as_deref().unwrap_or(""));
-        self.new_password_notes_entry.set_text(&entry.notes);
-        *self.editing_login.borrow_mut() = Some((entry.id.clone(), source));
-        // An existing login's backend can't change via `update` — there's
-        // no "move a login between backends" operation.
-        self.save_destination_combo.set_sensitive(false);
-        self.submit_password_button.set_label("Save");
-        self.passwords_form_heading.set_text("Edit Login");
-        self.cancel_edit_button.set_visible(true);
-    }
-
-    /// Returns the add/edit form to "add new" mode: clears the fields,
-    /// `editing_login`, and undoes everything `start_editing_login` set.
-    fn cancel_editing_login(self: &Rc<Self>) {
-        self.new_password_site_entry.set_text("");
-        self.new_password_username_entry.set_text("");
-        self.new_password_password_entry.set_text("");
-        self.new_password_notes_entry.set_text("");
-        *self.editing_login.borrow_mut() = None;
-        self.save_destination_combo.set_sensitive(true);
-        self.submit_password_button.set_label("Add");
-        self.passwords_form_heading.set_text("Add Login");
-        self.cancel_edit_button.set_visible(false);
-    }
-
-    /// Sets the add-new-credential form's fields and submits them — test
-    /// helper, same pattern as `add_search_engine_via_fields`. Only ever
-    /// used with the form in "add new" mode (`editing_login: None`), so
-    /// this always creates a fresh login in whichever backend
-    /// `save_destination_combo` is currently set to (the local vault, by
-    /// default) — unaffected by this pass's edit-mode changes.
-    pub fn add_password_via_fields(self: &Rc<Self>, site: &str, username: &str, password: &str, notes: &str) {
-        self.new_password_site_entry.set_text(site);
-        self.new_password_username_entry.set_text(username);
-        self.new_password_password_entry.set_text(password);
-        self.new_password_notes_entry.set_text(notes);
-        self.submit_login_from_fields();
-    }
-
-    /// Test helper: simulates clicking "Edit" on the local vault's row with
-    /// this id — looks the entry up itself, mirroring what the real Edit
-    /// button's closure already captured at row-build time.
-    pub fn start_editing_local_login(self: &Rc<Self>, id: &str) {
-        let entry = match &*self.passwords.borrow() {
-            VaultState::Unlocked(store) => store.list().unwrap_or_default().into_iter().find(|e| e.id == id),
-            VaultState::Locked | VaultState::NotSetUp => None,
-        };
-        if let Some(entry) = entry {
-            self.start_editing_login(&entry, LoginSource::Local);
-        }
-    }
-
-    /// Test helper: simulates clicking "Fill" on the local vault's row for
-    /// `username` — looks the entry up itself, mirroring what the real Fill
-    /// button's closure already captured at row-build time. A no-op if no
-    /// such entry exists, same as the real button would be if it were
-    /// somehow clicked in a stale/mismatched state.
-    pub fn fill_active_page_with_local_login(self: &Rc<Self>, username: &str) {
-        let entry = match &*self.passwords.borrow() {
-            VaultState::Unlocked(store) => store.list().unwrap_or_default().into_iter().find(|e| e.username == username),
-            VaultState::Locked | VaultState::NotSetUp => None,
-        };
-        if let Some(entry) = entry {
-            self.fill_active_page_with_login(&entry);
         }
     }
 
@@ -1768,98 +1146,6 @@ impl AppState {
     pub fn active_page_widget_for_test(&self) -> Option<gtk::Widget> {
         let core = self.core.borrow();
         core.active().and_then(|page| page.engine.as_ref()).map(|engine| engine.widget())
-    }
-
-    /// Test helper: simulates clicking "Edit" on a Bitwarden row with this
-    /// id — same reasoning as `start_editing_local_login`, just looking the
-    /// entry up via `bitwarden_backend()` instead of the local vault.
-    pub fn start_editing_bitwarden_login(self: &Rc<Self>, id: &str) {
-        let entry = self.bitwarden_backend().and_then(|backend| backend.list().ok()?.into_iter().find(|e| e.id == id));
-        if let Some(entry) = entry {
-            self.start_editing_login(&entry, LoginSource::Bitwarden);
-        }
-    }
-
-    /// Test helper: simulates clicking the "×" delete button on a Bitwarden
-    /// row with this id — `delete_login`/`LoginSource` are private (this
-    /// crate's own concern, not part of the public API), so this is the
-    /// test-facing entry point for exercising that path.
-    pub fn delete_bitwarden_login_for_test(self: &Rc<Self>, id: &str) {
-        self.delete_login(id, LoginSource::Bitwarden);
-    }
-
-    /// Submits the add/edit form — adds a new login (routed to whichever
-    /// backend `save_destination_combo` selects) if `editing_login` is
-    /// `None`, or updates the existing one it names otherwise. A no-op if
-    /// the site field is blank. On success, clears/resets the form (via
-    /// `cancel_editing_login`, reused for that side effect) and rebuilds the
-    /// list; on failure, surfaces the error in `passwords_error_label`
-    /// instead of just logging it — this overlay had no visible error
-    /// surface at all before this.
-    pub fn submit_login_from_fields(self: &Rc<Self>) {
-        let site = self.new_password_site_entry.text().to_string();
-        let site = site.trim().to_string();
-        if site.is_empty() {
-            return;
-        }
-        let username = self.new_password_username_entry.text().to_string();
-        let password_text = self.new_password_password_entry.text().to_string();
-        let notes = self.new_password_notes_entry.text().to_string();
-        // A blank password field means "no password" (None), not the empty
-        // string as a literal secret — matches how `Login::password` reads
-        // back from storage (see `passwords.rs`'s `collect_entries`).
-        let password = if password_text.trim().is_empty() { None } else { Some(password_text) };
-        let fields = LoginFields { site, username, password, passkey: None, notes };
-
-        let editing = self.editing_login.borrow().clone();
-        let result: anyhow::Result<()> = match editing {
-            Some((id, LoginSource::Local)) => match &*self.passwords.borrow() {
-                VaultState::Unlocked(store) => store.update(&id, fields),
-                VaultState::Locked | VaultState::NotSetUp => return,
-            },
-            Some((id, LoginSource::Bitwarden)) => match self.bitwarden_backend() {
-                Some(backend) => backend.update(&id, fields),
-                None => return,
-            },
-            None => match self.save_destination_combo.active_id().as_deref() {
-                Some("bitwarden") => match self.bitwarden_backend() {
-                    Some(backend) => backend.add(fields).map(|_| ()),
-                    None => return,
-                },
-                _ => match &*self.passwords.borrow() {
-                    VaultState::Unlocked(store) => store.add(fields).map(|_| ()),
-                    VaultState::Locked | VaultState::NotSetUp => return,
-                },
-            },
-        };
-
-        if let Err(err) = result {
-            let action = if self.editing_login.borrow().is_some() { "save" } else { "add" };
-            self.passwords_error_label.set_text(&format!("Failed to {action} login: {err}"));
-            return;
-        }
-        self.cancel_editing_login();
-        self.rebuild_passwords_panel();
-    }
-
-    /// Deletes the login identified by `id` from whichever backend `source`
-    /// names, surfacing any failure the same way `submit_login_from_fields`
-    /// does rather than just logging it.
-    fn delete_login(self: &Rc<Self>, id: &str, source: LoginSource) {
-        let result: anyhow::Result<()> = match source {
-            LoginSource::Local => match &*self.passwords.borrow() {
-                VaultState::Unlocked(store) => store.delete(id),
-                VaultState::Locked | VaultState::NotSetUp => Ok(()),
-            },
-            LoginSource::Bitwarden => match self.bitwarden_backend() {
-                Some(backend) => backend.delete(id),
-                None => Ok(()),
-            },
-        };
-        if let Err(err) = result {
-            self.passwords_error_label.set_text(&format!("Failed to delete login: {err}"));
-        }
-        self.rebuild_passwords_panel();
     }
 
     /// Shows a native "Save Screenshot" dialog (suggesting a filename built
@@ -1968,40 +1254,18 @@ impl AppState {
         }
     }
 
-    /// The local vault's id for the first entry whose username is
-    /// `username` — test helper for driving `start_editing_local_login`,
-    /// which needs a real id rather than the username
-    /// `password_vault_usernames` already exposes.
-    pub fn password_vault_id_for_username(&self, username: &str) -> Option<String> {
-        match &*self.passwords.borrow() {
-            VaultState::Unlocked(store) => store.list().unwrap_or_default().into_iter().find(|e| e.username == username).map(|e| e.id),
-            VaultState::Locked | VaultState::NotSetUp => None,
+    /// Adds a login straight to the unlocked local vault — test helper.
+    /// Real adds go through `internal_rpc.rs`'s `passwords.add` now (driven
+    /// by `browser://passwords`, not a native form); a no-op if the vault
+    /// isn't unlocked.
+    pub fn add_password_for_test(&self, site: &str, username: &str, password: &str, notes: &str) {
+        if let VaultState::Unlocked(store) = &*self.passwords.borrow() {
+            if let Err(err) = store.add(browser_core::LoginFields::password_only(site, username, password, notes)) {
+                eprintln!("failed to add password: {err}");
+            }
         }
     }
 
-    /// Whether any label anywhere in the password manager overlay's
-    /// rendered list currently displays text containing `needle` — test/
-    /// inspection helper. Walks the widget tree (rows/section titles/status
-    /// messages are nested `Box`/`Label` combinations, not one flat widget
-    /// type) rather than reading `Login`/`VaultState` data directly, since
-    /// this specifically exists to check what `rebuild_passwords_panel`
-    /// actually rendered (e.g. the Bitwarden section), not the underlying
-    /// backend state `password_vault_usernames` already covers for the
-    /// local vault.
-    pub fn passwords_list_contains_text(&self, needle: &str) -> bool {
-        fn walk(widget: &gtk::Widget, needle: &str) -> bool {
-            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
-                if label.text().contains(needle) {
-                    return true;
-                }
-            }
-            if let Some(container) = widget.downcast_ref::<gtk::Container>() {
-                return container.children().iter().any(|child| walk(child, needle));
-            }
-            false
-        }
-        self.passwords_list_box.children().iter().any(|child| walk(child, needle))
-    }
 
     /// Bookmarks a URL directly, without needing to open it as a real page
     /// first — test helper for exercising the bookmark-match path in
@@ -2026,80 +1290,28 @@ impl AppState {
         self.history.record_visit(url, title)
     }
 
-    /// Number of rows currently shown in the keybindings editor (folded into
-    /// the settings overlay — see `open_settings`'s doc comment) — test/
-    /// inspection helper confirming it's actually populated when settings
-    /// opens, one row per `Action::ALL`.
-    pub fn keybindings_row_count(&self) -> usize {
-        self.keybindings_list_box.children().len()
+    /// Sets and saves `Settings::start_page` directly — test helper. Real
+    /// changes to `Settings` go through `internal_rpc.rs`'s
+    /// `profile.settings.update_general` now (driven by `browser://profile`,
+    /// not a native form), so this is the test-facing equivalent of what
+    /// used to be `set_settings_start_page` + `save_settings`.
+    pub fn set_start_page_for_test(&self, url: &str) {
+        self.settings.borrow_mut().start_page = url.to_string();
+        if let Err(err) = self.settings().save(&self.profile) {
+            eprintln!("failed to save settings: {err}");
+        }
     }
 
-    /// Called from the window's `key-press-event` handler when
-    /// `listening_for` is set: assigns `chord` as a new binding for that
-    /// action (in addition to any existing ones — the editor's "Add
-    /// binding" always adds, "×" on a tag is what removes), saves, clears
-    /// the listening state, and rebuilds the rows.
-    fn assign_listening_binding(self: &Rc<Self>, chord: KeyChord) {
-        let Some(action) = self.listening_for.take() else { return };
-        let mut chords = self.keybindings.borrow().bindings_for(action).to_vec();
-        if !chords.contains(&chord) {
-            chords.push(chord);
+    /// Sets `Settings::theme` and reapplies it — test helper. Real theme
+    /// changes go through `internal_rpc.rs`'s `profile.settings.
+    /// update_general` now (driven by `browser://profile`), same reasoning
+    /// as `set_start_page_for_test`.
+    pub fn set_theme_for_test(self: &Rc<Self>, theme: Theme) {
+        self.settings.borrow_mut().theme = theme;
+        if let Err(err) = self.settings().save(&self.profile) {
+            eprintln!("failed to save settings: {err}");
         }
-        self.keybindings.borrow_mut().set_bindings(action, chords);
-        if let Err(err) = self.keybindings.borrow().save(&self.profile) {
-            eprintln!("failed to save keybindings: {err}");
-        }
-        self.rebuild_keybindings_list();
-    }
-
-    /// Rebuilds the keybindings editor's rows from scratch — one per
-    /// `Action::ALL`, each showing its label, its current chords as
-    /// removable tags, and an "Add binding" button (which shows "Press
-    /// keys…" instead while listening for that specific action).
-    fn rebuild_keybindings_list(self: &Rc<Self>) {
-        for child in self.keybindings_list_box.children() {
-            self.keybindings_list_box.remove(&child);
-        }
-
-        for &action in Action::ALL {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-
-            let label = gtk::Label::new(Some(action.label()));
-            label.set_width_chars(18);
-            label.set_halign(gtk::Align::Start);
-            row.pack_start(&label, false, false, 0);
-
-            let chords_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-            let chords: Vec<KeyChord> = self.keybindings.borrow().bindings_for(action).to_vec();
-            for chord in chords {
-                let tag = gtk::Button::with_label(&format!("{chord} \u{d7}"));
-                tag.style_context().add_class("flat");
-                let app_clone = Rc::clone(self);
-                tag.connect_clicked(move |_| {
-                    let mut remaining = app_clone.keybindings.borrow().bindings_for(action).to_vec();
-                    remaining.retain(|c| *c != chord);
-                    app_clone.keybindings.borrow_mut().set_bindings(action, remaining);
-                    if let Err(err) = app_clone.keybindings.borrow().save(&app_clone.profile) {
-                        eprintln!("failed to save keybindings: {err}");
-                    }
-                    app_clone.rebuild_keybindings_list();
-                });
-                chords_box.pack_start(&tag, false, false, 0);
-            }
-            row.pack_start(&chords_box, true, true, 0);
-
-            let listening = self.listening_for.get() == Some(action);
-            let add_button = gtk::Button::with_label(if listening { "Press keys\u{2026}" } else { "Add binding" });
-            let app_clone = Rc::clone(self);
-            add_button.connect_clicked(move |_| {
-                app_clone.listening_for.set(Some(action));
-                app_clone.rebuild_keybindings_list();
-            });
-            row.pack_start(&add_button, false, false, 0);
-
-            self.keybindings_list_box.pack_start(&row, false, false, 0);
-        }
-        self.keybindings_list_box.show_all();
+        self.apply_theme();
     }
 
     /// Runs whatever `action` means — the shared target of both normal
@@ -2113,10 +1325,12 @@ impl AppState {
             Action::Reload => self.with_active(|p| p.reload()),
             Action::GoBack => self.with_active(|p| p.go_back()),
             Action::GoForward => self.with_active(|p| p.go_forward()),
-            Action::OpenSettings => self.open_settings(),
+            Action::OpenSettings => self.open_or_focus_internal_page(browser_chrome_core::internal_pages::PROFILE),
             Action::OpenProfilePicker => self.open_profile_picker(),
             Action::ToggleBookmark => self.toggle_bookmark_for_active(),
-            Action::OpenBookmarks => self.open_bookmarks(),
+            // The dedicated bookmarks overlay is retired — browsing
+            // bookmarks lives in the switcher's own Bookmarks tab now.
+            Action::OpenBookmarks => self.open_switcher(),
             Action::ToggleReaderMode => self.toggle_reader_mode(),
             Action::OpenPasswords => self.open_passwords(),
             Action::NextPage => self.switch_to_next_page(),
@@ -2644,34 +1858,6 @@ impl AppState {
         len > 0 && self.address_bar.selection_bounds() == Some((0, len))
     }
 
-    /// The settings overlay's start-page field, as currently shown — test
-    /// helper for confirming `open_settings` pre-populates it from the
-    /// current `Settings` rather than leaving it stale from a previous open.
-    pub fn settings_start_page_entry_text(&self) -> String {
-        self.start_page_entry.text().to_string()
-    }
-
-    /// Types into the settings overlay's start-page field — test helper for
-    /// driving an edit before calling `save_settings`, the same way
-    /// `address_bar_activate`/`search_activate` drive their own widgets.
-    pub fn set_settings_start_page(&self, text: &str) {
-        self.start_page_entry.set_text(text);
-    }
-
-    /// Selects the settings overlay's "Light" theme radio button — test
-    /// helper for driving a theme change before calling `save_settings`.
-    pub fn select_light_theme_radio(&self) {
-        self.light_theme_radio.set_active(true);
-    }
-
-    /// Sets the settings overlay's Bitwarden checkbox/URL fields — test
-    /// helper for driving a Bitwarden-enable before calling `save_settings`,
-    /// same pattern as `select_light_theme_radio`.
-    pub fn set_bitwarden_fields(&self, enabled: bool, url: &str) {
-        self.bitwarden_check.set_active(enabled);
-        self.bitwarden_url_entry.set_text(url);
-    }
-
     /// The theme-provider's currently loaded CSS — test helper for
     /// confirming `apply_theme` actually reloaded it with the right
     /// theme's rules, not just that `Settings::theme` changed.
@@ -2681,32 +1867,9 @@ impl AppState {
 
     /// Names of every search engine currently in `Settings::search_engines`
     /// — test helper for confirming add/remove actually changed the
-    /// underlying data (not just the management list widget).
+    /// underlying data.
     pub fn settings_engine_names(&self) -> Vec<String> {
         self.settings.borrow().search_engines.iter().map(|e| e.name.clone()).collect()
-    }
-
-    /// The default-search-engine dropdown's currently active id (which is
-    /// also the engine's name) — test helper for confirming
-    /// `refresh_engine_combo` actually re-selects the current default after
-    /// being repopulated.
-    pub fn engine_combo_active_id(&self) -> Option<String> {
-        self.engine_combo.active_id().map(|s| s.to_string())
-    }
-
-    /// Types into the "Add engine" row's fields and clicks "Add engine" —
-    /// test helper exercising the real `add_search_engine_from_fields`
-    /// handler a real click would trigger.
-    pub fn add_search_engine_via_fields(self: &Rc<Self>, name: &str, url_template: &str) {
-        self.new_engine_name_entry.set_text(name);
-        self.new_engine_url_entry.set_text(url_template);
-        self.add_search_engine_from_fields();
-    }
-
-    /// Number of rows currently shown in the search engine management list
-    /// — test/inspection helper.
-    pub fn engines_row_count(&self) -> usize {
-        self.engines_list_box.children().len()
     }
 }
 
@@ -2988,11 +2151,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         Some("non-starred-symbolic"),
         gtk::IconSize::Button,
     )));
-    let bookmarks_button = gtk::Button::new();
-    bookmarks_button.set_image(Some(&gtk::Image::from_icon_name(
-        Some("user-bookmarks-symbolic"),
-        gtk::IconSize::Button,
-    )));
     let screenshot_button = gtk::Button::new();
     screenshot_button.set_image(Some(&gtk::Image::from_icon_name(
         Some("camera-photo-symbolic"),
@@ -3019,7 +2177,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         &settings_button,
         &profile_button,
         &bookmark_toggle_button,
-        &bookmarks_button,
         &screenshot_button,
         &reader_mode_button,
         &passwords_button,
@@ -3072,7 +2229,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     header_bar.pack_end(&switcher_toggle);
     header_bar.pack_end(&settings_button);
     header_bar.pack_end(&profile_button);
-    header_bar.pack_end(&bookmarks_button);
     header_bar.pack_end(&screenshot_button);
     header_bar.pack_end(&reader_mode_button);
     header_bar.pack_end(&passwords_button);
@@ -3130,167 +2286,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     let (switcher_overlay, scrim, switcher_close_button) = build_overlay_chrome(&grid_content, &scrim_css);
     switcher_overlay.add_overlay(&profile_label);
 
-    // --- Settings overlay: an in-window overlay (like the switcher grid
-    // above), not a modal `gtk::Dialog` — see `AppState::settings_panel`'s
-    // doc comment for why. Scoped to picking the default search engine from
-    // the existing seeded list, not adding/editing entries — that's a
-    // fuller list-editor UI, left for later.
-    let settings_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    settings_box.set_halign(gtk::Align::Fill);
-    settings_box.set_valign(gtk::Align::Start);
-    settings_box.style_context().add_class("settings-box");
-    settings_box.set_margin(24);
-
-    let settings_title = gtk::Label::new(Some("Settings"));
-    settings_title.style_context().add_class("settings-title");
-    settings_title.set_halign(gtk::Align::Start);
-    settings_box.pack_start(&settings_title, false, false, 0);
-
-    // Four tabs (General, Search Engines, Password Managers, Keybindings)
-    // via a plain `gtk::Stack`/`gtk::StackSwitcher` pair — reuses the exact
-    // widget classes already in this dependency (no new crate), distinct
-    // from `self.stack` (the *page* stack, an unrelated concept). Each
-    // tab's own heading label (redundant with the switcher's own tab
-    // title) is dropped.
-    let settings_stack = gtk::Stack::new();
-    settings_stack.set_vexpand(true);
-    let settings_stack_switcher = gtk::StackSwitcher::new();
-    settings_stack_switcher.set_stack(Some(&settings_stack));
-    // `StackSwitcher` applies GTK's own "linked" style by default (a fused,
-    // segmented-control look — square-jointed buttons sharing edges).
-    // Removed so each tab renders as its own separate, individually
-    // rounded card instead, matching the switcher grid's tiles (see the
-    // `.settings-box stackswitcher > button` CSS in `build_window_and_app`)
-    // — the look this was actually asked to match.
-    settings_stack_switcher.style_context().remove_class("linked");
-    settings_box.pack_start(&settings_stack_switcher, false, false, 0);
-    settings_box.pack_start(&settings_stack, true, true, 0);
-
-    // ---- General tab ----
-    let general_page = gtk::Box::new(gtk::Orientation::Vertical, 8);
-
-    let start_page_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    start_page_row.pack_start(&gtk::Label::new(Some("Start page")), false, false, 0);
-    let start_page_entry = gtk::Entry::new();
-    start_page_entry.set_hexpand(true);
-    start_page_row.pack_start(&start_page_entry, true, true, 0);
-    general_page.pack_start(&start_page_row, false, false, 0);
-
-    let limit_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    limit_row.pack_start(&gtk::Label::new(Some("Loaded pages limit")), false, false, 0);
-    let unlimited_check = gtk::CheckButton::new();
-    unlimited_check.set_label("Unlimited");
-    let limit_spin = gtk::SpinButton::with_range(1.0, 100.0, 1.0);
-    {
-        let limit_spin = limit_spin.clone();
-        unlimited_check.connect_toggled(move |check| {
-            limit_spin.set_sensitive(!check.is_active());
-        });
-    }
-    limit_row.pack_start(&unlimited_check, false, false, 0);
-    limit_row.pack_start(&limit_spin, false, false, 0);
-    general_page.pack_start(&limit_row, false, false, 0);
-
-    let theme_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    theme_row.pack_start(&gtk::Label::new(Some("Theme")), false, false, 0);
-    let dark_theme_radio = gtk::RadioButton::with_label("Dark");
-    let light_theme_radio = gtk::RadioButton::with_label_from_widget(&dark_theme_radio, "Light");
-    theme_row.pack_start(&dark_theme_radio, false, false, 0);
-    theme_row.pack_start(&light_theme_radio, false, false, 0);
-    general_page.pack_start(&theme_row, false, false, 0);
-
-    settings_stack.add_titled(&general_page, "general", "General");
-
-    // ---- Search Engines tab ----
-    let search_engines_page = gtk::Box::new(gtk::Orientation::Vertical, 8);
-
-    let engine_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    engine_row.pack_start(&gtk::Label::new(Some("Search engine")), false, false, 0);
-    // Populated for real (from the live per-profile Settings, not this
-    // hardcoded default) by `refresh_engine_combo`, called from
-    // `open_settings` every time it opens — left empty here since nothing
-    // shows until the overlay is opened anyway.
-    let engine_combo = gtk::ComboBoxText::new();
-    engine_row.pack_start(&engine_combo, true, true, 0);
-    search_engines_page.pack_start(&engine_row, false, false, 0);
-
-    // Search engine management: add/remove entries from Settings::search_engines.
-    // Unlike the fields above (staged until Save), these take effect and save
-    // immediately on each add/remove — the same immediate-save convention this
-    // session's bookmarks/keybindings editors already use, rather than adding a
-    // separate staged/cancel-able list-editing model just for this section.
-    let engines_list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    search_engines_page.pack_start(&engines_list_box, false, false, 0);
-
-    let new_engine_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let new_engine_name_entry = gtk::Entry::new();
-    new_engine_name_entry.set_placeholder_text(Some("Name"));
-    new_engine_name_entry.set_hexpand(true);
-    let new_engine_url_entry = gtk::Entry::new();
-    new_engine_url_entry.set_placeholder_text(Some("https://example.com/search?q={query}"));
-    new_engine_url_entry.set_hexpand(true);
-    let add_engine_button = gtk::Button::with_label("Add engine");
-    new_engine_row.pack_start(&new_engine_name_entry, true, true, 0);
-    new_engine_row.pack_start(&new_engine_url_entry, true, true, 0);
-    new_engine_row.pack_start(&add_engine_button, false, false, 0);
-    search_engines_page.pack_start(&new_engine_row, false, false, 0);
-
-    settings_stack.add_titled(&search_engines_page, "search-engines", "Search Engines");
-
-    // ---- Password Managers tab ----
-    // Just Bitwarden for now — a generic name rather than a per-backend one
-    // since other backends are a real, if not-yet-built, possibility (see
-    // ROADMAP.md's Backlog: KeePassXC/secret-service, 1Password), each of
-    // which would land as its own subsection here, "Bitwarden" keeping its
-    // subtitle to distinguish it from whichever else eventually joins it.
-    let password_managers_page = gtk::Box::new(gtk::Orientation::Vertical, 8);
-
-    let bitwarden_subtitle = gtk::Label::new(Some("Bitwarden"));
-    bitwarden_subtitle.style_context().add_class("settings-subtitle");
-    bitwarden_subtitle.set_halign(gtk::Align::Start);
-    password_managers_page.pack_start(&bitwarden_subtitle, false, false, 0);
-
-    // A checkbox plus its server URL, always shown side by side (unlike the
-    // loaded-pages limit's conditionally-disabled spin button) since
-    // there's only one field to fill in.
-    let bitwarden_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let bitwarden_check = gtk::CheckButton::new();
-    bitwarden_check.set_label("Enable Bitwarden (via bw serve)");
-    let bitwarden_url_entry = gtk::Entry::new();
-    bitwarden_url_entry.set_placeholder_text(Some("http://127.0.0.1:8087"));
-    bitwarden_url_entry.set_hexpand(true);
-    bitwarden_row.pack_start(&bitwarden_check, false, false, 0);
-    bitwarden_row.pack_start(&bitwarden_url_entry, true, true, 0);
-    password_managers_page.pack_start(&bitwarden_row, false, false, 0);
-
-    settings_stack.add_titled(&password_managers_page, "password-managers", "Password Managers");
-
-    // ---- Keybindings tab ----
-    // One row per `Action::ALL`, rebuilt from the current `Keybindings` each
-    // time settings opens and after every add/remove. `vexpand` on the
-    // `ScrolledWindow` rather than a fixed `max_content_height` — this tab
-    // now has the overlay's full height to itself, not a shared column
-    // alongside every other setting.
-    let keybindings_page = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    let keybindings_list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    let keybindings_scroll = gtk::ScrolledWindow::new(gtk::Adjustment::NONE, gtk::Adjustment::NONE);
-    keybindings_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    keybindings_scroll.set_vexpand(true);
-    keybindings_scroll.add(&keybindings_list_box);
-    keybindings_page.pack_start(&keybindings_scroll, true, true, 0);
-
-    settings_stack.add_titled(&keybindings_page, "keybindings", "Keybindings");
-
-    let settings_buttons_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    settings_buttons_row.set_halign(gtk::Align::End);
-    let settings_cancel_button = gtk::Button::with_label("Cancel");
-    let settings_save_button = gtk::Button::with_label("Save");
-    settings_buttons_row.pack_start(&settings_cancel_button, false, false, 0);
-    settings_buttons_row.pack_start(&settings_save_button, false, false, 0);
-    settings_box.pack_start(&settings_buttons_row, false, false, 0);
-
-    let (settings_overlay, settings_scrim, settings_close_button) = build_overlay_chrome(&settings_box, &scrim_css);
-
     // --- Profile picker overlay: same in-window-overlay pattern again.
     // Lists existing profiles (from `list_profile_names()`, rebuilt each
     // time it opens) plus a field to create a new one — picking any profile
@@ -3334,30 +2329,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
 
     let (profile_overlay, profile_scrim, profile_close_button) = build_overlay_chrome(&profile_box, &scrim_css);
 
-    // --- Bookmarks overlay: same shape again. One row per bookmark, rebuilt
-    // from `Bookmarks::all()` each time it opens and after every add/remove.
-    let bookmarks_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    bookmarks_box.set_halign(gtk::Align::Fill);
-    bookmarks_box.set_valign(gtk::Align::Start);
-    bookmarks_box.style_context().add_class("settings-box");
-    bookmarks_box.set_margin(24);
-
-    let bookmarks_title = gtk::Label::new(Some("Bookmarks"));
-    bookmarks_title.style_context().add_class("settings-title");
-    bookmarks_title.set_halign(gtk::Align::Start);
-    bookmarks_box.pack_start(&bookmarks_title, false, false, 0);
-
-    let bookmarks_list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    bookmarks_box.pack_start(&bookmarks_list_box, false, false, 0);
-
-    let bookmarks_close_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    bookmarks_close_row.set_halign(gtk::Align::End);
-    let bookmarks_close_button = gtk::Button::with_label("Close");
-    bookmarks_close_row.pack_start(&bookmarks_close_button, false, false, 0);
-    bookmarks_box.pack_start(&bookmarks_close_row, false, false, 0);
-
-    let (bookmarks_overlay, bookmarks_scrim, bookmarks_close_icon) = build_overlay_chrome(&bookmarks_box, &scrim_css);
-
     // --- Password manager overlay: same shape again. One row per
     // credential, rebuilt from `PasswordStore::list()` each time the
     // overlay opens and after every add/update/delete — plus an inline
@@ -3399,68 +2370,8 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     passwords_unlock_box.pack_start(&passwords_unlock_button, false, false, 0);
     passwords_box.pack_start(&passwords_unlock_box, false, false, 0);
 
-    // ---- vault contents sub-group ----
-    // Shown instead of `passwords_unlock_box` once the vault is unlocked.
-    let passwords_content_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-
-    let saved_logins_subtitle = gtk::Label::new(Some("Saved Logins"));
-    saved_logins_subtitle.style_context().add_class("settings-subtitle");
-    saved_logins_subtitle.set_halign(gtk::Align::Start);
-    passwords_content_box.pack_start(&saved_logins_subtitle, false, false, 0);
-
-    let passwords_list_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    passwords_content_box.pack_start(&passwords_list_box, false, false, 0);
-
-    // Text toggles "Add Login"/"Edit Login" alongside
-    // `submit_password_button`'s label (see `start_editing_login`/
-    // `cancel_editing_login`).
-    let passwords_form_heading = gtk::Label::new(Some("Add Login"));
-    passwords_form_heading.style_context().add_class("settings-subtitle");
-    passwords_form_heading.set_halign(gtk::Align::Start);
-    passwords_content_box.pack_start(&passwords_form_heading, false, false, 0);
-
-    let new_password_site_entry = gtk::Entry::new();
-    new_password_site_entry.set_placeholder_text(Some("Site (e.g. https://example.com)"));
-    passwords_content_box.pack_start(&new_password_site_entry, false, false, 0);
-    let new_password_username_entry = gtk::Entry::new();
-    new_password_username_entry.set_placeholder_text(Some("Username"));
-    passwords_content_box.pack_start(&new_password_username_entry, false, false, 0);
-    let new_password_password_entry = gtk::Entry::new();
-    new_password_password_entry.set_visibility(false);
-    new_password_password_entry.set_placeholder_text(Some("Password"));
-    passwords_content_box.pack_start(&new_password_password_entry, false, false, 0);
-    let new_password_notes_entry = gtk::Entry::new();
-    new_password_notes_entry.set_placeholder_text(Some("Notes (optional)"));
-    passwords_content_box.pack_start(&new_password_notes_entry, false, false, 0);
-
-    // Hidden entirely unless Bitwarden integration is enabled (see
-    // `rebuild_passwords_panel`, which rebuilds this combo's contents and
-    // this row's visibility every time it runs) — a brand-new login always
-    // goes to the local vault when this isn't shown, same as before this
-    // field existed.
-    let save_destination_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    save_destination_row.pack_start(&gtk::Label::new(Some("Save to")), false, false, 0);
-    let save_destination_combo = gtk::ComboBoxText::new();
-    save_destination_row.pack_start(&save_destination_combo, true, true, 0);
-    passwords_content_box.pack_start(&save_destination_row, false, false, 0);
-
-    let passwords_error_label = gtk::Label::new(None);
-    passwords_error_label.set_halign(gtk::Align::Start);
-    passwords_error_label.set_line_wrap(true);
-    passwords_content_box.pack_start(&passwords_error_label, false, false, 0);
-
-    let password_form_button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let cancel_edit_button = gtk::Button::with_label("Cancel edit");
-    cancel_edit_button.set_visible(false);
-    let submit_password_button = gtk::Button::with_label("Add");
-    password_form_button_row.pack_start(&cancel_edit_button, false, false, 0);
-    password_form_button_row.pack_start(&submit_password_button, false, false, 0);
-    passwords_content_box.pack_start(&password_form_button_row, false, false, 0);
-
-    passwords_box.pack_start(&passwords_content_box, false, false, 0);
-
-    // Close stays outside both sub-groups above — dismissing the overlay
-    // shouldn't depend on the vault's unlock state.
+    // Close stays outside the unlock sub-group above — dismissing the
+    // overlay shouldn't depend on the vault's unlock state.
     let passwords_close_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     passwords_close_row.set_halign(gtk::Align::End);
     let passwords_close_button = gtk::Button::with_label("Close");
@@ -3472,17 +2383,13 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     let root_overlay = gtk::Overlay::new();
     root_overlay.add(&stack);
     root_overlay.add_overlay(&switcher_overlay);
-    root_overlay.add_overlay(&settings_overlay);
     root_overlay.add_overlay(&profile_overlay);
-    root_overlay.add_overlay(&bookmarks_overlay);
     root_overlay.add_overlay(&passwords_overlay);
 
     window.add(&root_overlay);
     window.show_all();
     switcher_overlay.hide();
-    settings_overlay.hide();
     profile_overlay.hide();
-    bookmarks_overlay.hide();
     passwords_overlay.hide();
 
     let settings = Settings::load(&profile);
@@ -3519,52 +2426,22 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         stack,
         switcher_panel: switcher_overlay.clone().upcast::<gtk::Widget>(),
         flowbox: flowbox.clone(),
-        settings_panel: settings_overlay.clone().upcast::<gtk::Widget>(),
-        start_page_entry: start_page_entry.clone(),
-        engine_combo: engine_combo.clone(),
-        engines_list_box: engines_list_box.clone(),
-        new_engine_name_entry: new_engine_name_entry.clone(),
-        new_engine_url_entry: new_engine_url_entry.clone(),
-        unlimited_check: unlimited_check.clone(),
-        limit_spin: limit_spin.clone(),
-        light_theme_radio: light_theme_radio.clone(),
-        dark_theme_radio: dark_theme_radio.clone(),
-        bitwarden_check: bitwarden_check.clone(),
-        bitwarden_url_entry: bitwarden_url_entry.clone(),
         theme_provider: theme_provider.clone(),
         profile_panel: profile_overlay.clone().upcast::<gtk::Widget>(),
         profile_list_box: profile_list_box.clone(),
         new_profile_entry: new_profile_entry.clone(),
         new_profile_encrypted_check: new_profile_encrypted_check.clone(),
-        keybindings_list_box: keybindings_list_box.clone(),
         keybindings: RefCell::new(Keybindings::load(&profile)),
-        listening_for: Cell::new(None),
-        bookmarks_panel: bookmarks_overlay.clone().upcast::<gtk::Widget>(),
-        bookmarks_list_box: bookmarks_list_box.clone(),
         bookmark_toggle_button: bookmark_toggle_button.clone(),
         bookmarks: RefCell::new(bookmarks),
         passwords_panel: passwords_overlay.clone().upcast::<gtk::Widget>(),
-        passwords_unlock_box: passwords_unlock_box.clone(),
         passwords_unlock_heading: passwords_unlock_heading.clone(),
         passwords_unlock_label: passwords_unlock_label.clone(),
         passwords_unlock_entry: passwords_unlock_entry.clone(),
         passwords_unlock_error_label: passwords_unlock_error_label.clone(),
         passwords_unlock_button: passwords_unlock_button.clone(),
-        passwords_content_box: passwords_content_box.clone(),
-        passwords_list_box: passwords_list_box.clone(),
-        passwords_form_heading: passwords_form_heading.clone(),
         passwords: RefCell::new(initial_vault_state),
         session_passphrase: RefCell::new(None),
-        new_password_site_entry: new_password_site_entry.clone(),
-        new_password_username_entry: new_password_username_entry.clone(),
-        new_password_password_entry: new_password_password_entry.clone(),
-        new_password_notes_entry: new_password_notes_entry.clone(),
-        editing_login: RefCell::new(None),
-        save_destination_combo: save_destination_combo.clone(),
-        save_destination_row: save_destination_row.clone(),
-        submit_password_button: submit_password_button.clone(),
-        cancel_edit_button: cancel_edit_button.clone(),
-        passwords_error_label: passwords_error_label.clone(),
         switcher_rows: RefCell::new(Vec::new()),
         core: RefCell::new(core),
         web_context: RefCell::new(web_context),
@@ -3766,7 +2643,7 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     {
         let app = Rc::clone(&app);
         settings_button.connect_clicked(move |_| {
-            app.toggle_settings();
+            app.open_or_focus_internal_page(browser_chrome_core::internal_pages::PROFILE);
         });
     }
     {
@@ -3774,43 +2651,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         scrim.connect_button_press_event(move |_, _| {
             app.close_switcher();
             gtk::glib::Propagation::Stop
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        settings_scrim.connect_button_press_event(move |_, _| {
-            app.close_settings();
-            gtk::glib::Propagation::Stop
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        settings_close_button.connect_clicked(move |_| {
-            app.close_settings();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        settings_cancel_button.connect_clicked(move |_| {
-            app.close_settings();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        settings_save_button.connect_clicked(move |_| {
-            app.save_settings();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        add_engine_button.connect_clicked(move |_| {
-            app.add_search_engine_from_fields();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        new_engine_url_entry.connect_activate(move |_| {
-            app.add_search_engine_from_fields();
         });
     }
     {
@@ -3864,12 +2704,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     }
     {
         let app = Rc::clone(&app);
-        bookmarks_button.connect_clicked(move |_| {
-            app.toggle_bookmarks();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
         screenshot_button.connect_clicked(move |_| {
             app.take_screenshot();
         });
@@ -3878,25 +2712,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
         let app = Rc::clone(&app);
         reader_mode_button.connect_clicked(move |_| {
             app.toggle_reader_mode();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        bookmarks_scrim.connect_button_press_event(move |_, _| {
-            app.close_bookmarks();
-            gtk::glib::Propagation::Stop
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        bookmarks_close_button.connect_clicked(move |_| {
-            app.close_bookmarks();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        bookmarks_close_icon.connect_clicked(move |_| {
-            app.close_bookmarks();
         });
     }
     {
@@ -3926,24 +2741,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
     }
     {
         let app = Rc::clone(&app);
-        submit_password_button.connect_clicked(move |_| {
-            app.submit_login_from_fields();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        new_password_password_entry.connect_activate(move |_| {
-            app.submit_login_from_fields();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
-        cancel_edit_button.connect_clicked(move |_| {
-            app.cancel_editing_login();
-        });
-    }
-    {
-        let app = Rc::clone(&app);
         passwords_unlock_button.connect_clicked(move |_| {
             app.unlock_vault_clicked();
         });
@@ -3961,14 +2758,8 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
             if is_escape && app.is_switcher_open() {
                 app.close_switcher();
                 return gtk::glib::Propagation::Stop;
-            } else if is_escape && app.is_settings_open() {
-                app.close_settings();
-                return gtk::glib::Propagation::Stop;
             } else if is_escape && app.is_profile_picker_open() {
                 app.close_profile_picker();
-                return gtk::glib::Propagation::Stop;
-            } else if is_escape && app.is_bookmarks_open() {
-                app.close_bookmarks();
                 return gtk::glib::Propagation::Stop;
             } else if is_escape && app.is_passwords_open() {
                 app.close_passwords();
@@ -3978,14 +2769,6 @@ pub fn build_window_and_app_with_history(profile: Profile, history: HistoryStore
             let Some(chord) = gtk_key_to_chord(event) else {
                 return gtk::glib::Propagation::Proceed;
             };
-
-            // While the keybindings editor is waiting for a new binding,
-            // this keypress becomes that binding instead of triggering
-            // whatever it's currently bound to (if anything).
-            if app.listening_for.get().is_some() {
-                app.assign_listening_binding(chord);
-                return gtk::glib::Propagation::Stop;
-            }
 
             match app.keybindings.borrow().action_for(&chord) {
                 Some(action) => {
